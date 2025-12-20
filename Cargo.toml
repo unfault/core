@@ -1,0 +1,48 @@
+[package]
+name = "unfault-core"
+version = "0.1.0"
+edition = "2024"
+authors = ["Sylvain Hellegouarch <sylvain@unfault.dev>"]
+description = "Core parsing, semantics extraction, and graph building for unfault"
+repository = "https://github.com/unfault/core"
+homepage = "https://unfault.dev"
+license = "MIT"
+keywords = ["parser", "code-analysis", "graph", "semantics"]
+categories = ["development-tools", "parser-implementations"]
+readme = "README.md"
+
+[lib]
+name = "unfault_core"
+path = "src/lib.rs"
+
+[dependencies]
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "2"
+
+# Tree-sitter for parsing
+tree-sitter = "0.25"
+tree-sitter-python = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-javascript = "0.25"
+tree-sitter-typescript = "0.23"
+tree-sitter-go = "0.25"
+tree-sitter-java = "0.23"
+tree-sitter-yaml = "0.7.2"
+tree-sitter-hcl = "1.1"
+tree-sitter-json = "0.24"
+
+# Graph construction
+petgraph = "0.8"
+
+# Regex for pattern matching
+regex = "1"
+
+# Diff generation for patches
+similar = { version = "2", features = ["inline", "text"] }
+
+[dev-dependencies]

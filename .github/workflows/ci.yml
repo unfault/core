@@ -42,6 +42,7 @@ jobs:
       run: cargo install cross --git https://github.com/cross-rs/cross
       
     - name: Build
+      shell: bash
       run: |
         if [ "${{ matrix.use_cross }}" == "true" ]; then
           cross build --verbose --target ${{ matrix.target }}
@@ -50,6 +51,7 @@ jobs:
         fi
       
     - name: Run tests
+      shell: bash
       run: |
         if [ "${{ matrix.use_cross }}" == "true" ]; then
           cross test --verbose --target ${{ matrix.target }}

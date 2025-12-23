@@ -26,6 +26,8 @@ use serde::{Deserialize, Serialize};
 use crate::parse::ast::FileId;
 use crate::semantics::{Import, SourceSemantics};
 use crate::semantics::common::CommonSemantics;
+use crate::semantics::go::frameworks::GoFrameworkSummary;
+use crate::semantics::go::model::GoFileSemantics;
 use crate::semantics::python::fastapi::FastApiFileSummary;
 use crate::semantics::python::model::PyFileSemantics;
 use crate::semantics::typescript::model::{ExpressFileSummary, TsFileSemantics};
@@ -654,8 +656,11 @@ pub fn build_code_graph(sem_entries: &[(FileId, Arc<SourceSemantics>)]) -> CodeG
                     add_fastapi_nodes(&mut cg, file_node, *file_id, py, fastapi);
                 }
             }
-            SourceSemantics::Go(_go) => {
-                // TODO: Add Go framework-specific nodes (Gin, Echo, Chi, etc.)
+            SourceSemantics::Go(go) => {
+                // Add Go framework-specific nodes (Gin, Echo, Chi, Fiber, etc.)
+                if let Some(framework) = &go.go_framework {
+                    add_go_framework_nodes(&mut cg, file_node, *file_id, go, framework);
+                }
             }
             SourceSemantics::Rust(_rs) => {
                 // TODO: Add Rust framework-specific nodes (Actix, Axum, Rocket, etc.)
@@ -950,6 +955,16 @@ fn add_function_nodes(
                 std::collections::HashSet::new()
             }
         }
+        SourceSemantics::Go(go) => {
+            // Skip Go framework route handlers (Gin, Echo, Fiber, Chi)
+            if let Some(framework) = &go.go_framework {
+                framework.routes.iter()
+                    .filter_map(|r| r.handler_name.as_deref())
+                    .collect()
+            } else {
+                std::collections::HashSet::new()
+            }
+        }
         _ => std::collections::HashSet::new(),
     };
 
@@ -1211,6 +1226,51 @@ fn add_express_nodes(
             is_handler: true,
             http_method: Some(http_method),
             http_path,
+        });
+
+        // File contains function
+        cg.graph
+            .add_edge(file_node, func_node, GraphEdgeKind::Contains);
+
+        // Store for lookup (needed for call resolution)
+        cg.function_nodes.insert((file_id, handler_name), func_node);
+    }
+}
+
+/// Add Go HTTP framework route handlers as function nodes with HTTP metadata.
+///
+/// This creates function nodes for Gin, Echo, Fiber, and Chi route handlers with
+/// `http_method` and `http_path` fields populated, similar to how FastAPI routes
+/// are handled.
+fn add_go_framework_nodes(
+    cg: &mut CodeGraph,
+    file_node: NodeIndex,
+    file_id: FileId,
+    _go: &GoFileSemantics,
+    framework: &GoFrameworkSummary,
+) {
+    // Routes - create function nodes with HTTP metadata
+    for route in &framework.routes {
+        // Only add routes that have a handler name (named function handlers)
+        let handler_name = match &route.handler_name {
+            Some(name) => name.clone(),
+            None => continue, // Skip anonymous handlers
+        };
+
+        // Skip if this function was already added by add_function_nodes
+        if cg.function_nodes.contains_key(&(file_id, handler_name.clone())) {
+            // We could update the existing node, but for simplicity we skip
+            continue;
+        }
+
+        let func_node = cg.graph.add_node(GraphNode::Function {
+            file_id,
+            name: handler_name.clone(),
+            qualified_name: handler_name.clone(),
+            is_async: false, // Go doesn't have async keyword
+            is_handler: true,
+            http_method: Some(route.http_method.clone()),
+            http_path: Some(route.path.clone()),
         });
 
         // File contains function

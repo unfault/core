@@ -1,8 +1,10 @@
 //! Go semantic model and framework-specific analysis (net/http, Gin, Echo, etc.)
 
+pub mod frameworks;
 pub mod http;
 pub mod model;
 
+pub use frameworks::{extract_go_routes, GoFrameworkSummary, GoHttpFramework, GoRoute};
 pub use model::GoFileSemantics;
 
 use anyhow::Result;

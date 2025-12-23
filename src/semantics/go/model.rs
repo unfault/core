@@ -2,7 +2,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::parse::ast::{AstLocation, FileId, ParsedFile};
 use crate::types::context::Language;
+use crate::semantics::common::{calls::FunctionCall, CommonLocation};
 
+use super::frameworks::{extract_go_routes, GoFrameworkSummary};
 use super::http::HttpCallSite;
 
 /// Information about an unchecked error in Go code.
@@ -185,6 +187,9 @@ pub struct GoFileSemantics {
 
     /// Mutex operations
     pub mutex_operations: Vec<MutexOperation>,
+
+    /// Go HTTP framework routes (Gin, Echo, Fiber, Chi, etc.)
+    pub go_framework: Option<GoFrameworkSummary>,
 }
 
 /// Information about a mutex operation (Lock/Unlock, RLock/RUnlock).
@@ -310,8 +315,8 @@ pub type CallSite = GoCallSite;
 /// Representation of a function/method call in the file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GoCallSite {
-    /// The callee expression, e.g., "http.Get", "fmt.Println"
-    pub callee: String,
+    /// Resolution information for this call site.
+    pub function_call: FunctionCall,
     /// Arguments (simple text representation)
     pub args_repr: String,
     /// Whether this call is inside a loop
@@ -322,8 +327,6 @@ pub struct GoCallSite {
     pub start_byte: usize,
     /// End byte offset
     pub end_byte: usize,
-    /// Location
-    pub location: AstLocation,
 }
 
 impl GoFileSemantics {
@@ -347,6 +350,7 @@ impl GoFileSemantics {
             defers: Vec::new(),
             context_usages: Vec::new(),
             mutex_operations: Vec::new(),
+            go_framework: None,
         };
 
         if parsed.language == Language::Go {
@@ -359,6 +363,13 @@ impl GoFileSemantics {
     /// Run framework-specific analysis (Gin, Echo, net/http, etc.).
     pub fn analyze_frameworks(&mut self, parsed: &ParsedFile) -> anyhow::Result<()> {
         self.http_calls = super::http::summarize_http_clients(parsed);
+        
+        // Extract Go HTTP framework routes (Gin, Echo, Fiber, Chi)
+        let framework_summary = extract_go_routes(parsed);
+        if framework_summary.has_framework() {
+            self.go_framework = Some(framework_summary);
+        }
+        
         collect_error_handling(parsed, self);
         collect_concurrency(parsed, self);
         collect_context_usage(parsed, self);
@@ -372,6 +383,7 @@ struct TraversalContext {
     in_loop: bool,
     in_select: bool,
     current_function: Option<String>,
+    current_qualified_name: Option<String>,
     /// Whether currently in an HTTP/RPC handler
     _in_handler: bool,
     /// Type of handler if in_handler is true
@@ -407,7 +419,8 @@ fn walk_nodes_with_context(
                 .child_by_field_name("name")
                 .map(|n| parsed.text_for_node(&n));
             TraversalContext {
-                current_function: func_name,
+                current_function: func_name.clone(),
+                current_qualified_name: func_name,
                 ..ctx.clone()
             }
         }
@@ -415,8 +428,12 @@ fn walk_nodes_with_context(
             let func_name = node
                 .child_by_field_name("name")
                 .map(|n| parsed.text_for_node(&n));
+            let receiver = node.child_by_field_name("receiver");
+            let receiver_type = receiver.map(|r| extract_receiver_type(parsed, &r).0).unwrap_or_default();
+            let qualified = func_name.as_ref().map(|n| format!("{}.{}", receiver_type, n));
             TraversalContext {
                 current_function: func_name,
+                current_qualified_name: qualified,
                 ..ctx.clone()
             }
         }
@@ -929,7 +946,7 @@ fn build_callsite(
     ctx: &TraversalContext,
 ) -> Option<GoCallSite> {
     let func_node = node.child_by_field_name("function")?;
-    let callee = parsed.text_for_node(&func_node);
+    let callee_expr = parsed.text_for_node(&func_node);
 
     let args_repr = if let Some(args_node) = node.child_by_field_name("arguments") {
         parsed.text_for_node(&args_node)
@@ -937,14 +954,46 @@ fn build_callsite(
         String::new()
     };
 
+    // Parse callee into parts (e.g., "pkg.Func" -> ["pkg", "Func"])
+    let callee_parts: Vec<String> = callee_expr.split('.').map(String::from).collect();
+    
+    // Detect if this is an import call (e.g., "http.Get" where "http" is from "net/http")
+    // For now, if first part could be an import alias, mark as import call
+    let is_import_call = callee_parts.len() > 1 && callee_parts[0].chars().next().is_some_and(|c| c.is_lowercase());
+    
+    // Get import alias if applicable
+    let import_alias = if is_import_call {
+        Some(callee_parts[0].clone())
+    } else {
+        None
+    };
+
+    let location = parsed.location_for_node(node);
+    
+    let function_call = FunctionCall {
+        callee_expr: callee_expr.clone(),
+        callee_parts,
+        caller_function: ctx.current_function.clone().unwrap_or_default(),
+        caller_qualified_name: ctx.current_qualified_name.clone().unwrap_or_default(),
+        location: CommonLocation {
+            file_id: parsed.file_id,
+            line: location.range.start_line + 1,
+            column: location.range.start_col + 1,
+            start_byte: node.start_byte(),
+            end_byte: node.end_byte(),
+        },
+        is_self_call: false, // Go doesn't have self in the same way
+        is_import_call,
+        import_alias,
+    };
+
     Some(GoCallSite {
-        callee,
+        function_call,
         args_repr,
         in_loop: ctx.in_loop,
         error_checked: false, // Will be determined by error analysis pass
         start_byte: node.start_byte(),
         end_byte: node.end_byte(),
-        location: parsed.location_for_node(node),
     })
 }
 

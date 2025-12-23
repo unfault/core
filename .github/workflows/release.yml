@@ -26,6 +26,8 @@ jobs:
     needs: test
     environment: release
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust

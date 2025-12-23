@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::parse::ast::{AstLocation, FileId, ParsedFile};
+use crate::semantics::common::calls::FunctionCall;
+use crate::semantics::common::CommonLocation;
 use crate::semantics::python::http::HttpCallSite;
 use crate::semantics::python::orm::OrmQueryCall;
 use crate::types::context::Language;
@@ -706,8 +708,8 @@ pub struct PyAssignment {
 /// Representation of a function/method call in the file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PyCallSite {
-    /// e.g. "FastAPI", "APIRouter", "httpx.get", "app.add_middleware".
-    pub callee: String,
+    /// Resolution information for this call site.
+    pub function_call: FunctionCall,
 
     /// Arguments for the call, both positional and keyword.
     pub args: Vec<PyCallArg>,
@@ -726,8 +728,6 @@ pub struct PyCallSite {
 
     /// End byte offset of the call
     pub end_byte: usize,
-
-    pub location: AstLocation,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -763,6 +763,12 @@ struct TraversalContext {
     /// True if we're inside a function, class, if-block, or any non-module scope.
     /// Used to filter out non-module-level assignments and imports.
     in_nested_scope: bool,
+    /// Current enclosing class name, if inside a class.
+    current_class: Option<String>,
+    /// Current enclosing function name (simple name).
+    current_function: Option<String>,
+    /// Current enclosing qualified name (Class.method or just function).
+    current_qualified_name: Option<String>,
 }
 
 /// Collect semantics by walking the tree-sitter AST.
@@ -786,6 +792,34 @@ fn walk_nodes_with_context(
 ) {
     // Update context based on current node
     let new_ctx = match node.kind() {
+        "class_definition" => {
+            let class_name = node
+                .child_by_field_name("name")
+                .map(|n| parsed.text_for_node(&n))
+                .unwrap_or_default();
+            TraversalContext {
+                current_class: Some(class_name),
+                in_nested_scope: true,
+                ..ctx.clone()
+            }
+        }
+        "function_definition" | "async_function_definition" => {
+            let func_name = node
+                .child_by_field_name("name")
+                .map(|n| parsed.text_for_node(&n))
+                .unwrap_or_default();
+            let qualified = if let Some(class) = &ctx.current_class {
+                format!("{}.{}", class, func_name)
+            } else {
+                func_name.clone()
+            };
+            TraversalContext {
+                current_function: Some(func_name),
+                current_qualified_name: Some(qualified),
+                in_nested_scope: true,
+                ..ctx.clone()
+            }
+        }
         "for_statement" | "while_statement" => TraversalContext {
             in_loop: true,
             ..ctx.clone()
@@ -797,13 +831,8 @@ fn walk_nodes_with_context(
             in_comprehension: true,
             ..ctx.clone()
         },
-        // Track when we enter a function, class, lambda, or if-block - these create new scopes
-        // for the purpose of determining module-level imports and assignments
-        "function_definition"
-        | "async_function_definition"
-        | "class_definition"
-        | "lambda"
-        | "if_statement" => TraversalContext {
+        // Track when we enter a lambda or if-block - these create new scopes
+        "lambda" | "if_statement" => TraversalContext {
             in_nested_scope: true,
             ..ctx.clone()
         },
@@ -827,7 +856,7 @@ fn walk_nodes_with_context(
             }
         }
         "call" => {
-            if let Some(call) = build_callsite(parsed, &node, &new_ctx) {
+            if let Some(call) = build_callsite(parsed, &node, &new_ctx, sem) {
                 sem.calls.push(call);
             }
         }
@@ -1211,12 +1240,50 @@ fn build_callsite(
     parsed: &ParsedFile,
     node: &tree_sitter::Node,
     ctx: &TraversalContext,
+    sem: &PyFileSemantics,
 ) -> Option<PyCallSite> {
     let location = parsed.location_for_node(node);
 
     // Try to get the function being called.
     let func_node = node.child_by_field_name("function")?;
     let callee = parsed.text_for_node(&func_node);
+
+    // Parse callee into parts
+    let callee_parts: Vec<String> = callee.split('.').map(|s| s.to_string()).collect();
+    let first_part = callee_parts.first().cloned().unwrap_or_default();
+
+    // Detect self call
+    let is_self_call = first_part == "self";
+
+    // Detect import call and alias
+    let (is_import_call, import_alias) = if is_self_call {
+        (false, None)
+    } else {
+        let mut matching_alias = None;
+        let found = sem.imports.iter().any(|imp| {
+            if imp.module == first_part {
+                matching_alias = None;
+                true
+            } else if imp.alias.as_ref() == Some(&first_part) {
+                matching_alias = imp.alias.clone();
+                true
+            } else {
+                false
+            }
+        });
+        (found, matching_alias)
+    };
+
+    let function_call = FunctionCall {
+        callee_expr: callee.clone(),
+        callee_parts,
+        caller_function: ctx.current_function.clone().unwrap_or_default(),
+        caller_qualified_name: ctx.current_qualified_name.clone().unwrap_or_default(),
+        location: CommonLocation::from(&location),
+        is_self_call,
+        is_import_call,
+        import_alias,
+    };
 
     // Get the full arguments text representation
     let args_repr = if let Some(args_node) = node.child_by_field_name("arguments") {
@@ -1242,14 +1309,13 @@ fn build_callsite(
     }
 
     Some(PyCallSite {
-        callee,
+        function_call,
         args,
         args_repr,
         in_loop: ctx.in_loop,
         in_comprehension: ctx.in_comprehension,
         start_byte: node.start_byte(),
         end_byte: node.end_byte(),
-        location,
     })
 }
 
@@ -1780,13 +1846,13 @@ async def async_func():
     #[test]
     fn collects_simple_function_call() {
         let sem = parse_and_build_semantics("print('hello')");
-        assert!(sem.calls.iter().any(|c| c.callee == "print"));
+        assert!(sem.calls.iter().any(|c| c.function_call.callee_expr == "print"));
     }
 
     #[test]
     fn collects_method_call() {
         let sem = parse_and_build_semantics("app.add_middleware(CORSMiddleware)");
-        assert!(sem.calls.iter().any(|c| c.callee == "app.add_middleware"));
+        assert!(sem.calls.iter().any(|c| c.function_call.callee_expr == "app.add_middleware"));
     }
 
     #[test]
@@ -1795,7 +1861,7 @@ async def async_func():
         let call = sem
             .calls
             .iter()
-            .find(|c| c.callee == "requests.get")
+            .find(|c| c.function_call.callee_expr == "requests.get")
             .unwrap();
         assert!(!call.args.is_empty());
     }
@@ -1807,8 +1873,8 @@ result = outer(inner(x))
 "#;
         let sem = parse_and_build_semantics(src);
         // Should collect both outer and inner calls
-        assert!(sem.calls.iter().any(|c| c.callee == "outer"));
-        assert!(sem.calls.iter().any(|c| c.callee == "inner"));
+        assert!(sem.calls.iter().any(|c| c.function_call.callee_expr == "outer"));
+        assert!(sem.calls.iter().any(|c| c.function_call.callee_expr == "inner"));
     }
 
     #[test]
@@ -1930,8 +1996,8 @@ def helper():
         assert!(sem.functions.iter().any(|f| f.name == "helper"));
 
         // Should have calls
-        assert!(sem.calls.iter().any(|c| c.callee == "FastAPI"));
-        assert!(sem.calls.iter().any(|c| c.callee == "app.add_middleware"));
+        assert!(sem.calls.iter().any(|c| c.function_call.callee_expr == "FastAPI"));
+        assert!(sem.calls.iter().any(|c| c.function_call.callee_expr == "app.add_middleware"));
     }
 
     #[test]

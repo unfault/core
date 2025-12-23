@@ -37,7 +37,7 @@ tree-sitter-hcl = "1.1"
 tree-sitter-json = "0.24"
 
 # Graph construction
-petgraph = "0.8"
+petgraph = { version = "0.8", features = ["serde-1"] }
 
 # Regex for pattern matching
 regex = "1"

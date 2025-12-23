@@ -21,16 +21,17 @@ use std::sync::Arc;
 use petgraph::Direction;
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
+use serde::{Deserialize, Serialize};
 
 use crate::parse::ast::FileId;
-use crate::semantics::SourceSemantics;
+use crate::semantics::{Import, SourceSemantics};
 use crate::semantics::common::CommonSemantics;
 use crate::semantics::python::fastapi::FastApiFileSummary;
 use crate::semantics::python::model::PyFileSemantics;
 use crate::types::context::Language;
 
 /// Category of external modules for better organization
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ModuleCategory {
     /// HTTP client libraries (requests, httpx, axios, etc.)
     HttpClient,
@@ -57,7 +58,7 @@ impl Default for ModuleCategory {
 }
 
 /// Nodes in the code graph.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GraphNode {
     /// A source file
     File {
@@ -75,6 +76,10 @@ pub enum GraphNode {
         is_async: bool,
         /// Whether this is an HTTP handler, event handler, etc.
         is_handler: bool,
+        /// HTTP method if this is an HTTP route handler (e.g., "GET", "POST")
+        http_method: Option<String>,
+        /// HTTP path if this is an HTTP route handler (e.g., "/users/{user_id}")
+        http_path: Option<String>,
     },
 
     /// A class or type definition
@@ -141,6 +146,24 @@ impl GraphNode {
         }
     }
 
+    /// Get the HTTP method for this node if it's an HTTP handler
+    pub fn http_method(&self) -> Option<&str> {
+        match self {
+            GraphNode::Function { http_method, .. } => http_method.as_deref(),
+            GraphNode::FastApiRoute { http_method, .. } => Some(http_method),
+            _ => None,
+        }
+    }
+
+    /// Get the HTTP path for this node if it's an HTTP handler
+    pub fn http_path(&self) -> Option<&str> {
+        match self {
+            GraphNode::Function { http_path, .. } => http_path.as_deref(),
+            GraphNode::FastApiRoute { path, .. } => Some(path),
+            _ => None,
+        }
+    }
+
     /// Check if this is a file node
     pub fn is_file(&self) -> bool {
         matches!(self, GraphNode::File { .. })
@@ -148,7 +171,7 @@ impl GraphNode {
 }
 
 /// Edge kinds between nodes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GraphEdgeKind {
     /// A file "contains" a construct (function, class, app, route, middleware).
     Contains,
@@ -182,18 +205,31 @@ pub enum GraphEdgeKind {
 }
 
 /// The main code graph structure.
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodeGraph {
     pub graph: DiGraph<GraphNode, GraphEdgeKind>,
     /// Quick lookup: file_id -> node index for the file node.
+    #[serde(skip)]
     pub file_nodes: HashMap<FileId, NodeIndex>,
     /// Quick lookup: file path -> node index for the file node.
+    #[serde(skip)]
     pub path_to_file: HashMap<String, NodeIndex>,
+    /// Quick lookup: path suffix -> node index (for fast import resolution)
+    /// Maps "module.py", "pkg/module.py", etc. to their file nodes
+    #[serde(skip)]
+    pub suffix_to_file: HashMap<String, NodeIndex>,
+    /// Quick lookup: module path (dot-separated) -> node index
+    /// Maps "pkg.module" to its file node
+    #[serde(skip)]
+    pub module_to_file: HashMap<String, NodeIndex>,
     /// Quick lookup: external module name -> node index
+    #[serde(skip)]
     pub external_modules: HashMap<String, NodeIndex>,
     /// Quick lookup: (file_id, function_name) -> node index
+    #[serde(skip)]
     pub function_nodes: HashMap<(FileId, String), NodeIndex>,
     /// Quick lookup: (file_id, class_name) -> node index
+    #[serde(skip)]
     pub class_nodes: HashMap<(FileId, String), NodeIndex>,
 }
 
@@ -203,6 +239,8 @@ impl CodeGraph {
             graph: DiGraph::new(),
             file_nodes: HashMap::new(),
             path_to_file: HashMap::new(),
+            suffix_to_file: HashMap::new(),
+            module_to_file: HashMap::new(),
             external_modules: HashMap::new(),
             function_nodes: HashMap::new(),
             class_nodes: HashMap::new(),
@@ -227,28 +265,44 @@ impl CodeGraph {
     }
 
     /// Find a file node by path (supports partial matching for relative imports)
+    ///
+    /// This uses pre-built indexes for O(1) lookups instead of O(n) iteration:
+    /// 1. Exact path match via path_to_file
+    /// 2. Module path (dot-separated) via module_to_file
+    /// 3. Path suffix match via suffix_to_file
     pub fn find_file_by_path(&self, path: &str) -> Option<NodeIndex> {
-        // Try exact match first
+        // Try exact match first (fastest)
         if let Some(&idx) = self.path_to_file.get(path) {
             return Some(idx);
         }
 
-        // Try suffix matching for relative imports
-        for (file_path, &idx) in &self.path_to_file {
-            if file_path.ends_with(path) {
-                return Some(idx);
+        // Try module path lookup (e.g., "auth.middleware" -> "auth/middleware.py")
+        if let Some(&idx) = self.module_to_file.get(path) {
+            return Some(idx);
+        }
+
+        // Try suffix match via pre-built index
+        if let Some(&idx) = self.suffix_to_file.get(path) {
+            return Some(idx);
+        }
+
+        // Try converting module path to file path and lookup
+        if path.contains('.') {
+            let file_path = path.replace('.', "/");
+            // Try with common extensions
+            for ext in &[".py", ".ts", ".tsx", ".js", ".go", ".rs"] {
+                let full_path = format!("{}{}", file_path, ext);
+                if let Some(&idx) = self.suffix_to_file.get(&full_path) {
+                    return Some(idx);
+                }
             }
-            // Handle module-style paths (e.g., "auth.middleware" -> "auth/middleware.py")
-            let module_path = path.replace('.', "/");
-            if file_path.ends_with(&format!("{}.py", module_path))
-                || file_path.ends_with(&format!("{}/", module_path))
-                || file_path.ends_with(&format!("{}.ts", module_path))
-                || file_path.ends_with(&format!("{}.go", module_path))
-                || file_path.ends_with(&format!("{}.rs", module_path))
-            {
+            // Try __init__.py for package imports
+            let init_path = format!("{}/__init__.py", file_path);
+            if let Some(&idx) = self.suffix_to_file.get(&init_path) {
                 return Some(idx);
             }
         }
+
         None
     }
 
@@ -436,6 +490,91 @@ impl CodeGraph {
             total_edges: self.graph.edge_count(),
         }
     }
+
+    /// Rebuild all lookup indexes from the graph.
+    ///
+    /// This must be called after deserializing a CodeGraph to restore
+    /// the quick-lookup HashMaps that are skipped during serialization.
+    pub fn rebuild_indexes(&mut self) {
+        self.file_nodes.clear();
+        self.path_to_file.clear();
+        self.suffix_to_file.clear();
+        self.module_to_file.clear();
+        self.external_modules.clear();
+        self.function_nodes.clear();
+        self.class_nodes.clear();
+
+        for node_idx in self.graph.node_indices() {
+            match &self.graph[node_idx] {
+                GraphNode::File { file_id, path, .. } => {
+                    self.file_nodes.insert(*file_id, node_idx);
+                    self.path_to_file.insert(path.clone(), node_idx);
+                    // Build suffix indexes for fast import resolution
+                    Self::add_path_to_indexes(
+                        path,
+                        node_idx,
+                        &mut self.suffix_to_file,
+                        &mut self.module_to_file,
+                    );
+                }
+                GraphNode::Function { file_id, name, .. } => {
+                    self.function_nodes.insert((*file_id, name.clone()), node_idx);
+                }
+                GraphNode::Class { file_id, name, .. } => {
+                    self.class_nodes.insert((*file_id, name.clone()), node_idx);
+                }
+                GraphNode::ExternalModule { name, .. } => {
+                    self.external_modules.insert(name.clone(), node_idx);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Add a path to suffix and module indexes for fast lookup
+    fn add_path_to_indexes(
+        path: &str,
+        node_idx: NodeIndex,
+        suffix_to_file: &mut HashMap<String, NodeIndex>,
+        module_to_file: &mut HashMap<String, NodeIndex>,
+    ) {
+        // Add various suffixes for import resolution
+        // e.g., "src/auth/middleware.py" -> ["middleware.py", "auth/middleware.py", "src/auth/middleware.py"]
+        let parts: Vec<&str> = path.split('/').collect();
+        for i in 0..parts.len() {
+            let suffix: String = parts[i..].join("/");
+            // Only insert if not already present (first path wins)
+            suffix_to_file.entry(suffix).or_insert(node_idx);
+        }
+
+        // Add module-style path (dots instead of slashes, no extension)
+        // e.g., "src/auth/middleware.py" -> "src.auth.middleware"
+        if let Some(without_ext) = path.strip_suffix(".py")
+            .or_else(|| path.strip_suffix(".ts"))
+            .or_else(|| path.strip_suffix(".tsx"))
+            .or_else(|| path.strip_suffix(".js"))
+            .or_else(|| path.strip_suffix(".go"))
+            .or_else(|| path.strip_suffix(".rs"))
+        {
+            let module_path = without_ext.replace('/', ".");
+            module_to_file.entry(module_path.clone()).or_insert(node_idx);
+
+            // Also add partial module paths
+            let mod_parts: Vec<&str> = module_path.split('.').collect();
+            for i in 0..mod_parts.len() {
+                let partial: String = mod_parts[i..].join(".");
+                module_to_file.entry(partial).or_insert(node_idx);
+            }
+        }
+
+        // Special case for __init__.py - map directory to the init file
+        if path.ends_with("__init__.py") {
+            if let Some(dir_path) = path.strip_suffix("/__init__.py") {
+                let module_path = dir_path.replace('/', ".");
+                module_to_file.entry(module_path).or_insert(node_idx);
+            }
+        }
+    }
 }
 
 impl Default for CodeGraph {
@@ -445,7 +584,7 @@ impl Default for CodeGraph {
 }
 
 /// Statistics about the code graph
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GraphStats {
     pub file_count: usize,
     pub function_count: usize,
@@ -467,7 +606,7 @@ pub struct GraphStats {
 pub fn build_code_graph(sem_entries: &[(FileId, Arc<SourceSemantics>)]) -> CodeGraph {
     let mut cg = CodeGraph::new();
 
-    // First pass: create file nodes and collect path mappings
+    // First pass: create file nodes and collect path mappings with suffix indexes
     for (file_id, sem) in sem_entries {
         let (path, language) = match sem.as_ref() {
             SourceSemantics::Python(py) => (py.path.clone(), Language::Python),
@@ -483,7 +622,15 @@ pub fn build_code_graph(sem_entries: &[(FileId, Arc<SourceSemantics>)]) -> CodeG
         });
 
         cg.file_nodes.insert(*file_id, node_index);
-        cg.path_to_file.insert(path, node_index);
+        cg.path_to_file.insert(path.clone(), node_index);
+        
+        // Build suffix and module indexes for fast import resolution
+        CodeGraph::add_path_to_indexes(
+            &path,
+            node_index,
+            &mut cg.suffix_to_file,
+            &mut cg.module_to_file,
+        );
     }
 
     // Second pass: add functions, classes, imports, and framework-specific nodes
@@ -519,7 +666,7 @@ pub fn build_code_graph(sem_entries: &[(FileId, Arc<SourceSemantics>)]) -> CodeG
     }
 
     // Third pass: add Calls edges between functions
-    // For now we only resolve intra-file calls (callee within the same file)
+    // First resolve intra-file calls (callee within the same file)
     for (file_id, sem) in sem_entries {
         let functions = match sem.as_ref() {
             SourceSemantics::Python(py) => py.functions(),
@@ -544,12 +691,161 @@ pub fn build_code_graph(sem_entries: &[(FileId, Arc<SourceSemantics>)]) -> CodeG
                     cg.graph
                         .add_edge(caller_node, callee_node, GraphEdgeKind::Calls);
                 }
-                // TODO: Cross-file call resolution would require import analysis
             }
         }
     }
 
+    // Fourth pass: add cross-file Calls edges using import analysis
+    add_cross_file_call_edges(&mut cg, sem_entries);
+
     cg
+}
+
+/// Add cross-file Calls edges by resolving function calls through imports.
+///
+/// For each call that wasn't resolved intra-file:
+/// 1. Check if the callee name matches an imported item
+/// 2. Find the source file of that import
+/// 3. Look for the function in that file
+/// 4. Add a Calls edge if found
+fn add_cross_file_call_edges(
+    cg: &mut CodeGraph,
+    sem_entries: &[(FileId, Arc<SourceSemantics>)],
+) {
+    // Build a lookup: file_id -> Vec<Import>
+    let imports_by_file: HashMap<FileId, Vec<Import>> = sem_entries
+        .iter()
+        .map(|(file_id, sem)| {
+            let imports = match sem.as_ref() {
+                SourceSemantics::Python(py) => py.imports(),
+                SourceSemantics::Go(go) => go.imports(),
+                SourceSemantics::Rust(rs) => rs.imports(),
+                SourceSemantics::Typescript(ts) => ts.imports(),
+            };
+            (*file_id, imports)
+        })
+        .collect();
+
+    // For each file and its functions
+    for (file_id, sem) in sem_entries {
+        let functions = match sem.as_ref() {
+            SourceSemantics::Python(py) => py.functions(),
+            SourceSemantics::Go(go) => go.functions(),
+            SourceSemantics::Rust(rs) => rs.functions(),
+            SourceSemantics::Typescript(ts) => ts.functions(),
+        };
+
+        let empty_imports = Vec::new();
+        let imports = imports_by_file.get(file_id).unwrap_or(&empty_imports);
+
+        for func in functions {
+            // Get the caller node
+            let caller_key = (*file_id, func.name.clone());
+            let Some(&caller_node) = cg.function_nodes.get(&caller_key) else {
+                continue;
+            };
+
+            // Process each call site
+            for call in &func.calls {
+                // Skip if already resolved intra-file
+                let callee_key = (*file_id, call.callee.clone());
+                if cg.function_nodes.contains_key(&callee_key) {
+                    continue;
+                }
+
+                // Try to resolve through imports
+                if let Some(callee_node) =
+                    resolve_call_through_imports(cg, &call.callee, &call.callee_expr, imports)
+                {
+                    cg.graph
+                        .add_edge(caller_node, callee_node, GraphEdgeKind::Calls);
+                }
+            }
+        }
+    }
+}
+
+/// Try to resolve a function call through imports.
+///
+/// Returns the NodeIndex of the callee function if found.
+fn resolve_call_through_imports(
+    cg: &CodeGraph,
+    callee: &str,
+    callee_expr: &str,
+    imports: &[Import],
+) -> Option<NodeIndex> {
+    // Strategy 1: Direct import match
+    // e.g., `from utils import process` then call `process()`
+    for import in imports {
+        // Check if the callee is a directly imported item
+        if import.imports_item(callee) {
+            // Find the source file for this import
+            if let Some(source_file_idx) = find_import_source_file(cg, &import.module_path) {
+                // Get the file_id from the source file node
+                if let GraphNode::File { file_id, .. } = &cg.graph[source_file_idx] {
+                    // Look for the function in that file
+                    let callee_key = (*file_id, callee.to_string());
+                    if let Some(&func_node) = cg.function_nodes.get(&callee_key) {
+                        return Some(func_node);
+                    }
+                }
+            }
+        }
+    }
+
+    // Strategy 2: Module attribute access
+    // e.g., `import utils` then call `utils.process()`
+    // The callee_expr would be "utils.process" and callee would be "process"
+    if callee_expr.contains('.') {
+        let parts: Vec<&str> = callee_expr.split('.').collect();
+        if parts.len() >= 2 {
+            let module_alias = parts[0];
+            let func_name = parts[parts.len() - 1];
+
+            for import in imports {
+                // Check if module was imported with this alias
+                let matches_alias = import.module_alias.as_deref() == Some(module_alias)
+                    || import.local_module_name() == Some(module_alias);
+
+                if matches_alias {
+                    if let Some(source_file_idx) = find_import_source_file(cg, &import.module_path) {
+                        if let GraphNode::File { file_id, .. } = &cg.graph[source_file_idx] {
+                            let callee_key = (*file_id, func_name.to_string());
+                            if let Some(&func_node) = cg.function_nodes.get(&callee_key) {
+                                return Some(func_node);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Find the file node that corresponds to an import module path.
+fn find_import_source_file(cg: &CodeGraph, module_path: &str) -> Option<NodeIndex> {
+    // Try various path patterns
+    let module_as_file = module_path.replace('.', "/");
+    let possible_paths = [
+        format!("{}.py", module_as_file),
+        format!("{}/__init__.py", module_as_file),
+        format!("{}.ts", module_as_file),
+        format!("{}.tsx", module_as_file),
+        format!("{}.js", module_as_file),
+        format!("{}.go", module_as_file),
+        format!("{}.rs", module_as_file),
+        module_as_file.clone(),
+    ];
+
+    for path in &possible_paths {
+        if let Some(idx) = cg.find_file_by_path(path) {
+            return Some(idx);
+        }
+    }
+
+    None
 }
 
 /// Add import edges from a file to other files or external modules
@@ -612,6 +908,9 @@ fn add_import_edges(
 }
 
 /// Add function nodes from a file
+///
+/// For Python files with FastAPI, route handlers are skipped here since
+/// they will be added by `add_fastapi_nodes()` with HTTP method/path metadata.
 fn add_function_nodes(
     cg: &mut CodeGraph,
     file_node: NodeIndex,
@@ -626,7 +925,25 @@ fn add_function_nodes(
         SourceSemantics::Typescript(ts) => ts.functions(),
     };
 
+    // For Python files with FastAPI, collect route handler names to skip
+    // (they'll be added by add_fastapi_nodes with HTTP metadata)
+    let fastapi_handler_names: std::collections::HashSet<&str> = match sem.as_ref() {
+        SourceSemantics::Python(py) => {
+            if let Some(fastapi) = &py.fastapi {
+                fastapi.routes.iter().map(|r| r.handler_name.as_str()).collect()
+            } else {
+                std::collections::HashSet::new()
+            }
+        }
+        _ => std::collections::HashSet::new(),
+    };
+
     for func in functions {
+        // Skip FastAPI route handlers - they're added by add_fastapi_nodes with HTTP metadata
+        if fastapi_handler_names.contains(func.name.as_str()) {
+            continue;
+        }
+
         let qualified_name = match &func.class_name {
             Some(class) => format!("{}.{}", class, func.name),
             None => func.name.clone(),
@@ -638,6 +955,8 @@ fn add_function_nodes(
             qualified_name: qualified_name.clone(),
             is_async: func.is_async,
             is_handler: func.is_route_handler(),
+            http_method: None,
+            http_path: None,
         });
 
         // File contains function
@@ -791,6 +1110,30 @@ fn add_fastapi_nodes(
             cg.graph
                 .add_edge(*app_node, route_node, GraphEdgeKind::FastApiAppOwnsRoute);
         }
+
+        // Also create a function node for the route handler with HTTP metadata
+        let qualified_name = route.handler_name.clone();
+        let func_node = cg.graph.add_node(GraphNode::Function {
+            file_id,
+            name: route.handler_name.clone(),
+            qualified_name,
+            is_async: route.is_async,
+            is_handler: true,
+            http_method: Some(route.http_method.clone()),
+            http_path: Some(route.path.clone()),
+        });
+
+        // File contains function
+        cg.graph
+            .add_edge(file_node, func_node, GraphEdgeKind::Contains);
+
+        // Function is the route handler
+        cg.graph
+            .add_edge(func_node, route_node, GraphEdgeKind::Contains);
+
+        // Store for lookup (needed for call resolution)
+        cg.function_nodes
+            .insert((file_id, route.handler_name.clone()), func_node);
     }
 
     // Middlewares
@@ -898,6 +1241,8 @@ mod tests {
             qualified_name: "MyClass.my_func".to_string(),
             is_async: true,
             is_handler: false,
+            http_method: None,
+            http_path: None,
         };
         let debug_str = format!("{:?}", node);
         assert!(debug_str.contains("Function"));
@@ -976,6 +1321,8 @@ mod tests {
             qualified_name: "Handler.process".to_string(),
             is_async: false,
             is_handler: true,
+            http_method: None,
+            http_path: None,
         };
         assert_eq!(func.display_name(), "Handler.process");
 
@@ -1017,6 +1364,8 @@ mod tests {
             qualified_name: "test".to_string(),
             is_async: false,
             is_handler: false,
+            http_method: None,
+            http_path: None,
         };
         assert!(!func.is_file());
     }
@@ -1455,6 +1804,8 @@ def bar():
             qualified_name: "func_a".to_string(),
             is_async: false,
             is_handler: false,
+            http_method: None,
+            http_path: None,
         });
 
         let func_b = cg.graph.add_node(GraphNode::Function {
@@ -1463,6 +1814,8 @@ def bar():
             qualified_name: "func_b".to_string(),
             is_async: false,
             is_handler: false,
+            http_method: None,
+            http_path: None,
         });
 
         // File contains both functions
@@ -1491,5 +1844,201 @@ def bar():
     fn graph_edge_kind_calls_eq() {
         assert_eq!(GraphEdgeKind::Calls, GraphEdgeKind::Calls);
         assert_ne!(GraphEdgeKind::Calls, GraphEdgeKind::Contains);
+    }
+
+    // ==================== Serialization / Rebuild Tests ====================
+
+    #[test]
+    fn rebuild_indexes_restores_lookups() {
+        // Build a graph manually
+        let mut cg = CodeGraph::new();
+
+        let file_id = FileId(1);
+        let file_node = cg.graph.add_node(GraphNode::File {
+            file_id,
+            path: "test.py".to_string(),
+            language: Language::Python,
+        });
+        cg.file_nodes.insert(file_id, file_node);
+        cg.path_to_file.insert("test.py".to_string(), file_node);
+
+        let func_node = cg.graph.add_node(GraphNode::Function {
+            file_id,
+            name: "my_func".to_string(),
+            qualified_name: "my_func".to_string(),
+            is_async: false,
+            is_handler: false,
+            http_method: None,
+            http_path: None,
+        });
+        cg.function_nodes
+            .insert((file_id, "my_func".to_string()), func_node);
+
+        let class_node = cg.graph.add_node(GraphNode::Class {
+            file_id,
+            name: "MyClass".to_string(),
+        });
+        cg.class_nodes
+            .insert((file_id, "MyClass".to_string()), class_node);
+
+        let ext_node = cg.graph.add_node(GraphNode::ExternalModule {
+            name: "requests".to_string(),
+            category: ModuleCategory::HttpClient,
+        });
+        cg.external_modules.insert("requests".to_string(), ext_node);
+
+        // Simulate serialization by clearing all the lookup maps
+        cg.file_nodes.clear();
+        cg.path_to_file.clear();
+        cg.function_nodes.clear();
+        cg.class_nodes.clear();
+        cg.external_modules.clear();
+
+        // Verify lookups are empty
+        assert!(cg.file_nodes.is_empty());
+        assert!(cg.path_to_file.is_empty());
+        assert!(cg.function_nodes.is_empty());
+        assert!(cg.class_nodes.is_empty());
+        assert!(cg.external_modules.is_empty());
+
+        // Rebuild indexes
+        cg.rebuild_indexes();
+
+        // Verify lookups are restored
+        assert!(cg.file_nodes.contains_key(&file_id));
+        assert!(cg.path_to_file.contains_key("test.py"));
+        assert!(cg.function_nodes.contains_key(&(file_id, "my_func".to_string())));
+        assert!(cg.class_nodes.contains_key(&(file_id, "MyClass".to_string())));
+        assert!(cg.external_modules.contains_key("requests"));
+    }
+
+    #[test]
+    fn rebuild_indexes_clears_stale_data() {
+        let mut cg = CodeGraph::new();
+
+        // Add some stale data to lookups (not matching graph)
+        cg.file_nodes.insert(FileId(999), NodeIndex::new(0));
+        cg.external_modules
+            .insert("stale_module".to_string(), NodeIndex::new(0));
+
+        // Add a real node
+        let file_id = FileId(1);
+        let _file_node = cg.graph.add_node(GraphNode::File {
+            file_id,
+            path: "real.py".to_string(),
+            language: Language::Python,
+        });
+
+        // Rebuild should clear stale data and add real data
+        cg.rebuild_indexes();
+
+        // Stale data should be gone
+        assert!(!cg.file_nodes.contains_key(&FileId(999)));
+        assert!(!cg.external_modules.contains_key("stale_module"));
+
+        // Real data should be present
+        assert!(cg.file_nodes.contains_key(&file_id));
+        assert!(cg.path_to_file.contains_key("real.py"));
+    }
+
+    #[test]
+    fn code_graph_serde_roundtrip() {
+        // Build a simple graph
+        let src = r#"
+import requests
+
+def process():
+    pass
+"#;
+        let (file_id, sem) = parse_and_build_semantics("main.py", src);
+        let sem_entries = vec![(file_id, sem)];
+        let cg = build_code_graph(&sem_entries);
+
+        // Record stats before serialization
+        let stats_before = cg.stats();
+
+        // Serialize to JSON
+        let json = serde_json::to_string(&cg).expect("serialization should succeed");
+
+        // Deserialize
+        let mut cg_restored: CodeGraph =
+            serde_json::from_str(&json).expect("deserialization should succeed");
+
+        // Lookups should be empty after deserialization
+        assert!(cg_restored.file_nodes.is_empty());
+        assert!(cg_restored.external_modules.is_empty());
+
+        // Rebuild indexes
+        cg_restored.rebuild_indexes();
+
+        // Stats should match
+        let stats_after = cg_restored.stats();
+        assert_eq!(stats_before.file_count, stats_after.file_count);
+        assert_eq!(stats_before.function_count, stats_after.function_count);
+        assert_eq!(
+            stats_before.external_module_count,
+            stats_after.external_module_count
+        );
+        assert_eq!(stats_before.total_nodes, stats_after.total_nodes);
+        assert_eq!(stats_before.total_edges, stats_after.total_edges);
+
+        // Lookups should work
+        assert!(cg_restored.file_nodes.contains_key(&file_id));
+        assert!(cg_restored.external_modules.contains_key("requests"));
+    }
+
+    // ==================== Cross-File Call Edge Tests ====================
+
+    #[test]
+    fn cross_file_call_edge_direct_import() {
+        // File 1 defines a helper function
+        let helper_src = r#"
+def helper_func():
+    return 42
+"#;
+        let (helper_id, helper_sem) = parse_python_with_id("helpers.py", helper_src, 1);
+
+        // File 2 imports and calls the helper
+        let main_src = r#"
+from helpers import helper_func
+
+def main():
+    result = helper_func()
+    return result
+"#;
+        let (main_id, main_sem) = parse_python_with_id("main.py", main_src, 2);
+
+        let sem_entries = vec![(helper_id, helper_sem), (main_id, main_sem)];
+        let cg = build_code_graph(&sem_entries);
+
+        // Both functions should exist
+        assert!(cg.function_nodes.contains_key(&(helper_id, "helper_func".to_string())));
+        assert!(cg.function_nodes.contains_key(&(main_id, "main".to_string())));
+
+        // Check that there's an import edge from main.py to helpers.py
+        let stats = cg.stats();
+        assert!(stats.import_edge_count >= 1);
+    }
+
+    #[test]
+    fn find_import_source_file_returns_none_for_external() {
+        let src = "x = 1";
+        let (file_id, sem) = parse_and_build_semantics("test.py", src);
+        let sem_entries = vec![(file_id, sem)];
+        let cg = build_code_graph(&sem_entries);
+
+        // Should return None for an external module
+        assert!(find_import_source_file(&cg, "requests").is_none());
+        assert!(find_import_source_file(&cg, "fastapi.FastAPI").is_none());
+    }
+
+    #[test]
+    fn find_import_source_file_finds_local_file() {
+        let (file_id, sem) = parse_and_build_semantics("utils.py", "x = 1");
+        let sem_entries = vec![(file_id, sem)];
+        let cg = build_code_graph(&sem_entries);
+
+        // Should find the local file
+        assert!(find_import_source_file(&cg, "utils").is_some());
     }
 }

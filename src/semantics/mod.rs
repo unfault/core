@@ -6,6 +6,7 @@ pub mod rust;
 pub mod typescript;
 
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 
 use crate::parse::ast::{FileId, ParsedFile};
 use crate::types::context::Language;
@@ -23,7 +24,7 @@ pub use common::{
 /// Language-agnostic wrapper for per-file semantics.
 ///
 /// Each variant contains the rich, language-specific model.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SourceSemantics {
     Python(PyFileSemantics),
     Go(GoFileSemantics),

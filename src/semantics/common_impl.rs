@@ -272,20 +272,21 @@ fn convert_py_call_site(call: &PyCallSite) -> FunctionCall {
     // Extract callee name (the function being called)
     // For method calls like "obj.method()", callee is "method"
     // For simple calls like "func()", callee is "func"
-    let (callee, receiver) = if let Some(idx) = call.callee.rfind('.') {
-        let callee_name = call.callee[idx + 1..].to_string();
-        let receiver_name = call.callee[..idx].to_string();
+    let callee_expr = &call.function_call.callee_expr;
+    let (callee, receiver) = if let Some(idx) = callee_expr.rfind('.') {
+        let callee_name = callee_expr[idx + 1..].to_string();
+        let receiver_name = callee_expr[..idx].to_string();
         (callee_name, Some(receiver_name))
     } else {
-        (call.callee.clone(), None)
+        (callee_expr.clone(), None)
     };
 
     FunctionCall {
         callee,
-        callee_expr: call.callee.clone(),
+        callee_expr: callee_expr.clone(),
         receiver,
-        line: call.location.range.start_line + 1,
-        column: call.location.range.start_col + 1,
+        line: call.function_call.location.line,
+        column: call.function_call.location.column,
     }
 }
 

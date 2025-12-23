@@ -4,6 +4,7 @@
 //! implemented by each language's semantic model, enabling shared rule logic.
 
 pub mod async_ops;
+pub mod calls;
 pub mod db;
 pub mod frameworks;
 pub mod functions;

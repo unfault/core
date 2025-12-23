@@ -30,6 +30,8 @@ use crate::semantics::go::frameworks::GoFrameworkSummary;
 use crate::semantics::go::model::GoFileSemantics;
 use crate::semantics::python::fastapi::FastApiFileSummary;
 use crate::semantics::python::model::PyFileSemantics;
+use crate::semantics::rust::frameworks::RustFrameworkSummary;
+use crate::semantics::rust::model::RustFileSemantics;
 use crate::semantics::typescript::model::{ExpressFileSummary, TsFileSemantics};
 use crate::types::context::Language;
 
@@ -662,8 +664,11 @@ pub fn build_code_graph(sem_entries: &[(FileId, Arc<SourceSemantics>)]) -> CodeG
                     add_go_framework_nodes(&mut cg, file_node, *file_id, go, framework);
                 }
             }
-            SourceSemantics::Rust(_rs) => {
-                // TODO: Add Rust framework-specific nodes (Actix, Axum, Rocket, etc.)
+            SourceSemantics::Rust(rs) => {
+                // Add Rust framework-specific nodes (Axum, Actix-web, Rocket, Warp, etc.)
+                if let Some(framework) = &rs.rust_framework {
+                    add_rust_framework_nodes(&mut cg, file_node, *file_id, rs, framework);
+                }
             }
             SourceSemantics::Typescript(ts) => {
                 if let Some(express) = &ts.express {
@@ -965,7 +970,16 @@ fn add_function_nodes(
                 std::collections::HashSet::new()
             }
         }
-        _ => std::collections::HashSet::new(),
+        SourceSemantics::Rust(rs) => {
+            // Skip Rust framework route handlers (Axum, Actix-web, Rocket, Warp)
+            if let Some(framework) = &rs.rust_framework {
+                framework.routes.iter()
+                    .map(|r| r.handler_name.as_str())
+                    .collect()
+            } else {
+                std::collections::HashSet::new()
+            }
+        }
     };
 
     for func in functions {
@@ -1270,6 +1284,47 @@ fn add_go_framework_nodes(
             is_async: false, // Go doesn't have async keyword
             is_handler: true,
             http_method: Some(route.http_method.clone()),
+            http_path: Some(route.path.clone()),
+        });
+
+        // File contains function
+        cg.graph
+            .add_edge(file_node, func_node, GraphEdgeKind::Contains);
+
+        // Store for lookup (needed for call resolution)
+        cg.function_nodes.insert((file_id, handler_name), func_node);
+    }
+}
+
+/// Add Rust HTTP framework route handlers as function nodes with HTTP metadata.
+///
+/// This creates function nodes for Axum, Actix-web, Rocket, Warp, and Poem route handlers
+/// with `http_method` and `http_path` fields populated, similar to how FastAPI routes
+/// are handled.
+fn add_rust_framework_nodes(
+    cg: &mut CodeGraph,
+    file_node: NodeIndex,
+    file_id: FileId,
+    _rs: &RustFileSemantics,
+    framework: &RustFrameworkSummary,
+) {
+    // Routes - create function nodes with HTTP metadata
+    for route in &framework.routes {
+        let handler_name = route.handler_name.clone();
+
+        // Skip if this function was already added by add_function_nodes
+        if cg.function_nodes.contains_key(&(file_id, handler_name.clone())) {
+            // We could update the existing node, but for simplicity we skip
+            continue;
+        }
+
+        let func_node = cg.graph.add_node(GraphNode::Function {
+            file_id,
+            name: handler_name.clone(),
+            qualified_name: handler_name.clone(),
+            is_async: route.is_async,
+            is_handler: true,
+            http_method: Some(route.method.clone()),
             http_path: Some(route.path.clone()),
         });
 

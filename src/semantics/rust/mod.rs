@@ -4,8 +4,12 @@
 //! extracting information about functions, types, async operations,
 //! error handling patterns, and more.
 
+pub mod frameworks;
 pub mod model;
 
+pub use frameworks::{
+    RustFrameworkRoute, RustFrameworkSummary, RustFrameworkType, RustMiddlewareInfo, RustRouteScope,
+};
 pub use model::RustFileSemantics;
 
 use anyhow::Result;
@@ -21,7 +25,16 @@ pub fn build_rust_semantics(parsed: &ParsedFile) -> Result<RustFileSemantics> {
     analyze_async_patterns(parsed, &mut sem);
     analyze_error_handling(parsed, &mut sem);
     analyze_unsafe_patterns(parsed, &mut sem);
+    analyze_frameworks(parsed, &mut sem);
     Ok(sem)
+}
+
+/// Analyze HTTP framework usage (Axum, Actix-web, Rocket, Warp, etc.).
+fn analyze_frameworks(parsed: &ParsedFile, sem: &mut RustFileSemantics) {
+    let summary = frameworks::extract_rust_routes(parsed);
+    if summary.has_framework() {
+        sem.rust_framework = Some(summary);
+    }
 }
 
 /// Context for tracking state during AST traversal.

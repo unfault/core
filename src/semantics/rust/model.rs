@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::parse::ast::{AstLocation, FileId, ParsedFile};
+use crate::semantics::rust::frameworks::RustFrameworkSummary;
 use crate::types::context::Language;
 
 /// Semantic model for a single Rust file.
@@ -68,6 +69,9 @@ pub struct RustFileSemantics {
 
     /// Variable bindings (let declarations and loop variables)
     pub variable_bindings: Vec<VariableBinding>,
+
+    /// HTTP framework information (Axum, Actix-web, Rocket, Warp, etc.)
+    pub rust_framework: Option<RustFrameworkSummary>,
 }
 
 /// Use statement (import).
@@ -660,6 +664,7 @@ impl RustFileSemantics {
             calls: Vec::new(),
             field_accesses: Vec::new(),
             variable_bindings: Vec::new(),
+            rust_framework: None,
         }
     }
 }

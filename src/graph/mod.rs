@@ -28,6 +28,7 @@ use crate::semantics::{Import, SourceSemantics};
 use crate::semantics::common::CommonSemantics;
 use crate::semantics::python::fastapi::FastApiFileSummary;
 use crate::semantics::python::model::PyFileSemantics;
+use crate::semantics::typescript::model::{ExpressFileSummary, TsFileSemantics};
 use crate::types::context::Language;
 
 /// Category of external modules for better organization
@@ -659,8 +660,10 @@ pub fn build_code_graph(sem_entries: &[(FileId, Arc<SourceSemantics>)]) -> CodeG
             SourceSemantics::Rust(_rs) => {
                 // TODO: Add Rust framework-specific nodes (Actix, Axum, Rocket, etc.)
             }
-            SourceSemantics::Typescript(_ts) => {
-                // TODO: Add TypeScript framework-specific nodes (Express, NestJS, etc.)
+            SourceSemantics::Typescript(ts) => {
+                if let Some(express) = &ts.express {
+                    add_express_nodes(&mut cg, file_node, *file_id, ts, express);
+                }
             }
         }
     }
@@ -909,8 +912,9 @@ fn add_import_edges(
 
 /// Add function nodes from a file
 ///
-/// For Python files with FastAPI, route handlers are skipped here since
-/// they will be added by `add_fastapi_nodes()` with HTTP method/path metadata.
+/// For Python files with FastAPI and TypeScript files with Express.js, route handlers
+/// are skipped here since they will be added by framework-specific functions with
+/// HTTP method/path metadata.
 fn add_function_nodes(
     cg: &mut CodeGraph,
     file_node: NodeIndex,
@@ -925,12 +929,23 @@ fn add_function_nodes(
         SourceSemantics::Typescript(ts) => ts.functions(),
     };
 
-    // For Python files with FastAPI, collect route handler names to skip
-    // (they'll be added by add_fastapi_nodes with HTTP metadata)
-    let fastapi_handler_names: std::collections::HashSet<&str> = match sem.as_ref() {
+    // Collect framework route handler names to skip
+    // (they'll be added by framework-specific functions with HTTP metadata)
+    let handler_names_to_skip: std::collections::HashSet<&str> = match sem.as_ref() {
         SourceSemantics::Python(py) => {
+            // Skip FastAPI route handlers
             if let Some(fastapi) = &py.fastapi {
                 fastapi.routes.iter().map(|r| r.handler_name.as_str()).collect()
+            } else {
+                std::collections::HashSet::new()
+            }
+        }
+        SourceSemantics::Typescript(ts) => {
+            // Skip Express route handlers
+            if let Some(express) = &ts.express {
+                express.routes.iter()
+                    .filter_map(|r| r.handler_name.as_deref())
+                    .collect()
             } else {
                 std::collections::HashSet::new()
             }
@@ -939,8 +954,8 @@ fn add_function_nodes(
     };
 
     for func in functions {
-        // Skip FastAPI route handlers - they're added by add_fastapi_nodes with HTTP metadata
-        if fastapi_handler_names.contains(func.name.as_str()) {
+        // Skip framework route handlers - they're added by framework-specific functions with HTTP metadata
+        if handler_names_to_skip.contains(func.name.as_str()) {
             continue;
         }
 
@@ -1156,6 +1171,55 @@ fn add_fastapi_nodes(
     }
 
     let _ = py; // unused for now, but we'll likely need it later.
+}
+
+/// Add Express.js route handlers as function nodes with HTTP metadata.
+///
+/// This creates function nodes for Express route handlers with `http_method`
+/// and `http_path` fields populated, similar to how FastAPI routes are handled.
+fn add_express_nodes(
+    cg: &mut CodeGraph,
+    file_node: NodeIndex,
+    file_id: FileId,
+    _ts: &TsFileSemantics,
+    express: &ExpressFileSummary,
+) {
+    // Routes - create function nodes with HTTP metadata
+    for route in &express.routes {
+        // Only add routes that have a handler name (named function handlers)
+        let handler_name = match &route.handler_name {
+            Some(name) => name.clone(),
+            None => continue, // Skip inline anonymous handlers for now
+        };
+
+        // Skip if this function was already added by add_function_nodes
+        if cg.function_nodes.contains_key(&(file_id, handler_name.clone())) {
+            // Update the existing node with HTTP metadata instead of creating a new one
+            // For now, we skip - but ideally we'd update the existing node
+            // This is a limitation we can fix later by refactoring
+            continue;
+        }
+
+        let http_method = route.method.to_uppercase();
+        let http_path = route.path.clone();
+
+        let func_node = cg.graph.add_node(GraphNode::Function {
+            file_id,
+            name: handler_name.clone(),
+            qualified_name: handler_name.clone(),
+            is_async: route.is_async,
+            is_handler: true,
+            http_method: Some(http_method),
+            http_path,
+        });
+
+        // File contains function
+        cg.graph
+            .add_edge(file_node, func_node, GraphEdgeKind::Contains);
+
+        // Store for lookup (needed for call resolution)
+        cg.function_nodes.insert((file_id, handler_name), func_node);
+    }
 }
 
 #[cfg(test)]
@@ -2040,5 +2104,77 @@ def main():
 
         // Should find the local file
         assert!(find_import_source_file(&cg, "utils").is_some());
+    }
+
+    // ==================== Express.js Graph Tests ====================
+
+    use crate::parse::typescript::parse_typescript_file;
+    use crate::semantics::typescript::model::TsFileSemantics;
+
+    fn parse_typescript_and_build_semantics(path: &str, source: &str) -> (FileId, Arc<SourceSemantics>) {
+        let sf = SourceFile {
+            path: path.to_string(),
+            language: Language::Typescript,
+            content: source.to_string(),
+        };
+        let file_id = FileId(1);
+        let parsed = parse_typescript_file(file_id, &sf).expect("parsing should succeed");
+        let mut sem = TsFileSemantics::from_parsed(&parsed);
+        sem.analyze_frameworks(&parsed)
+            .expect("framework analysis should succeed");
+        (file_id, Arc::new(SourceSemantics::Typescript(sem)))
+    }
+
+    #[test]
+    fn build_code_graph_with_express_routes_with_http_metadata() {
+        let src = r#"
+import express from 'express';
+
+const app = express();
+
+async function getUsers(req, res) {
+    res.json([]);
+}
+
+function createUser(req, res) {
+    res.json({});
+}
+
+app.get('/users', getUsers);
+app.post('/users', createUser);
+"#;
+        let (file_id, sem) = parse_typescript_and_build_semantics("app.ts", src);
+        let sem_entries = vec![(file_id, sem)];
+
+        let cg = build_code_graph(&sem_entries);
+
+        // Should have: file node + 2 function nodes with HTTP metadata
+        let stats = cg.stats();
+        assert_eq!(stats.file_count, 1);
+        assert_eq!(stats.function_count, 2);
+
+        // Check that getUsers has HTTP metadata
+        let get_users_key = (file_id, "getUsers".to_string());
+        assert!(cg.function_nodes.contains_key(&get_users_key));
+        let get_users_idx = cg.function_nodes[&get_users_key];
+        if let GraphNode::Function { http_method, http_path, is_handler, .. } = &cg.graph[get_users_idx] {
+            assert_eq!(*http_method, Some("GET".to_string()));
+            assert_eq!(*http_path, Some("/users".to_string()));
+            assert!(*is_handler);
+        } else {
+            panic!("Expected Function node for getUsers");
+        }
+
+        // Check that createUser has HTTP metadata
+        let create_user_key = (file_id, "createUser".to_string());
+        assert!(cg.function_nodes.contains_key(&create_user_key));
+        let create_user_idx = cg.function_nodes[&create_user_key];
+        if let GraphNode::Function { http_method, http_path, is_handler, .. } = &cg.graph[create_user_idx] {
+            assert_eq!(*http_method, Some("POST".to_string()));
+            assert_eq!(*http_path, Some("/users".to_string()));
+            assert!(*is_handler);
+        } else {
+            panic!("Expected Function node for createUser");
+        }
     }
 }

@@ -380,4 +380,34 @@ app.delete('/users/:id', (req, res) => {});
         let summary = parse_and_summarize(src).unwrap();
         assert_eq!(summary.routes.len(), 3);
     }
+
+    #[test]
+    fn detects_handler_name_for_named_function_reference() {
+        let src = r#"
+const app = express();
+
+async function getUsers(req, res) {
+    res.json([]);
+}
+
+function createUser(req, res) {
+    res.json({});
+}
+
+app.get('/users', getUsers);
+app.post('/users', createUser);
+"#;
+        let summary = parse_and_summarize(src).unwrap();
+        assert_eq!(summary.routes.len(), 2);
+        
+        // First route should have handler_name = getUsers
+        assert_eq!(summary.routes[0].handler_name, Some("getUsers".to_string()));
+        assert_eq!(summary.routes[0].path, Some("/users".to_string()));
+        assert_eq!(summary.routes[0].method, "get");
+        
+        // Second route should have handler_name = createUser
+        assert_eq!(summary.routes[1].handler_name, Some("createUser".to_string()));
+        assert_eq!(summary.routes[1].path, Some("/users".to_string()));
+        assert_eq!(summary.routes[1].method, "post");
+    }
 }

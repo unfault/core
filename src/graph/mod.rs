@@ -725,17 +725,17 @@ fn add_cross_file_call_edges(
     cg: &mut CodeGraph,
     sem_entries: &[(FileId, Arc<SourceSemantics>)],
 ) {
-    // Build a lookup: file_id -> Vec<Import>
-    let imports_by_file: HashMap<FileId, Vec<Import>> = sem_entries
+    // Build a lookup: file_id -> (file_path, Vec<Import>)
+    let imports_by_file: HashMap<FileId, (String, Vec<Import>)> = sem_entries
         .iter()
         .map(|(file_id, sem)| {
-            let imports = match sem.as_ref() {
-                SourceSemantics::Python(py) => py.imports(),
-                SourceSemantics::Go(go) => go.imports(),
-                SourceSemantics::Rust(rs) => rs.imports(),
-                SourceSemantics::Typescript(ts) => ts.imports(),
+            let (path, imports) = match sem.as_ref() {
+                SourceSemantics::Python(py) => (py.path.clone(), py.imports()),
+                SourceSemantics::Go(go) => (go.path.clone(), go.imports()),
+                SourceSemantics::Rust(rs) => (rs.path.clone(), rs.imports()),
+                SourceSemantics::Typescript(ts) => (ts.path.clone(), ts.imports()),
             };
-            (*file_id, imports)
+            (*file_id, (path, imports))
         })
         .collect();
 
@@ -748,8 +748,12 @@ fn add_cross_file_call_edges(
             SourceSemantics::Typescript(ts) => ts.functions(),
         };
 
+        let empty_path = String::new();
         let empty_imports = Vec::new();
-        let imports = imports_by_file.get(file_id).unwrap_or(&empty_imports);
+        let (file_path, imports) = imports_by_file
+            .get(file_id)
+            .map(|(p, i)| (p.as_str(), i.as_slice()))
+            .unwrap_or((empty_path.as_str(), empty_imports.as_slice()));
 
         for func in functions {
             // Get the caller node
@@ -766,9 +770,9 @@ fn add_cross_file_call_edges(
                     continue;
                 }
 
-                // Try to resolve through imports
+                // Try to resolve through imports (with file path context for relative imports)
                 if let Some(callee_node) =
-                    resolve_call_through_imports(cg, &call.callee, &call.callee_expr, imports)
+                    resolve_call_through_imports(cg, &call.callee, &call.callee_expr, imports, file_path)
                 {
                     cg.graph
                         .add_edge(caller_node, callee_node, GraphEdgeKind::Calls);
@@ -781,19 +785,29 @@ fn add_cross_file_call_edges(
 /// Try to resolve a function call through imports.
 ///
 /// Returns the NodeIndex of the callee function if found.
+///
+/// # Arguments
+///
+/// * `cg` - The code graph containing file and function nodes
+/// * `callee` - The simple function name being called (e.g., "add")
+/// * `callee_expr` - The full call expression (e.g., "utils.add" or just "add")
+/// * `imports` - The list of imports in the calling file
+/// * `importing_file_path` - The path of the file making the call (for relative import resolution)
 fn resolve_call_through_imports(
     cg: &CodeGraph,
     callee: &str,
     callee_expr: &str,
     imports: &[Import],
+    importing_file_path: &str,
 ) -> Option<NodeIndex> {
     // Strategy 1: Direct import match
     // e.g., `from utils import process` then call `process()`
+    // or `from .utils import add` then call `add()`
     for import in imports {
         // Check if the callee is a directly imported item
         if import.imports_item(callee) {
-            // Find the source file for this import
-            if let Some(source_file_idx) = find_import_source_file(cg, &import.module_path) {
+            // Find the source file for this import, with context for relative imports
+            if let Some(source_file_idx) = find_import_source_file_with_context(cg, &import.module_path, importing_file_path) {
                 // Get the file_id from the source file node
                 if let GraphNode::File { file_id, .. } = &cg.graph[source_file_idx] {
                     // Look for the function in that file
@@ -821,7 +835,7 @@ fn resolve_call_through_imports(
                     || import.local_module_name() == Some(module_alias);
 
                 if matches_alias {
-                    if let Some(source_file_idx) = find_import_source_file(cg, &import.module_path) {
+                    if let Some(source_file_idx) = find_import_source_file_with_context(cg, &import.module_path, importing_file_path) {
                         if let GraphNode::File { file_id, .. } = &cg.graph[source_file_idx] {
                             let callee_key = (*file_id, func_name.to_string());
                             if let Some(&func_node) = cg.function_nodes.get(&callee_key) {
@@ -835,6 +849,32 @@ fn resolve_call_through_imports(
     }
 
     None
+}
+
+/// Find the file node for an import, with context for relative import resolution.
+///
+/// This function can resolve both absolute and relative imports.
+///
+/// # Arguments
+///
+/// * `cg` - The code graph containing file nodes
+/// * `module_path` - The module path from the import (e.g., ".utils", "pkg.models")
+/// * `importing_file_path` - The path of the file doing the import (for relative resolution)
+fn find_import_source_file_with_context(cg: &CodeGraph, module_path: &str, importing_file_path: &str) -> Option<NodeIndex> {
+    // Handle relative imports
+    if module_path.starts_with('.') {
+        // Use the same resolution logic as add_import_edges
+        let possible_paths = resolve_relative_import(importing_file_path, module_path);
+        for path in &possible_paths {
+            if let Some(idx) = cg.find_file_by_path(path) {
+                return Some(idx);
+            }
+        }
+        return None;
+    }
+    
+    // For absolute imports, delegate to the existing function
+    find_import_source_file(cg, module_path)
 }
 
 /// Find the file node that corresponds to an import module path.
@@ -2504,5 +2544,71 @@ from ..utils import helper
         // Relative imports can't be resolved without the importing file context
         assert!(find_import_source_file(&cg, ".utils").is_none());
         assert!(find_import_source_file(&cg, "..models").is_none());
+    }
+
+    #[test]
+    fn cross_file_call_edge_with_relative_import() {
+        // This is the exact scenario from the bug report:
+        // utils.py defines add(), app.py imports via `from .utils import add` and calls it
+        
+        // utils.py defines the add function
+        let utils_src = r#"
+def add(a, b):
+    return a + b
+"#;
+        let (utils_id, utils_sem) = parse_python_with_id("utils.py", utils_src, 1);
+
+        // app.py imports add via relative import and calls it
+        let app_src = r#"
+from .utils import add
+
+def main():
+    result = add(1, 2)
+    return result
+"#;
+        let (app_id, app_sem) = parse_python_with_id("app.py", app_src, 2);
+
+        let sem_entries = vec![(utils_id, utils_sem), (app_id, app_sem)];
+        let cg = build_code_graph(&sem_entries);
+
+        // Verify both functions exist
+        assert!(cg.function_nodes.contains_key(&(utils_id, "add".to_string())));
+        assert!(cg.function_nodes.contains_key(&(app_id, "main".to_string())));
+
+        // Key assertion: There should be a Calls edge from main() to add()
+        let stats = cg.stats();
+        assert!(stats.calls_edge_count >= 1,
+            "Expected at least 1 Calls edge for cross-file call via relative import, got {}",
+            stats.calls_edge_count);
+
+        // Verify the specific edge exists: main -> add
+        let main_func_idx = cg.function_nodes.get(&(app_id, "main".to_string())).expect("main function should exist");
+        let add_func_idx = cg.function_nodes.get(&(utils_id, "add".to_string())).expect("add function should exist");
+        
+        let mut found_calls_edge = false;
+        for edge in cg.graph.edges(*main_func_idx) {
+            if matches!(edge.weight(), GraphEdgeKind::Calls) {
+                if edge.target() == *add_func_idx {
+                    found_calls_edge = true;
+                    break;
+                }
+            }
+        }
+        assert!(found_calls_edge, "Expected Calls edge from main() to add()");
+    }
+
+    #[test]
+    fn find_import_source_file_with_context_resolves_relative() {
+        // Set up a graph with a utils.py file
+        let (utils_id, utils_sem) = parse_python_with_id("utils.py", "x = 1", 1);
+        let sem_entries = vec![(utils_id, utils_sem)];
+        let cg = build_code_graph(&sem_entries);
+
+        // Without context, relative import should fail
+        assert!(find_import_source_file(&cg, ".utils").is_none());
+
+        // With context, relative import should succeed
+        let result = find_import_source_file_with_context(&cg, ".utils", "app.py");
+        assert!(result.is_some(), "Expected to find utils.py via relative import from app.py");
     }
 }

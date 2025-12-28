@@ -838,8 +838,18 @@ fn resolve_call_through_imports(
 }
 
 /// Find the file node that corresponds to an import module path.
+///
+/// For relative imports, this function needs the importing file path to resolve
+/// the relative path. When called without that context (from cross-file call resolution),
+/// it only handles absolute imports.
 fn find_import_source_file(cg: &CodeGraph, module_path: &str) -> Option<NodeIndex> {
-    // Try various path patterns
+    // Relative imports start with '.' - these can't be resolved without the importing file path
+    // The add_import_edges function handles relative imports directly
+    if module_path.starts_with('.') {
+        return None;
+    }
+    
+    // Try various path patterns for absolute imports
     let module_as_file = module_path.replace('.', "/");
     let possible_paths = [
         format!("{}.py", module_as_file),
@@ -868,6 +878,14 @@ fn add_import_edges(
     _file_id: FileId,
     sem: &Arc<SourceSemantics>,
 ) {
+    // Get the file path to resolve relative imports
+    let file_path = match sem.as_ref() {
+        SourceSemantics::Python(py) => py.path.clone(),
+        SourceSemantics::Go(go) => go.path.clone(),
+        SourceSemantics::Rust(rs) => rs.path.clone(),
+        SourceSemantics::Typescript(ts) => ts.path.clone(),
+    };
+    
     // Get imports via CommonSemantics trait
     let imports = match sem.as_ref() {
         SourceSemantics::Python(py) => py.imports(),
@@ -885,12 +903,24 @@ fn add_import_edges(
         // We try multiple path patterns to find the file:
         // 1. Exact module path (e.g., "reliably_app.task" -> "reliably_app/task.py")
         // 2. Module path as directory init (e.g., "reliably_app" -> "reliably_app/__init__.py")
-        let module_as_file = import.module_path.replace('.', "/");
-        let possible_paths = [
-            format!("{}.py", module_as_file),
-            format!("{}/__init__.py", module_as_file),
-            module_as_file.clone(),
-        ];
+        // 3. Relative imports (e.g., ".utils" resolved relative to the importing file's directory)
+        
+        let possible_paths = if import.module_path.starts_with('.') {
+            // Handle relative imports (Python-style: from .utils import foo)
+            // The module path starts with one or more dots indicating relative level
+            resolve_relative_import(&file_path, &import.module_path)
+        } else {
+            // Absolute imports
+            let module_as_file = import.module_path.replace('.', "/");
+            vec![
+                format!("{}.py", module_as_file),
+                format!("{}/__init__.py", module_as_file),
+                format!("{}.ts", module_as_file),
+                format!("{}.tsx", module_as_file),
+                format!("{}.js", module_as_file),
+                module_as_file.clone(),
+            ]
+        };
 
         let mut found_local_file = false;
         for path in &possible_paths {
@@ -918,6 +948,69 @@ fn add_import_edges(
                 .add_edge(file_node, module_idx, GraphEdgeKind::UsesLibrary);
         }
     }
+}
+
+/// Resolve a relative import path to possible file paths.
+///
+/// Python relative imports use dots to indicate the relative level:
+/// - `.utils` means `utils` in the same package
+/// - `..utils` means `utils` in the parent package
+/// - etc.
+///
+/// # Arguments
+///
+/// * `importing_file` - The path of the file doing the import (e.g., "app.py")
+/// * `module_path` - The relative module path (e.g., ".utils", "..models.user")
+///
+/// # Returns
+///
+/// A vector of possible file paths to try for resolution.
+fn resolve_relative_import(importing_file: &str, module_path: &str) -> Vec<String> {
+    // Count leading dots to determine relative level
+    let dots = module_path.chars().take_while(|&c| c == '.').count();
+    let remaining = &module_path[dots..];
+    
+    // Get the directory of the importing file
+    let importing_dir = if let Some(last_slash) = importing_file.rfind('/') {
+        &importing_file[..last_slash]
+    } else {
+        // File is in root directory
+        ""
+    };
+    
+    // Go up `dots - 1` directories (one dot = same directory, two dots = parent, etc.)
+    let mut base_dir = importing_dir.to_string();
+    for _ in 0..(dots.saturating_sub(1)) {
+        if let Some(last_slash) = base_dir.rfind('/') {
+            base_dir = base_dir[..last_slash].to_string();
+        } else {
+            base_dir = String::new();
+            break;
+        }
+    }
+    
+    // Convert remaining module path to file path
+    let module_as_path = remaining.replace('.', "/");
+    
+    // Build the resolved path
+    let resolved_base = if base_dir.is_empty() {
+        module_as_path
+    } else if module_as_path.is_empty() {
+        // Just dots, no module name - refers to __init__.py
+        base_dir
+    } else {
+        format!("{}/{}", base_dir, module_as_path)
+    };
+    
+    // Return possible file paths
+    vec![
+        format!("{}.py", resolved_base),
+        format!("{}/__init__.py", resolved_base),
+        format!("{}.ts", resolved_base),
+        format!("{}.tsx", resolved_base),
+        format!("{}.js", resolved_base),
+        resolved_base,
+    ]
 }
 
 /// Add function nodes from a file
@@ -2291,5 +2384,125 @@ app.post('/users', createUser);
         } else {
             panic!("Expected Function node for createUser");
         }
+    }
+
+    // ==================== Relative Import Resolution Tests ====================
+
+    #[test]
+    fn resolve_relative_import_single_dot_same_dir() {
+        // from .utils import foo -> should resolve to utils.py in same directory
+        let paths = resolve_relative_import("app.py", ".utils");
+        assert!(paths.contains(&"utils.py".to_string()));
+        
+        let paths = resolve_relative_import("pkg/app.py", ".utils");
+        assert!(paths.contains(&"pkg/utils.py".to_string()));
+    }
+
+    #[test]
+    fn resolve_relative_import_double_dot_parent_dir() {
+        // from ..utils import foo -> should resolve to utils.py in parent directory
+        let paths = resolve_relative_import("pkg/sub/app.py", "..utils");
+        assert!(paths.contains(&"pkg/utils.py".to_string()));
+    }
+
+    #[test]
+    fn resolve_relative_import_triple_dot() {
+        // from ...utils import foo -> should resolve to utils.py two directories up
+        let paths = resolve_relative_import("a/b/c/app.py", "...utils");
+        assert!(paths.contains(&"a/utils.py".to_string()));
+    }
+
+    #[test]
+    fn resolve_relative_import_nested_module() {
+        // from .models.user import User -> should resolve to models/user.py
+        let paths = resolve_relative_import("pkg/app.py", ".models.user");
+        assert!(paths.contains(&"pkg/models/user.py".to_string()));
+    }
+
+    #[test]
+    fn resolve_relative_import_package_init() {
+        // from . import models -> should try __init__.py
+        let paths = resolve_relative_import("pkg/app.py", ".");
+        assert!(paths.contains(&"pkg/__init__.py".to_string()));
+    }
+
+    #[test]
+    fn resolve_relative_import_root_file() {
+        // File in root directory
+        let paths = resolve_relative_import("app.py", ".utils");
+        assert!(paths.contains(&"utils.py".to_string()));
+    }
+
+    #[test]
+    fn build_code_graph_with_relative_import() {
+        // utils.py defines a function
+        let utils_src = r#"
+def add(a, b):
+    return a + b
+"#;
+        let (utils_id, utils_sem) = parse_python_with_id("utils.py", utils_src, 1);
+
+        // app.py imports from .utils
+        let app_src = r#"
+from .utils import add
+
+def main():
+    return add(1, 2)
+"#;
+        let (app_id, app_sem) = parse_python_with_id("app.py", app_src, 2);
+
+        let sem_entries = vec![(utils_id, utils_sem), (app_id, app_sem)];
+        let cg = build_code_graph(&sem_entries);
+
+        // Should have import edge from app.py to utils.py
+        let stats = cg.stats();
+        assert!(stats.import_edge_count >= 1, "Expected at least 1 import edge, got {}", stats.import_edge_count);
+        
+        // Verify the edge is ImportsFrom with correct items
+        let app_file_idx = cg.file_nodes.get(&app_id).expect("app file should exist");
+        let mut found_import_edge = false;
+        for edge in cg.graph.edges(*app_file_idx) {
+            if let GraphEdgeKind::ImportsFrom { items } = edge.weight() {
+                if items.contains(&"add".to_string()) {
+                    found_import_edge = true;
+                }
+            }
+        }
+        assert!(found_import_edge, "Expected ImportsFrom edge with 'add' item");
+    }
+
+    #[test]
+    fn build_code_graph_with_relative_import_nested() {
+        // pkg/utils.py defines a function
+        let utils_src = r#"
+def helper():
+    pass
+"#;
+        let (utils_id, utils_sem) = parse_python_with_id("pkg/utils.py", utils_src, 1);
+
+        // pkg/sub/app.py imports from ..utils
+        let app_src = r#"
+from ..utils import helper
+"#;
+        let (app_id, app_sem) = parse_python_with_id("pkg/sub/app.py", app_src, 2);
+
+        let sem_entries = vec![(utils_id, utils_sem), (app_id, app_sem)];
+        let cg = build_code_graph(&sem_entries);
+
+        // Should have import edge from app.py to utils.py
+        let stats = cg.stats();
+        assert!(stats.import_edge_count >= 1, "Expected at least 1 import edge for ..utils");
+    }
+
+    #[test]
+    fn find_import_source_file_returns_none_for_relative() {
+        let src = "x = 1";
+        let (file_id, sem) = parse_and_build_semantics("test.py", src);
+        let sem_entries = vec![(file_id, sem)];
+        let cg = build_code_graph(&sem_entries);
+
+        // Relative imports can't be resolved without the importing file context
+        assert!(find_import_source_file(&cg, ".utils").is_none());
+        assert!(find_import_source_file(&cg, "..models").is_none());
     }
 }

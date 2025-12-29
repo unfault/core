@@ -470,17 +470,27 @@ impl CommonSemantics for GoFileSemantics {
     }
 
     fn async_operations(&self) -> Vec<AsyncOperation> {
-        self.goroutines
-            .iter()
-            .map(|g| AsyncOperation {
+        let mut operations = Vec::new();
+
+        // Convert goroutines to TaskSpawn operations
+        for g in &self.goroutines {
+            operations.push(AsyncOperation {
                 runtime: AsyncRuntime::Goroutine,
                 operation_type: AsyncOperationType::TaskSpawn,
                 has_error_handling: g.has_recover,
-                error_handling: None,
+                error_handling: if g.has_recover {
+                    Some(crate::semantics::common::async_ops::ErrorHandling::Other("recover".to_string()))
+                } else {
+                    None
+                },
                 has_timeout: false,
                 timeout_value: None,
                 has_cancellation: g.has_context_param || g.has_done_channel,
-                cancellation_handling: None,
+                cancellation_handling: if g.has_done_channel {
+                    Some(crate::semantics::common::async_ops::CancellationHandling::ChannelClose)
+                } else {
+                    None
+                },
                 is_bounded: false,
                 bound_limit: None,
                 has_cleanup: false,
@@ -495,8 +505,148 @@ impl CommonSemantics for GoFileSemantics {
                 enclosing_function: g.function_name.clone(),
                 start_byte: g.start_byte,
                 end_byte: g.end_byte,
-            })
-            .collect()
+            });
+        }
+
+        // Convert channel operations to ChannelSend/ChannelReceive operations
+        for ch in &self.channel_ops {
+            let operation_type = match ch.kind {
+                super::go::model::ChannelOpKind::Send => AsyncOperationType::ChannelSend,
+                super::go::model::ChannelOpKind::Receive => AsyncOperationType::ChannelReceive,
+                super::go::model::ChannelOpKind::Close => AsyncOperationType::Unknown,
+            };
+
+            if operation_type != AsyncOperationType::Unknown {
+                operations.push(AsyncOperation {
+                    runtime: AsyncRuntime::Goroutine,
+                    operation_type,
+                    has_error_handling: false,
+                    error_handling: None,
+                    has_timeout: false,
+                    timeout_value: None,
+                    has_cancellation: false,
+                    cancellation_handling: None,
+                    is_bounded: false,
+                    bound_limit: None,
+                    has_cleanup: false,
+                    operation_text: ch.text.clone(),
+                    location: CommonLocation {
+                        file_id: self.file_id,
+                        line: ch.location.range.start_line + 1,
+                        column: ch.location.range.start_col + 1,
+                        start_byte: ch.start_byte,
+                        end_byte: ch.end_byte,
+                    },
+                    enclosing_function: ch.function_name.clone(),
+                    start_byte: ch.start_byte,
+                    end_byte: ch.end_byte,
+                });
+            }
+        }
+
+        // Convert select statements to SelectRace operations
+        for select_stmt in &self.select_statements {
+            operations.push(AsyncOperation {
+                runtime: AsyncRuntime::Goroutine,
+                operation_type: AsyncOperationType::SelectRace,
+                has_error_handling: false,
+                error_handling: None,
+                has_timeout: false,
+                timeout_value: None,
+                has_cancellation: select_stmt.is_cancellation_pattern,
+                cancellation_handling: if select_stmt.is_cancellation_pattern {
+                    Some(crate::semantics::common::async_ops::CancellationHandling::ChannelClose)
+                } else {
+                    None
+                },
+                is_bounded: false,
+                bound_limit: None,
+                has_cleanup: false,
+                operation_text: select_stmt.text.clone(),
+                location: CommonLocation {
+                    file_id: self.file_id,
+                    line: select_stmt.location.range.start_line + 1,
+                    column: select_stmt.location.range.start_col + 1,
+                    start_byte: select_stmt.start_byte,
+                    end_byte: select_stmt.end_byte,
+                },
+                enclosing_function: select_stmt.function_name.clone(),
+                start_byte: select_stmt.start_byte,
+                end_byte: select_stmt.end_byte,
+            });
+        }
+
+        // Convert mutex operations to LockAcquire/LockRelease operations
+        for mutex in &self.mutex_operations {
+            let operation_type = if mutex.operation_type == "Lock" || mutex.operation_type == "RLock" {
+                AsyncOperationType::LockAcquire
+            } else {
+                AsyncOperationType::LockRelease
+            };
+
+            operations.push(AsyncOperation {
+                runtime: AsyncRuntime::Goroutine,
+                operation_type,
+                has_error_handling: mutex.uses_defer_unlock,
+                error_handling: if mutex.uses_defer_unlock {
+                    Some(crate::semantics::common::async_ops::ErrorHandling::Other("defer".to_string()))
+                } else {
+                    None
+                },
+                has_timeout: false,
+                timeout_value: None,
+                has_cancellation: false,
+                cancellation_handling: None,
+                is_bounded: false,
+                bound_limit: None,
+                has_cleanup: mutex.uses_defer_unlock,
+                operation_text: mutex.text.clone(),
+                location: CommonLocation {
+                    file_id: self.file_id,
+                    line: mutex.location.range.start_line + 1,
+                    column: mutex.location.range.start_col + 1,
+                    start_byte: mutex.lock_start_byte,
+                    end_byte: mutex.lock_end_byte,
+                },
+                enclosing_function: mutex.function_name.clone(),
+                start_byte: mutex.lock_start_byte,
+                end_byte: mutex.lock_end_byte,
+            });
+        }
+
+        // Convert defer statements to operations (resource cleanup tracking)
+        for defer_stmt in &self.defers {
+            operations.push(AsyncOperation {
+                runtime: AsyncRuntime::Goroutine,
+                operation_type: AsyncOperationType::Unknown,
+                has_error_handling: defer_stmt.is_resource_cleanup,
+                error_handling: None,
+                has_timeout: false,
+                timeout_value: None,
+                has_cancellation: defer_stmt.is_resource_cleanup,
+                cancellation_handling: if defer_stmt.is_resource_cleanup {
+                    Some(crate::semantics::common::async_ops::CancellationHandling::Other("defer_cleanup".to_string()))
+                } else {
+                    None
+                },
+                is_bounded: false,
+                bound_limit: None,
+                has_cleanup: true,
+                operation_text: defer_stmt.text.clone(),
+                location: CommonLocation {
+                    file_id: self.file_id,
+                    line: defer_stmt.location.range.start_line + 1,
+                    column: defer_stmt.location.range.start_col + 1,
+                    start_byte: defer_stmt.start_byte,
+                    end_byte: defer_stmt.end_byte,
+                },
+                enclosing_function: defer_stmt.function_name.clone(),
+                start_byte: defer_stmt.start_byte,
+                end_byte: defer_stmt.end_byte,
+            });
+        }
+
+        operations
     }
 
     fn imports(&self) -> Vec<Import> {

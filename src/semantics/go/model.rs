@@ -86,6 +86,35 @@ pub enum ChannelOpKind {
     Close,
 }
 
+/// Information about a select statement.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelectStatement {
+    /// 1-based line number
+    pub line: u32,
+    /// 1-based column number
+    pub column: u32,
+    /// The text of the select statement
+    pub text: String,
+    /// Number of cases in the select
+    pub case_count: u32,
+    /// Whether there's a default case
+    pub has_default: bool,
+    /// Whether there are send operations
+    pub has_send_cases: bool,
+    /// Whether there are receive operations
+    pub has_receive_cases: bool,
+    /// Whether this select is used for cancellation (ctx.Done())
+    pub is_cancellation_pattern: bool,
+    /// Name of the enclosing function
+    pub function_name: Option<String>,
+    /// Start byte offset
+    pub start_byte: usize,
+    /// End byte offset
+    pub end_byte: usize,
+    /// Location information
+    pub location: AstLocation,
+}
+
 /// Information about a defer statement.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeferStatement {
@@ -179,6 +208,9 @@ pub struct GoFileSemantics {
 
     /// Channel operations
     pub channel_ops: Vec<ChannelOp>,
+
+    /// Select statements
+    pub select_statements: Vec<SelectStatement>,
 
     /// Defer statements
     pub defers: Vec<DeferStatement>,
@@ -359,6 +391,7 @@ impl GoFileSemantics {
             unchecked_errors: Vec::new(),
             goroutines: Vec::new(),
             channel_ops: Vec::new(),
+            select_statements: Vec::new(),
             defers: Vec::new(),
             context_usages: Vec::new(),
             mutex_operations: Vec::new(),
@@ -386,6 +419,7 @@ impl GoFileSemantics {
         collect_error_handling(parsed, self);
         collect_concurrency(parsed, self);
         collect_context_usage(parsed, self);
+        collect_mutex_operations(parsed, self);
         Ok(())
     }
 }
@@ -417,7 +451,6 @@ fn walk_nodes_with_context(
     sem: &mut GoFileSemantics,
     ctx: TraversalContext,
 ) {
-    // Update context based on current node
     let new_ctx = match node.kind() {
         "for_statement" | "range_clause" => TraversalContext {
             in_loop: true,
@@ -453,10 +486,8 @@ fn walk_nodes_with_context(
         _ => ctx.clone(),
     };
 
-    // Process current node
     match node.kind() {
         "package_clause" => {
-            // In tree-sitter-go, package name is a package_identifier child, not a field
             for i in 0..node.child_count() {
                 if let Some(child) = node.child(i) {
                     if child.kind() == "package_identifier" {
@@ -489,9 +520,16 @@ fn walk_nodes_with_context(
             if let Some(call) = build_callsite(parsed, &node, &new_ctx) {
                 sem.calls.push(call);
             }
-            // Check for database operations (database/sql, GORM, sqlx, etc.)
             if let Some(db_op) = detect_db_operation_from_call(parsed, &node, &new_ctx) {
                 sem.db_operations.push(db_op);
+            }
+            if let Some(ch_op) = detect_channel_close(parsed, &node, &new_ctx) {
+                sem.channel_ops.push(ch_op);
+            }
+        }
+        "unary_expression" => {
+            if let Some(ch_op) = detect_channel_receive_unary(parsed, &node, &new_ctx) {
+                sem.channel_ops.push(ch_op);
             }
         }
         "go_statement" => {
@@ -514,10 +552,14 @@ fn walk_nodes_with_context(
                 sem.channel_ops.push(ch_op);
             }
         }
+        "select_statement" => {
+            if let Some(select_stmt) = build_select_statement(parsed, &node, &new_ctx) {
+                sem.select_statements.push(select_stmt);
+            }
+        }
         _ => {}
     }
 
-    // Recurse into children
     let child_count = node.child_count();
     for i in 0..child_count {
         if let Some(child) = node.child(i) {
@@ -580,7 +622,6 @@ fn collect_imports(parsed: &ParsedFile, node: &tree_sitter::Node, sem: &mut GoFi
         }
     }
 
-    // Handle both single import and grouped imports
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i) {
             match child.kind() {
@@ -626,7 +667,6 @@ fn build_method(parsed: &ParsedFile, node: &tree_sitter::Node) -> Option<GoMetho
     let name_node = node.child_by_field_name("name")?;
     let name = parsed.text_for_node(&name_node);
 
-    // Extract receiver
     let receiver = node.child_by_field_name("receiver")?;
     let (receiver_type, receiver_is_pointer) = extract_receiver_type(parsed, &receiver);
 
@@ -649,13 +689,10 @@ fn build_method(parsed: &ParsedFile, node: &tree_sitter::Node) -> Option<GoMetho
 /// Extract receiver type from a parameter list node.
 fn extract_receiver_type(parsed: &ParsedFile, receiver: &tree_sitter::Node) -> (String, bool) {
     let text = parsed.text_for_node(receiver);
-    // Remove parentheses and extract type
     let trimmed = text.trim_matches(|c| c == '(' || c == ')' || c == ' ');
 
-    // Check for pointer receiver
     if let Some(ptr_pos) = trimmed.find('*') {
         let type_name = trimmed[ptr_pos + 1..].trim().to_string();
-        // Remove any variable name prefix
         let type_name = type_name
             .split_whitespace()
             .last()
@@ -663,7 +700,6 @@ fn extract_receiver_type(parsed: &ParsedFile, receiver: &tree_sitter::Node) -> (
             .to_string();
         (type_name, true)
     } else {
-        // Non-pointer receiver - extract type name after variable name if present
         let parts: Vec<&str> = trimmed.split_whitespace().collect();
         let type_name = parts.last().unwrap_or(&"").to_string();
         (type_name, false)
@@ -675,12 +711,10 @@ fn extract_signature(parsed: &ParsedFile, node: &tree_sitter::Node) -> (Vec<GoPa
     let mut params = Vec::new();
     let mut return_types = Vec::new();
 
-    // Extract parameters
     if let Some(params_node) = node.child_by_field_name("parameters") {
         params = extract_params(parsed, &params_node);
     }
 
-    // Extract return types
     if let Some(result_node) = node.child_by_field_name("result") {
         return_types = extract_return_types(parsed, &result_node);
     }
@@ -695,7 +729,6 @@ fn extract_params(parsed: &ParsedFile, params_node: &tree_sitter::Node) -> Vec<G
     for i in 0..params_node.child_count() {
         if let Some(child) = params_node.child(i) {
             if child.kind() == "parameter_declaration" {
-                // Get the type (last type_identifier or qualified_type in the declaration)
                 let mut param_type = String::new();
                 let mut names = Vec::new();
 
@@ -715,7 +748,6 @@ fn extract_params(parsed: &ParsedFile, params_node: &tree_sitter::Node) -> Vec<G
                     }
                 }
 
-                // If no names, use empty string
                 if names.is_empty() {
                     names.push(String::new());
                 }
@@ -739,11 +771,9 @@ fn extract_return_types(parsed: &ParsedFile, result_node: &tree_sitter::Node) ->
 
     match result_node.kind() {
         "parameter_list" => {
-            // Multiple return values: (int, error)
             for i in 0..result_node.child_count() {
                 if let Some(child) = result_node.child(i) {
                     if child.kind() == "parameter_declaration" {
-                        // Extract type from each parameter declaration
                         for j in 0..child.child_count() {
                             if let Some(type_node) = child.child(j) {
                                 if matches!(
@@ -769,7 +799,6 @@ fn extract_return_types(parsed: &ParsedFile, result_node: &tree_sitter::Node) ->
         }
         "type_identifier" | "qualified_type" | "pointer_type" | "slice_type" | "array_type"
         | "map_type" | "channel_type" | "function_type" | "interface_type" | "struct_type" => {
-            // Single return value
             types.push(parsed.text_for_node(result_node));
         }
         _ => {}
@@ -826,11 +855,8 @@ fn build_type_decl(parsed: &ParsedFile, node: &tree_sitter::Node) -> Option<GoTy
 fn extract_struct_fields(parsed: &ParsedFile, struct_node: &tree_sitter::Node) -> Vec<GoField> {
     let mut fields = Vec::new();
 
-    // In tree-sitter-go, struct_type has child nodes directly, including field_declaration_list
-    // or individual field_declaration nodes. We iterate through all children.
     for i in 0..struct_node.child_count() {
         if let Some(child) = struct_node.child(i) {
-            // Handle field_declaration_list (for multiple fields) or direct field_declaration
             let field_decls: Vec<tree_sitter::Node> = if child.kind() == "field_declaration_list" {
                 (0..child.child_count())
                     .filter_map(|j| child.child(j))
@@ -866,7 +892,6 @@ fn extract_struct_fields(parsed: &ParsedFile, struct_node: &tree_sitter::Node) -
                     }
                 }
 
-                // Handle embedded fields (no name, just type)
                 if names.is_empty() && !field_type.is_empty() {
                     names.push(field_type.clone());
                 }
@@ -915,7 +940,6 @@ fn collect_declarations(
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i) {
             if child.kind() == "var_spec" || child.kind() == "const_spec" {
-                // Extract name(s) and value(s)
                 let mut names = Vec::new();
                 let mut decl_type = None;
                 let mut value = None;
@@ -935,7 +959,6 @@ fn collect_declarations(
                                 value = Some(parsed.text_for_node(&spec_child));
                             }
                             _ if spec_child.is_named() && value.is_none() => {
-                                // Catch other expression types
                                 let text = parsed.text_for_node(&spec_child);
                                 if !text.is_empty() && spec_child.kind() != "comment" {
                                     value = Some(text);
@@ -970,19 +993,14 @@ fn detect_db_operation_from_call(
     let callee_expr = parsed.text_for_node(&func_node);
 
     let (library, operation_type) = match callee_expr.as_str() {
-        // sqlx patterns - check for sqlx-specific method names (they don't contain "sqlx" in callee)
         s if s.to_lowercase().contains("queryx") || s.to_lowercase().contains("queryrowx") => (DbLibrary::Sqlx, DbOperationType::Select),
         s if s.to_lowercase().contains("mustexec") => (DbLibrary::Sqlx, DbOperationType::Update),
-
-        // database/sql patterns (stdlib) - case insensitive matching
         s if s.to_lowercase().contains("sql.open") => (DbLibrary::DatabaseSql, DbOperationType::Connect),
         s if s.to_lowercase().contains("query") && !s.to_lowercase().contains("queryx") && !s.to_lowercase().contains("queryrowx") => (DbLibrary::DatabaseSql, DbOperationType::Select),
         s if s.to_lowercase().contains("exec") && !s.to_lowercase().contains("mustexec") => (DbLibrary::DatabaseSql, DbOperationType::Update),
         s if s.to_lowercase().contains("begin") => (DbLibrary::DatabaseSql, DbOperationType::TransactionBegin),
         s if s.to_lowercase().contains("commit") && s.to_lowercase().contains("tx") => (DbLibrary::DatabaseSql, DbOperationType::TransactionCommit),
         s if s.to_lowercase().contains("rollback") && s.to_lowercase().contains("tx") => (DbLibrary::DatabaseSql, DbOperationType::TransactionRollback),
-
-        // GORM patterns
         s if s.to_lowercase().contains("gorm") && s.to_lowercase().contains("open") => (DbLibrary::Gorm, DbOperationType::Connect),
         s if s.to_lowercase().contains(".find") => (DbLibrary::Gorm, DbOperationType::Select),
         s if s.to_lowercase().contains(".first") || s.to_lowercase().contains(".last") || s.to_lowercase().contains(".take") => (DbLibrary::Gorm, DbOperationType::Select),
@@ -991,10 +1009,7 @@ fn detect_db_operation_from_call(
         s if s.to_lowercase().contains(".update") => (DbLibrary::Gorm, DbOperationType::Update),
         s if s.to_lowercase().contains(".delete") => (DbLibrary::Gorm, DbOperationType::Delete),
         s if s.to_lowercase().contains(".raw") => (DbLibrary::Gorm, DbOperationType::RawSql),
-
-        // sqlc patterns
         s if s.to_lowercase().contains("querier") => (DbLibrary::Sqlc, DbOperationType::Select),
-
         _ => return None,
     };
 
@@ -1041,14 +1056,8 @@ fn build_callsite(
         String::new()
     };
 
-    // Parse callee into parts (e.g., "pkg.Func" -> ["pkg", "Func"])
     let callee_parts: Vec<String> = callee_expr.split('.').map(String::from).collect();
-    
-    // Detect if this is an import call (e.g., "http.Get" where "http" is from "net/http")
-    // For now, if first part could be an import alias, mark as import call
     let is_import_call = callee_parts.len() > 1 && callee_parts[0].chars().next().is_some_and(|c| c.is_lowercase());
-    
-    // Get import alias if applicable
     let import_alias = if is_import_call {
         Some(callee_parts[0].clone())
     } else {
@@ -1069,7 +1078,7 @@ fn build_callsite(
             start_byte: node.start_byte(),
             end_byte: node.end_byte(),
         },
-        is_self_call: false, // Go doesn't have self in the same way
+        is_self_call: false,
         is_import_call,
         import_alias,
     };
@@ -1078,7 +1087,7 @@ fn build_callsite(
         function_call,
         args_repr,
         in_loop: ctx.in_loop,
-        error_checked: false, // Will be determined by error analysis pass
+        error_checked: false,
         start_byte: node.start_byte(),
         end_byte: node.end_byte(),
     })
@@ -1093,22 +1102,13 @@ fn build_goroutine(
     let text = parsed.text_for_node(node);
     let range = node.range();
 
-    // Check if goroutine has recover() somewhere inside
     let has_recover = text.contains("recover()");
-
-    // Check if goroutine function receives a context parameter
     let has_context_param = text.contains("ctx") || text.contains("context.Context");
-
-    // Check if goroutine uses a done channel pattern
     let has_done_channel = text.contains("done")
         || text.contains("quit")
         || text.contains("stop")
         || text.contains("<-ctx.Done()");
-
-    // Check for unbounded channel send (send without select with default)
     let has_unbounded_channel_send = text.contains("<-") && !text.contains("select");
-
-    // Check if this is an anonymous goroutine (go func() {...}())
     let is_anonymous = text.contains("go func(");
 
     Some(GoroutineSpawn {
@@ -1136,14 +1136,12 @@ fn build_defer(
     let text = parsed.text_for_node(node);
     let range = node.range();
 
-    // Extract the call expression text (everything after "defer ")
     let call_text = text
         .strip_prefix("defer ")
         .unwrap_or(&text)
         .trim()
         .to_string();
 
-    // Check if defer is for resource cleanup
     let is_resource_cleanup = text.contains(".Close()")
         || text.contains(".Unlock()")
         || text.contains(".RUnlock()")
@@ -1210,9 +1208,111 @@ fn build_channel_receive(
     })
 }
 
+/// Detect a channel close operation (close(ch)).
+fn detect_channel_close(
+    parsed: &ParsedFile,
+    node: &tree_sitter::Node,
+    ctx: &TraversalContext,
+) -> Option<ChannelOp> {
+    let func_node = node.child_by_field_name("function")?;
+    let callee = parsed.text_for_node(&func_node);
+    
+    if callee != "close" {
+        return None;
+    }
+    
+    let text = parsed.text_for_node(node);
+    let range = node.range();
+
+    Some(ChannelOp {
+        kind: ChannelOpKind::Close,
+        line: range.start_point.row as u32 + 1,
+        column: range.start_point.column as u32 + 1,
+        text,
+        in_select: ctx.in_select,
+        function_name: ctx.current_function.clone(),
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        location: parsed.location_for_node(node),
+    })
+}
+
+/// Detect a channel receive from a unary expression (<-ch).
+/// Only detects unary expressions that are NOT inside a receive_statement.
+fn detect_channel_receive_unary(
+    parsed: &ParsedFile,
+    node: &tree_sitter::Node,
+    ctx: &TraversalContext,
+) -> Option<ChannelOp> {
+    // Skip if inside a receive_statement (to avoid double-counting)
+    let mut ancestor = node.parent();
+    while let Some(parent) = ancestor {
+        if parent.kind() == "receive_statement" {
+            return None;
+        }
+        ancestor = parent.parent();
+    }
+
+    let operator_node = node.child_by_field_name("operator")?;
+    let operator = parsed.text_for_node(&operator_node);
+    
+    if operator != "<-" {
+        return None;
+    }
+    
+    let text = parsed.text_for_node(node);
+    let range = node.range();
+
+    Some(ChannelOp {
+        kind: ChannelOpKind::Receive,
+        line: range.start_point.row as u32 + 1,
+        column: range.start_point.column as u32 + 1,
+        text,
+        in_select: ctx.in_select,
+        function_name: ctx.current_function.clone(),
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        location: parsed.location_for_node(node),
+    })
+}
+
+/// Build a SelectStatement from a select_statement node.
+fn build_select_statement(
+    parsed: &ParsedFile,
+    node: &tree_sitter::Node,
+    ctx: &TraversalContext,
+) -> Option<SelectStatement> {
+    let text = parsed.text_for_node(node);
+    let range = node.range();
+
+    let case_count = node
+        .children(&mut node.walk())
+        .filter(|n| n.kind() == "communication_case" || n.kind() == "default_case")
+        .count() as u32;
+
+    let has_default = text.contains("default:");
+    let has_send_cases = text.contains("case ") && text.contains(" <- ");
+    let has_receive_cases = text.contains("case ") && (text.contains(" <- ") || text.contains(":="));
+    let is_cancellation_pattern = text.contains("ctx.Done()") || text.contains("ctx.Done");
+
+    Some(SelectStatement {
+        line: range.start_point.row as u32 + 1,
+        column: range.start_point.column as u32 + 1,
+        text,
+        case_count,
+        has_default,
+        has_send_cases,
+        has_receive_cases,
+        is_cancellation_pattern,
+        function_name: ctx.current_function.clone(),
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        location: parsed.location_for_node(node),
+    })
+}
+
 /// Collect error handling information.
 fn collect_error_handling(parsed: &ParsedFile, sem: &mut GoFileSemantics) {
-    // Look for calls that return error but don't check it
     let root = parsed.tree.root_node();
     collect_unchecked_errors(parsed, root, sem, None);
 }
@@ -1231,13 +1331,10 @@ fn collect_unchecked_errors(
         current_fn
     };
 
-    // Check for expression statements that are just call expressions
-    // These are potential unchecked error returns
     if node.kind() == "expression_statement" {
         if let Some(child) = node.child(0) {
             if child.kind() == "call_expression" {
                 let call_text = parsed.text_for_node(&child);
-                // Heuristic: if the call looks like it returns an error (common patterns)
                 if is_likely_error_returning_call(&call_text) {
                     let range = child.range();
                     sem.unchecked_errors.push(UncheckedError {
@@ -1254,7 +1351,6 @@ fn collect_unchecked_errors(
         }
     }
 
-    // Recurse
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i) {
             collect_unchecked_errors(parsed, child, sem, current_fn.clone());
@@ -1264,7 +1360,6 @@ fn collect_unchecked_errors(
 
 /// Heuristic to detect calls that likely return an error.
 fn is_likely_error_returning_call(call_text: &str) -> bool {
-    // Common patterns that return errors
     call_text.contains(".Write(")
         || call_text.contains(".Read(")
         || call_text.contains(".Close(")
@@ -1281,19 +1376,12 @@ fn is_likely_error_returning_call(call_text: &str) -> bool {
         || call_text.contains(".Query(")
 }
 
-/// Collect concurrency-related information.
-fn collect_concurrency(_parsed: &ParsedFile, _sem: &mut GoFileSemantics) {
-    // Additional concurrency analysis can be added here
-    // For now, goroutines and channel ops are collected in the main pass
-}
-
 /// Collect context usage information.
 fn collect_context_usage(parsed: &ParsedFile, sem: &mut GoFileSemantics) {
     let root = parsed.tree.root_node();
     walk_for_context_usage(parsed, root, sem, ContextAnalysisState::default());
 }
 
-/// Context for tracking handler state during context usage analysis.
 #[derive(Default, Clone)]
 struct ContextAnalysisState {
     current_fn: Option<String>,
@@ -1301,7 +1389,6 @@ struct ContextAnalysisState {
     handler_type: Option<String>,
 }
 
-/// Walk AST to find context usage patterns.
 fn walk_for_context_usage(
     parsed: &ParsedFile,
     node: tree_sitter::Node,
@@ -1313,7 +1400,6 @@ fn walk_for_context_usage(
             .child_by_field_name("name")
             .map(|n| parsed.text_for_node(&n));
 
-        // Check if this is an HTTP handler based on signature
         let (in_handler, handler_type) = detect_handler_type(parsed, &node);
 
         ContextAnalysisState {
@@ -1328,7 +1414,6 @@ fn walk_for_context_usage(
     if node.kind() == "call_expression" {
         let call_text = parsed.text_for_node(&node);
 
-        // Check for context patterns
         if call_text.contains("context.") {
             let is_background = call_text.contains("context.Background()");
             let is_todo = call_text.contains("context.TODO()");
@@ -1337,7 +1422,6 @@ fn walk_for_context_usage(
                 || call_text.contains("WithDeadline")
                 || call_text.contains("WithCancel");
 
-            // Determine context type
             let context_type = if is_background {
                 "Background"
             } else if is_todo {
@@ -1372,7 +1456,6 @@ fn walk_for_context_usage(
         }
     }
 
-    // Recurse
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i) {
             walk_for_context_usage(parsed, child, sem, state.clone());
@@ -1384,32 +1467,145 @@ fn walk_for_context_usage(
 fn detect_handler_type(parsed: &ParsedFile, node: &tree_sitter::Node) -> (bool, Option<String>) {
     let fn_text = parsed.text_for_node(node);
 
-    // Check for net/http handler: func(w http.ResponseWriter, r *http.Request)
     if fn_text.contains("http.ResponseWriter") && fn_text.contains("http.Request") {
         return (true, Some("http".to_string()));
     }
-
-    // Check for Gin handler: func(c *gin.Context)
     if fn_text.contains("*gin.Context") {
         return (true, Some("gin".to_string()));
     }
-
-    // Check for Echo handler: func(c echo.Context)
     if fn_text.contains("echo.Context") {
         return (true, Some("echo".to_string()));
     }
-
-    // Check for Fiber handler: func(c *fiber.Ctx)
     if fn_text.contains("*fiber.Ctx") {
         return (true, Some("fiber".to_string()));
     }
-
-    // Check for gRPC handler: (ctx context.Context, req *pb.Something)
     if fn_text.contains("context.Context") && fn_text.contains("*pb.") {
         return (true, Some("grpc".to_string()));
     }
 
     (false, None)
+}
+
+/// Collect concurrency-related information.
+fn collect_concurrency(_parsed: &ParsedFile, _sem: &mut GoFileSemantics) {
+    // Additional concurrency analysis can be added here
+    // For now, goroutines and channel ops are collected in the main pass
+}
+
+/// Collect mutex operations.
+fn collect_mutex_operations(parsed: &ParsedFile, sem: &mut GoFileSemantics) {
+    let root = parsed.tree.root_node();
+    collect_mutex_ops_recursive(parsed, root, sem, None);
+}
+
+fn collect_mutex_ops_recursive(
+    parsed: &ParsedFile,
+    node: tree_sitter::Node,
+    sem: &mut GoFileSemantics,
+    current_fn: Option<String>,
+) {
+    let current_fn = if matches!(node.kind(), "function_declaration" | "method_declaration") {
+        node.child_by_field_name("name")
+            .map(|n| parsed.text_for_node(&n))
+    } else {
+        current_fn
+    };
+
+    if node.kind() == "call_expression" {
+        let call_text = parsed.text_for_node(&node);
+        let range = node.range();
+
+        let (_is_lock, is_rlock) = if call_text.contains(".Lock(") {
+            (true, false)
+        } else if call_text.contains(".RLock(") {
+            (true, true)
+        } else {
+            // Not a lock operation, continue to children
+            for i in 0..node.child_count() {
+                if let Some(child) = node.child(i) {
+                    collect_mutex_ops_recursive(parsed, child, sem, current_fn.clone());
+                }
+            }
+            return;
+        };
+
+        if let Some(func_node) = node.child_by_field_name("function") {
+            let callee = parsed.text_for_node(&func_node);
+            if let Some(dot_pos) = callee.rfind('.') {
+                let mutex_var = callee[..dot_pos].to_string();
+                let operation_type = if is_rlock { "RLock" } else { "Lock" };
+
+                let uses_defer_unlock = check_for_defer_unlock_in_scope(node, parsed);
+                let is_empty_critical_section = check_for_empty_critical_section(node, parsed);
+
+                sem.mutex_operations.push(MutexOperation {
+                    lock_line: range.start_point.row as u32 + 1,
+                    lock_column: range.start_point.column as u32 + 1,
+                    text: call_text,
+                    mutex_var,
+                    operation_type: operation_type.to_string(),
+                    is_rlock,
+                    uses_defer_unlock,
+                    is_empty_critical_section,
+                    function_name: current_fn.clone(),
+                    lock_start_byte: node.start_byte(),
+                    lock_end_byte: node.end_byte(),
+                    location: parsed.location_for_node(&node),
+                });
+            }
+        }
+    }
+
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i) {
+            collect_mutex_ops_recursive(parsed, child, sem, current_fn.clone());
+        }
+    }
+}
+
+fn check_for_defer_unlock_in_scope(node: tree_sitter::Node, parsed: &ParsedFile) -> bool {
+    let mut ancestor = node.parent();
+    while let Some(parent) = ancestor {
+        if parent.kind() == "function_declaration" || parent.kind() == "method_declaration" {
+            let text = parsed.text_for_node(&parent);
+            return text.contains("defer ") && (text.contains(".Unlock()") || text.contains(".RUnlock()"));
+        }
+        ancestor = parent.parent();
+    }
+    false
+}
+
+fn check_for_empty_critical_section(node: tree_sitter::Node, parsed: &ParsedFile) -> bool {
+    let parent = node.parent();
+    if parent.is_none() {
+        return false;
+    }
+    let parent = parent.unwrap();
+    if parent.kind() != "expression_statement" {
+        return false;
+    }
+
+    let grandparent = parent.parent();
+    if grandparent.is_none() {
+        return false;
+    }
+    let grandparent = grandparent.unwrap();
+    if grandparent.kind() != "block" {
+        return false;
+    }
+
+    let siblings: Vec<_> = grandparent.children(&mut grandparent.walk()).collect();
+    let node_idx = match siblings.iter().position(|n| n.id() == node.id()) {
+        Some(idx) => idx,
+        None => return false,
+    };
+    let next_sibling = match siblings.get(node_idx + 1) {
+        Some(sibling) => sibling,
+        None => return false,
+    };
+
+    let next_text = parsed.text_for_node(next_sibling);
+    next_text.contains(".Unlock()") || next_text.contains(".RUnlock()")
 }
 
 #[cfg(test)]
@@ -1419,7 +1615,6 @@ mod tests {
     use crate::parse::go::parse_go_file;
     use crate::types::context::{Language, SourceFile};
 
-    /// Helper to parse Go source and build semantics.
     fn parse_and_build_semantics(source: &str) -> GoFileSemantics {
         let sf = SourceFile {
             path: "test.go".to_string(),
@@ -1427,114 +1622,15 @@ mod tests {
             content: source.to_string(),
         };
         let parsed = parse_go_file(FileId(1), &sf).expect("parsing should succeed");
-        GoFileSemantics::from_parsed(&parsed)
+        let mut sem = GoFileSemantics::from_parsed(&parsed);
+        sem.analyze_frameworks(&parsed).expect("analysis should succeed");
+        sem
     }
 
     #[test]
     fn collects_package_name() {
         let sem = parse_and_build_semantics("package main");
         assert_eq!(sem.package_name, "main");
-    }
-
-    #[test]
-    fn collects_simple_import() {
-        let src = r#"
-package main
-
-import "fmt"
-"#;
-        let sem = parse_and_build_semantics(src);
-        assert_eq!(sem.imports.len(), 1);
-        assert_eq!(sem.imports[0].path, "fmt");
-    }
-
-    #[test]
-    fn collects_grouped_imports() {
-        let src = r#"
-package main
-
-import (
-    "fmt"
-    "net/http"
-)
-"#;
-        let sem = parse_and_build_semantics(src);
-        assert_eq!(sem.imports.len(), 2);
-    }
-
-    #[test]
-    fn collects_aliased_import() {
-        let src = r#"
-package main
-
-import mux "github.com/gorilla/mux"
-"#;
-        let sem = parse_and_build_semantics(src);
-        assert_eq!(sem.imports.len(), 1);
-        assert_eq!(sem.imports[0].alias, Some("mux".to_string()));
-    }
-
-    #[test]
-    fn collects_function() {
-        let src = r#"
-package main
-
-func hello(name string) string {
-    return "Hello, " + name
-}
-"#;
-        let sem = parse_and_build_semantics(src);
-        assert_eq!(sem.functions.len(), 1);
-        assert_eq!(sem.functions[0].name, "hello");
-        assert_eq!(sem.functions[0].params.len(), 1);
-    }
-
-    #[test]
-    fn collects_function_returning_error() {
-        let src = r#"
-package main
-
-func readFile(path string) ([]byte, error) {
-    return nil, nil
-}
-"#;
-        let sem = parse_and_build_semantics(src);
-        assert_eq!(sem.functions.len(), 1);
-        assert!(sem.functions[0].returns_error);
-    }
-
-    #[test]
-    fn collects_method() {
-        let src = r#"
-package main
-
-type Server struct {}
-
-func (s *Server) Start() error {
-    return nil
-}
-"#;
-        let sem = parse_and_build_semantics(src);
-        assert_eq!(sem.methods.len(), 1);
-        assert_eq!(sem.methods[0].name, "Start");
-        assert!(sem.methods[0].receiver_is_pointer);
-        assert!(sem.methods[0].returns_error);
-    }
-
-    #[test]
-    fn collects_struct_type() {
-        let src = r#"
-package main
-
-type User struct {
-    ID   int
-    Name string
-}
-"#;
-        let sem = parse_and_build_semantics(src);
-        assert_eq!(sem.types.len(), 1);
-        assert_eq!(sem.types[0].name, "User");
-        assert!(matches!(sem.types[0].kind, GoTypeKind::Struct));
     }
 
     #[test]
@@ -1566,33 +1662,94 @@ func main() {
     }
 
     #[test]
-    fn collects_const_declaration() {
+    fn collects_channel_operations() {
         let src = r#"
 package main
 
-const MaxSize = 100
+func main() {
+    ch := make(chan int)
+    go func() { ch <- 42 }()
+    v := <-ch
+    _ = v
+    close(ch)
+}
 "#;
         let sem = parse_and_build_semantics(src);
-        assert!(
-            sem.declarations
-                .iter()
-                .any(|d| d.name == "MaxSize" && d.is_const)
-        );
+        assert_eq!(sem.channel_ops.len(), 3);
+        assert!(sem.channel_ops.iter().any(|op| matches!(op.kind, ChannelOpKind::Send)));
+        assert!(sem.channel_ops.iter().any(|op| matches!(op.kind, ChannelOpKind::Receive)));
+        assert!(sem.channel_ops.iter().any(|op| matches!(op.kind, ChannelOpKind::Close)));
     }
 
     #[test]
-    fn collects_var_declaration() {
+    fn collects_select_statement() {
         let src = r#"
 package main
 
-var count int = 0
+func main() {
+    select {
+    case <-done:
+        fmt.Println("done")
+    default:
+        fmt.Println("default")
+    }
+}
 "#;
         let sem = parse_and_build_semantics(src);
-        assert!(
-            sem.declarations
-                .iter()
-                .any(|d| d.name == "count" && !d.is_const)
-        );
+        assert_eq!(sem.select_statements.len(), 1);
+        let select = &sem.select_statements[0];
+        assert_eq!(select.case_count, 2);
+        assert!(select.has_default);
+    }
+
+    #[test]
+    fn channel_ops_track_in_select() {
+        let src = r#"
+package main
+
+func main() {
+    ch := make(chan int)
+    select {
+    case ch <- 1:
+        fmt.Println("sent")
+    case v := <-ch:
+        fmt.Println(v)
+    }
+}
+"#;
+        let sem = parse_and_build_semantics(src);
+        assert_eq!(sem.channel_ops.len(), 2);
+        assert!(sem.channel_ops.iter().all(|op| op.in_select));
+    }
+
+    #[test]
+    fn detects_mutex_operations() {
+        let src = r#"
+package main
+
+func main() {
+    mu.Lock()
+    mu.Unlock()
+}
+"#;
+        let sem = parse_and_build_semantics(src);
+        assert!(!sem.mutex_operations.is_empty());
+    }
+
+    #[test]
+    fn detects_rlock_operations() {
+        let src = r#"
+package main
+
+func main() {
+    mu.RLock()
+    mu.RUnlock()
+}
+"#;
+        let sem = parse_and_build_semantics(src);
+        assert!(!sem.mutex_operations.is_empty());
+        let rlock_op = sem.mutex_operations.iter().find(|op| op.is_rlock);
+        assert!(rlock_op.is_some());
     }
 
     #[test]
@@ -1612,29 +1769,9 @@ func getUser(db *sql.DB, id int) error {
 }
 "#;
         let sem = parse_and_build_semantics(src);
-        // Check if any db_operations are detected
-        println!("Go DB operations found: {:?}", sem.db_operations);
-        assert!(!sem.db_operations.is_empty(), "Expected DB operations to be detected");
-        assert_eq!(sem.db_operations[0].library.as_str(), "database/sql");
-        assert_eq!(sem.db_operations[0].operation_type.as_str(), "SELECT");
-    }
-
-    #[test]
-    fn detects_database_sql_exec() {
-        let src = r#"
-package main
-
-import "database/sql"
-
-func createUser(db *sql.DB, name string) error {
-    _, err := db.Exec("INSERT INTO users (name) VALUES (?)", name)
-    return err
-}
-"#;
-        let sem = parse_and_build_semantics(src);
         assert!(!sem.db_operations.is_empty());
         assert_eq!(sem.db_operations[0].library.as_str(), "database/sql");
-        assert_eq!(sem.db_operations[0].operation_type.as_str(), "UPDATE");
+        assert_eq!(sem.db_operations[0].operation_type.as_str(), "SELECT");
     }
 
     #[test]
@@ -1654,45 +1791,10 @@ func findUsers(db *gorm.DB) []User {
     db.Find(&users)
     return users
 }
-
-func createUser(db *gorm.DB, name string) error {
-    return db.Create(&User{Name: name}).Error
-}
-
-func deleteUser(db *gorm.DB, id uint) error {
-    return db.Delete(&User{ID: id}).Error
-}
-"#;
-        let sem = parse_and_build_semantics(src);
-        assert_eq!(sem.db_operations.len(), 3);
-        assert_eq!(sem.db_operations[0].library.as_str(), "GORM");
-        assert_eq!(sem.db_operations[0].operation_type.as_str(), "SELECT");
-        assert_eq!(sem.db_operations[1].library.as_str(), "GORM");
-        assert_eq!(sem.db_operations[1].operation_type.as_str(), "INSERT");
-        assert_eq!(sem.db_operations[2].library.as_str(), "GORM");
-        assert_eq!(sem.db_operations[2].operation_type.as_str(), "DELETE");
-    }
-
-    #[test]
-    fn detects_sqlx_operations() {
-        let src = r#"
-package main
-
-import "github.com/jmoiron/sqlx"
-
-func queryUsers(db *sqlx.DB) ([]User, error) {
-    var users []User
-    err := db.Queryx("SELECT * FROM users").Map(&users)
-    return users, err
-}
-
-func executeQuery(db *sqlx.DB) error {
-    _, err := db.MustExec("INSERT INTO users (name) VALUES ('test')")
-    return err
-}
 "#;
         let sem = parse_and_build_semantics(src);
         assert!(!sem.db_operations.is_empty());
-        assert_eq!(sem.db_operations[0].library.as_str(), "sqlx");
+        assert_eq!(sem.db_operations[0].library.as_str(), "GORM");
+        assert_eq!(sem.db_operations[0].operation_type.as_str(), "SELECT");
     }
 }

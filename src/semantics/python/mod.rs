@@ -1,7 +1,9 @@
-//! Python semantic model and framework-specific analysis (FastAPI, Django, etc.)
+//! Python semantic model and framework-specific analysis (FastAPI, Django, Flask, etc.)
 
 pub mod async_ops;
+pub mod django;
 pub mod fastapi;
+pub mod flask;
 pub mod http;
 pub mod model;
 pub mod orm;

@@ -70,6 +70,125 @@ pub struct PyFileSemantics {
     /// If a module-level docstring is present, this is the 1-based line number
     /// where it ends (useful for inserting new imports after it).
     pub module_docstring_end_line: Option<u32>,
+
+    /// Async operations (asyncio.create_task, gather, await, etc.)
+    pub async_operations: Vec<AsyncOperation>,
+}
+
+/// Async operation in Python code.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AsyncOperation {
+    /// Type of async operation
+    pub operation_type: AsyncOperationType,
+
+    /// Whether this operation has error handling
+    pub has_error_handling: bool,
+
+    /// Whether this operation has a timeout
+    pub has_timeout: bool,
+
+    /// Timeout value in seconds (if determinable)
+    pub timeout_value: Option<f64>,
+
+    /// Whether this operation has cancellation support
+    pub has_cancellation: bool,
+
+    /// Whether this operation is bounded (limited concurrency)
+    pub is_bounded: bool,
+
+    /// Bound/semaphore limit (if determinable)
+    pub bound_limit: Option<u32>,
+
+    /// Full text of the operation
+    pub operation_text: String,
+
+    /// Name of the enclosing function
+    pub enclosing_function: Option<String>,
+
+    /// Start byte offset of the entire operation
+    pub start_byte: usize,
+
+    /// End byte offset of the entire operation
+    pub end_byte: usize,
+
+    /// Location in source file
+    pub location: AstLocation,
+}
+
+/// Type of async operation in Python.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum AsyncOperationType {
+    /// asyncio.create_task, asyncio.Task, etc.
+    TaskSpawn,
+
+    /// await expression
+    Await,
+
+    /// asyncio.gather, asyncio.wait, etc.
+    TaskGather,
+
+    /// Channel send (asyncio.Queue.put)
+    ChannelSend,
+
+    /// Channel receive (asyncio.Queue.get)
+    ChannelReceive,
+
+    /// Lock acquisition (asyncio.Lock.acquire)
+    LockAcquire,
+
+    /// Lock release (asyncio.Lock.release)
+    LockRelease,
+
+    /// Semaphore acquire (asyncio.Semaphore.acquire)
+    SemaphoreAcquire,
+
+    /// Sleep (asyncio.sleep)
+    Sleep,
+
+    /// Timeout wrapper (asyncio.timeout, asyncio.wait_for)
+    Timeout,
+
+    /// Select (asyncio.wait, select on multiple futures)
+    Select,
+
+    /// Async for loop iteration
+    AsyncFor,
+
+    /// Unknown operation
+    Unknown,
+}
+
+impl AsyncOperationType {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::TaskSpawn => "spawn",
+            Self::Await => "await",
+            Self::TaskGather => "gather",
+            Self::ChannelSend => "send",
+            Self::ChannelReceive => "receive",
+            Self::LockAcquire => "lock",
+            Self::LockRelease => "unlock",
+            Self::SemaphoreAcquire => "semaphore",
+            Self::Sleep => "sleep",
+            Self::Timeout => "timeout",
+            Self::Select => "select",
+            Self::AsyncFor => "async_for",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Check if this operation can potentially block/hang
+    pub fn can_hang(&self) -> bool {
+        matches!(
+            self,
+            Self::Await | Self::ChannelReceive | Self::LockAcquire | Self::SemaphoreAcquire
+        )
+    }
+
+    /// Check if this operation creates concurrent work
+    pub fn creates_concurrent_work(&self) -> bool {
+        matches!(self, Self::TaskSpawn | Self::TaskGather | Self::AsyncFor)
+    }
 }
 
 impl PyFileSemantics {
@@ -89,6 +208,7 @@ impl PyFileSemantics {
             orm_queries: Vec::new(),
             bare_excepts: Vec::new(),
             module_docstring_end_line: find_module_docstring_end_line(parsed),
+            async_operations: Vec::new(),
         };
 
         if parsed.language == Language::Python {
@@ -110,6 +230,10 @@ impl PyFileSemantics {
 
         // ORM analysis
         self.orm_queries = super::orm::summarize_orm_queries(parsed);
+
+        // Async operation analysis
+        let async_summary = super::async_ops::summarize_async_operations(parsed);
+        self.async_operations = async_summary.operations;
 
         Ok(())
     }

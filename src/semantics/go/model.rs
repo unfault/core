@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::parse::ast::{AstLocation, FileId, ParsedFile};
 use crate::types::context::Language;
 use crate::semantics::common::{calls::FunctionCall, CommonLocation};
+use crate::semantics::common::db::{DbOperation, DbLibrary, DbOperationType};
 
 use super::frameworks::{extract_go_routes, GoFrameworkSummary};
 use super::http::HttpCallSite;
@@ -190,6 +191,9 @@ pub struct GoFileSemantics {
 
     /// Go HTTP framework routes (Gin, Echo, Fiber, Chi, etc.)
     pub go_framework: Option<GoFrameworkSummary>,
+
+    /// Database operations (database/sql, GORM, sqlx, etc.)
+    pub db_operations: Vec<DbOperation>,
 }
 
 /// Information about a mutex operation (Lock/Unlock, RLock/RUnlock).
@@ -351,6 +355,7 @@ impl GoFileSemantics {
             context_usages: Vec::new(),
             mutex_operations: Vec::new(),
             go_framework: None,
+            db_operations: Vec::new(),
         };
 
         if parsed.language == Language::Go {
@@ -475,6 +480,10 @@ fn walk_nodes_with_context(
         "call_expression" => {
             if let Some(call) = build_callsite(parsed, &node, &new_ctx) {
                 sem.calls.push(call);
+            }
+            // Check for database operations (database/sql, GORM, sqlx, etc.)
+            if let Some(db_op) = detect_db_operation_from_call(parsed, &node, &new_ctx) {
+                sem.db_operations.push(db_op);
             }
         }
         "go_statement" => {
@@ -937,6 +946,72 @@ fn collect_declarations(
             }
         }
     }
+}
+
+/// Detect database operations from call expressions.
+fn detect_db_operation_from_call(
+    parsed: &ParsedFile,
+    node: &tree_sitter::Node,
+    ctx: &TraversalContext,
+) -> Option<DbOperation> {
+    let func_node = node.child_by_field_name("function")?;
+    let callee_expr = parsed.text_for_node(&func_node);
+
+    let (library, operation_type) = match callee_expr.as_str() {
+        // sqlx patterns - check for sqlx-specific method names (they don't contain "sqlx" in callee)
+        s if s.to_lowercase().contains("queryx") || s.to_lowercase().contains("queryrowx") => (DbLibrary::Sqlx, DbOperationType::Select),
+        s if s.to_lowercase().contains("mustexec") => (DbLibrary::Sqlx, DbOperationType::Update),
+
+        // database/sql patterns (stdlib) - case insensitive matching
+        s if s.to_lowercase().contains("sql.open") => (DbLibrary::DatabaseSql, DbOperationType::Connect),
+        s if s.to_lowercase().contains("query") && !s.to_lowercase().contains("queryx") && !s.to_lowercase().contains("queryrowx") => (DbLibrary::DatabaseSql, DbOperationType::Select),
+        s if s.to_lowercase().contains("exec") && !s.to_lowercase().contains("mustexec") => (DbLibrary::DatabaseSql, DbOperationType::Update),
+        s if s.to_lowercase().contains("begin") => (DbLibrary::DatabaseSql, DbOperationType::TransactionBegin),
+        s if s.to_lowercase().contains("commit") && s.to_lowercase().contains("tx") => (DbLibrary::DatabaseSql, DbOperationType::TransactionCommit),
+        s if s.to_lowercase().contains("rollback") && s.to_lowercase().contains("tx") => (DbLibrary::DatabaseSql, DbOperationType::TransactionRollback),
+
+        // GORM patterns
+        s if s.to_lowercase().contains("gorm") && s.to_lowercase().contains("open") => (DbLibrary::Gorm, DbOperationType::Connect),
+        s if s.to_lowercase().contains(".find") => (DbLibrary::Gorm, DbOperationType::Select),
+        s if s.to_lowercase().contains(".first") || s.to_lowercase().contains(".last") || s.to_lowercase().contains(".take") => (DbLibrary::Gorm, DbOperationType::Select),
+        s if s.to_lowercase().contains(".create") => (DbLibrary::Gorm, DbOperationType::Insert),
+        s if s.to_lowercase().contains(".save") => (DbLibrary::Gorm, DbOperationType::Update),
+        s if s.to_lowercase().contains(".update") => (DbLibrary::Gorm, DbOperationType::Update),
+        s if s.to_lowercase().contains(".delete") => (DbLibrary::Gorm, DbOperationType::Delete),
+        s if s.to_lowercase().contains(".raw") => (DbLibrary::Gorm, DbOperationType::RawSql),
+
+        // sqlc patterns
+        s if s.to_lowercase().contains("querier") => (DbLibrary::Sqlc, DbOperationType::Select),
+
+        _ => return None,
+    };
+
+    let text = parsed.text_for_node(node);
+    let ast_location = parsed.location_for_node(node);
+
+    Some(DbOperation {
+        library,
+        operation_type,
+        has_timeout: false,
+        timeout_value: None,
+        in_transaction: false,
+        eager_loading: None,
+        in_loop: ctx.in_loop,
+        in_iteration: false,
+        model_name: None,
+        relationship_field: None,
+        operation_text: text,
+        location: CommonLocation {
+            file_id: ast_location.file_id,
+            line: ast_location.range.start_line + 1,
+            column: ast_location.range.start_col + 1,
+            start_byte: node.start_byte(),
+            end_byte: node.end_byte(),
+        },
+        enclosing_function: ctx.current_function.clone(),
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+    })
 }
 
 /// Build a GoCallSite from a call_expression node.
@@ -1506,5 +1581,106 @@ var count int = 0
                 .iter()
                 .any(|d| d.name == "count" && !d.is_const)
         );
+    }
+
+    #[test]
+    fn detects_database_sql_query() {
+        let src = r#"
+package main
+
+import "database/sql"
+
+func getUser(db *sql.DB, id int) error {
+    rows, err := db.Query("SELECT * FROM users WHERE id = ?", id)
+    if err != nil {
+        return err
+    }
+    defer rows.Close()
+    return nil
+}
+"#;
+        let sem = parse_and_build_semantics(src);
+        // Check if any db_operations are detected
+        println!("Go DB operations found: {:?}", sem.db_operations);
+        assert!(!sem.db_operations.is_empty(), "Expected DB operations to be detected");
+        assert_eq!(sem.db_operations[0].library.as_str(), "database/sql");
+        assert_eq!(sem.db_operations[0].operation_type.as_str(), "SELECT");
+    }
+
+    #[test]
+    fn detects_database_sql_exec() {
+        let src = r#"
+package main
+
+import "database/sql"
+
+func createUser(db *sql.DB, name string) error {
+    _, err := db.Exec("INSERT INTO users (name) VALUES (?)", name)
+    return err
+}
+"#;
+        let sem = parse_and_build_semantics(src);
+        assert!(!sem.db_operations.is_empty());
+        assert_eq!(sem.db_operations[0].library.as_str(), "database/sql");
+        assert_eq!(sem.db_operations[0].operation_type.as_str(), "UPDATE");
+    }
+
+    #[test]
+    fn detects_gorm_operations() {
+        let src = r#"
+package main
+
+import "github.com/jinzhu/gorm"
+
+type User struct {
+    ID   uint
+    Name string
+}
+
+func findUsers(db *gorm.DB) []User {
+    var users []User
+    db.Find(&users)
+    return users
+}
+
+func createUser(db *gorm.DB, name string) error {
+    return db.Create(&User{Name: name}).Error
+}
+
+func deleteUser(db *gorm.DB, id uint) error {
+    return db.Delete(&User{ID: id}).Error
+}
+"#;
+        let sem = parse_and_build_semantics(src);
+        assert_eq!(sem.db_operations.len(), 3);
+        assert_eq!(sem.db_operations[0].library.as_str(), "GORM");
+        assert_eq!(sem.db_operations[0].operation_type.as_str(), "SELECT");
+        assert_eq!(sem.db_operations[1].library.as_str(), "GORM");
+        assert_eq!(sem.db_operations[1].operation_type.as_str(), "INSERT");
+        assert_eq!(sem.db_operations[2].library.as_str(), "GORM");
+        assert_eq!(sem.db_operations[2].operation_type.as_str(), "DELETE");
+    }
+
+    #[test]
+    fn detects_sqlx_operations() {
+        let src = r#"
+package main
+
+import "github.com/jmoiron/sqlx"
+
+func queryUsers(db *sqlx.DB) ([]User, error) {
+    var users []User
+    err := db.Queryx("SELECT * FROM users").Map(&users)
+    return users, err
+}
+
+func executeQuery(db *sqlx.DB) error {
+    _, err := db.MustExec("INSERT INTO users (name) VALUES ('test')")
+    return err
+}
+"#;
+        let sem = parse_and_build_semantics(src);
+        assert!(!sem.db_operations.is_empty());
+        assert_eq!(sem.db_operations[0].library.as_str(), "sqlx");
     }
 }

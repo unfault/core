@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::parse::ast::{AstLocation, FileId, ParsedFile};
+use crate::semantics::common::db::DbOperation;
 use crate::semantics::rust::frameworks::RustFrameworkSummary;
 use crate::types::context::Language;
 
@@ -72,6 +73,9 @@ pub struct RustFileSemantics {
 
     /// HTTP framework information (Axum, Actix-web, Rocket, Warp, etc.)
     pub rust_framework: Option<RustFrameworkSummary>,
+
+    /// Database operations (Diesel, SeaORM, sqlx, etc.)
+    pub db_operations: Vec<DbOperation>,
 }
 
 /// Use statement (import).
@@ -665,6 +669,7 @@ impl RustFileSemantics {
             field_accesses: Vec::new(),
             variable_bindings: Vec::new(),
             rust_framework: None,
+            db_operations: Vec::new(),
         }
     }
 }

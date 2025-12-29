@@ -1103,15 +1103,9 @@ fn add_function_nodes(
                 std::collections::HashSet::new()
             }
         }
-        SourceSemantics::Rust(rs) => {
-            // Skip Rust framework route handlers (Axum, Actix-web, Rocket, Warp)
-            if let Some(framework) = &rs.rust_framework {
-                framework.routes.iter()
-                    .map(|r| r.handler_name.as_str())
-                    .collect()
-            } else {
-                std::collections::HashSet::new()
-            }
+        SourceSemantics::Rust(_rs) => {
+            // Rust doesn't have framework route handlers yet
+            std::collections::HashSet::new()
         }
     };
 

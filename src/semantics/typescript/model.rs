@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::parse::ast::{AstLocation, FileId, ParsedFile};
 use crate::types::context::Language;
+use crate::semantics::common::db::{DbOperation, DbLibrary, DbOperationType};
+use crate::semantics::common::CommonLocation;
 
 use super::http::HttpCallSite;
 
@@ -90,6 +92,93 @@ pub struct TsFileSemantics {
 
     /// Global mutable state (module-level let/var)
     pub global_mutable_state: Vec<GlobalMutableState>,
+
+    /// Async operations (Promise, async/await, etc.)
+    pub async_operations: Vec<TsAsyncOperation>,
+
+    /// Database operations (Prisma, TypeORM, Knex, Sequelize, Drizzle, etc.)
+    pub db_operations: Vec<DbOperation>,
+}
+
+/// Async operation in TypeScript/JavaScript code.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TsAsyncOperation {
+    /// Type of async operation
+    pub operation_type: TsAsyncOperationType,
+
+    /// Whether this operation has error handling
+    pub has_error_handling: bool,
+
+    /// Whether this operation has a timeout
+    pub has_timeout: bool,
+
+    /// Timeout value in seconds (if determinable)
+    pub timeout_value: Option<f64>,
+
+    /// Whether this operation has cancellation support
+    pub has_cancellation: bool,
+
+    /// Full text of operation
+    pub operation_text: String,
+
+    /// Name of enclosing function
+    pub enclosing_function: Option<String>,
+
+    /// Start byte offset
+    pub start_byte: usize,
+
+    /// End byte offset
+    pub end_byte: usize,
+
+    /// Location in source file
+    pub location: AstLocation,
+}
+
+/// Type of async operation in TypeScript/JavaScript.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum TsAsyncOperationType {
+    /// Promise constructor (new Promise(...))
+    PromiseConstructor,
+
+    /// await expression
+    Await,
+
+    /// Promise.all, Promise.allSettled, Promise.race, Promise.any
+    PromiseCombinator,
+
+    /// Promise chain (.then, .catch)
+    PromiseChain,
+
+    /// setTimeout / setInterval
+    Timeout,
+
+    /// AbortController cancellation
+    Cancellation,
+
+    /// Async function declaration
+    AsyncFunction,
+
+    /// Async arrow function
+    AsyncArrow,
+
+    /// Unknown operation
+    Unknown,
+}
+
+impl TsAsyncOperationType {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::PromiseConstructor => "promise_constructor",
+            Self::Await => "await",
+            Self::PromiseCombinator => "promise_combinator",
+            Self::PromiseChain => "promise_chain",
+            Self::Timeout => "timeout",
+            Self::Cancellation => "cancellation",
+            Self::AsyncFunction => "async_function",
+            Self::AsyncArrow => "async_arrow",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 /// Representation of a TypeScript import statement.
@@ -311,6 +400,8 @@ impl TsFileSemantics {
             express: None,
             async_without_error_handling: Vec::new(),
             global_mutable_state: Vec::new(),
+            async_operations: Vec::new(),
+            db_operations: Vec::new(),
         };
 
         if parsed.language == Language::Typescript {
@@ -330,6 +421,10 @@ impl TsFileSemantics {
 
         // HTTP client calls
         self.http_calls = super::http::summarize_http_clients(parsed);
+
+        // Async operation analysis
+        let async_summary = super::async_ops::summarize_ts_async_operations(parsed);
+        self.async_operations = async_summary.operations;
 
         Ok(())
     }
@@ -427,10 +522,27 @@ fn walk_nodes_with_context(
             if let Some(call) = build_callsite(parsed, &node, &new_ctx) {
                 sem.calls.push(call);
             }
+            // Check for async operations like Promise.all, Promise.race, setTimeout
+            if let Some(async_op) = detect_async_operation_from_call(parsed, &node, &new_ctx) {
+                sem.async_operations.push(async_op);
+            }
+            // Check for database operations (Prisma, TypeORM, Knex, Sequelize, Drizzle)
+            if let Some(db_op) = detect_db_operation_from_call(parsed, &node, &new_ctx) {
+                sem.db_operations.push(db_op);
+            }
+        }
+        "await_expression" => {
+            if let Some(async_op) = detect_await_operation(parsed, &node, &new_ctx) {
+                sem.async_operations.push(async_op);
+            }
         }
         "new_expression" => {
             if let Some(call) = build_new_expression(parsed, &node, &new_ctx) {
                 sem.calls.push(call);
+            }
+            // Check for Promise constructor
+            if let Some(async_op) = detect_promise_constructor(parsed, &node, &new_ctx) {
+                sem.async_operations.push(async_op);
             }
         }
         "catch_clause" => {
@@ -1066,6 +1178,258 @@ fn check_catch_clause(
     }
 }
 
+/// Detect if a call is an async operation (Promise.all, Promise.race, setTimeout, etc.)
+fn detect_async_operation_from_call(
+    parsed: &ParsedFile,
+    node: &tree_sitter::Node,
+    ctx: &TraversalContext,
+) -> Option<TsAsyncOperation> {
+    let func_node = node.child_by_field_name("function")?;
+    let callee = parsed.text_for_node(&func_node);
+
+    let operation_type = match callee.as_str() {
+        "Promise.all" | "Promise.allSettled" | "Promise.race" | "Promise.any" => {
+            TsAsyncOperationType::PromiseCombinator
+        }
+        "setTimeout" | "setInterval" | "setImmediate" => {
+            TsAsyncOperationType::Timeout
+        }
+        "AbortController" => TsAsyncOperationType::Cancellation,
+        _ => {
+            // Check for promise method chains
+            if callee.contains(".then(") || callee.contains(".catch(") || callee.contains(".finally(") {
+                TsAsyncOperationType::PromiseChain
+            } else {
+                return None;
+            }
+        }
+    };
+
+    let text = parsed.text_for_node(node);
+    let has_error_handling = has_try_catch_around(node) || text.contains(".catch(");
+    let (has_timeout, timeout_value) = extract_timeout_from_args(parsed, node);
+    let has_cancellation = text.contains("AbortController") || text.contains("signal");
+
+    Some(TsAsyncOperation {
+        operation_type,
+        has_error_handling,
+        has_timeout,
+        timeout_value,
+        has_cancellation,
+        operation_text: text,
+        enclosing_function: ctx.current_function.clone(),
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        location: parsed.location_for_node(node),
+    })
+}
+
+/// Detect an await expression.
+fn detect_await_operation(
+    parsed: &ParsedFile,
+    node: &tree_sitter::Node,
+    ctx: &TraversalContext,
+) -> Option<TsAsyncOperation> {
+    let text = parsed.text_for_node(node);
+    let has_error_handling = has_try_catch_around(node);
+
+    Some(TsAsyncOperation {
+        operation_type: TsAsyncOperationType::Await,
+        has_error_handling,
+        has_timeout: false,
+        timeout_value: None,
+        has_cancellation: false,
+        operation_text: text,
+        enclosing_function: ctx.current_function.clone(),
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        location: parsed.location_for_node(node),
+    })
+}
+
+/// Detect a Promise constructor call.
+fn detect_promise_constructor(
+    parsed: &ParsedFile,
+    node: &tree_sitter::Node,
+    ctx: &TraversalContext,
+) -> Option<TsAsyncOperation> {
+    let constructor_node = node.child_by_field_name("constructor")?;
+    let constructor_name = parsed.text_for_node(&constructor_node);
+
+    if constructor_name != "Promise" {
+        return None;
+    }
+
+    let text = parsed.text_for_node(node);
+    let has_error_handling = text.contains("catch") || has_try_catch_around(node);
+
+    Some(TsAsyncOperation {
+        operation_type: TsAsyncOperationType::PromiseConstructor,
+        has_error_handling,
+        has_timeout: false,
+        timeout_value: None,
+        has_cancellation: false,
+        operation_text: text,
+        enclosing_function: ctx.current_function.clone(),
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        location: parsed.location_for_node(node),
+    })
+}
+
+/// Check if a node has a try-catch around it.
+fn has_try_catch_around(node: &tree_sitter::Node) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == "try_statement" {
+            return true;
+        }
+        current = parent.parent();
+    }
+    false
+}
+
+/// Extract timeout value from call arguments.
+fn extract_timeout_from_args(
+    parsed: &ParsedFile,
+    node: &tree_sitter::Node,
+) -> (bool, Option<f64>) {
+    if let Some(args_node) = node.child_by_field_name("arguments") {
+        let text = parsed.text_for_node(&args_node);
+
+        // Look for timeout argument
+        if let Some(timeout_idx) = text.find("timeout") {
+            // Simple heuristic: look for a number near "timeout"
+            let before_timeout = &text[..timeout_idx.saturating_sub(50)];
+            if let Some(number_start) = before_timeout.chars().rev().position(|c| c.is_ascii_digit() || c == '.') {
+                let start = timeout_idx - number_start;
+                let number: String = text[start..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit() || *c == '.')
+                    .collect();
+                if let Ok(value) = number.parse::<f64>() {
+                    // Convert milliseconds to seconds
+                    let timeout_seconds = value / 1000.0;
+                    return (true, Some(timeout_seconds));
+                }
+            }
+        }
+    }
+    (false, None)
+}
+
+/// Detect database operations from call expressions.
+fn detect_db_operation_from_call(
+    parsed: &ParsedFile,
+    node: &tree_sitter::Node,
+    ctx: &TraversalContext,
+) -> Option<DbOperation> {
+    let func_node = node.child_by_field_name("function")?;
+    let callee = parsed.text_for_node(&func_node);
+
+    let (library, operation_type) = match callee.as_str() {
+        // Prisma patterns (case-insensitive) - check first since they use prisma prefix
+        s if s.to_lowercase().starts_with("prisma") => {
+            let op_type = if s.to_lowercase().contains("find") || s.to_lowercase().contains("findmany") {
+                DbOperationType::Select
+            } else if s.to_lowercase().contains("create") || s.to_lowercase().contains("upsert") {
+                DbOperationType::Insert
+            } else if s.to_lowercase().contains("update") {
+                DbOperationType::Update
+            } else if s.to_lowercase().contains("delete") {
+                DbOperationType::Delete
+            } else if s.to_lowercase().contains("queryraw") {
+                DbOperationType::RawSql
+            } else if s.to_lowercase().contains("executeraw") {
+                DbOperationType::Update
+            } else {
+                return None;
+            };
+            (DbLibrary::Prisma, op_type)
+        }
+
+        // Knex patterns - check for knex at start
+        s if s.to_lowercase().starts_with("knex") => {
+            let op_type = if s.to_lowercase().contains(".select") || s.to_lowercase().contains(".from") || s.to_lowercase().contains(".where") {
+                DbOperationType::Select
+            } else if s.to_lowercase().contains(".insert") {
+                DbOperationType::Insert
+            } else if s.to_lowercase().contains(".update") {
+                DbOperationType::Update
+            } else if s.to_lowercase().contains(".del") || s.to_lowercase().contains(".delete") {
+                DbOperationType::Delete
+            } else if s.to_lowercase().contains(".raw") {
+                DbOperationType::RawSql
+            } else {
+                return None;
+            };
+            (DbLibrary::Knex, op_type)
+        }
+
+        // Drizzle ORM patterns - check before generic patterns
+        s if s.to_lowercase().contains("db.query") || s.to_lowercase().contains("drizzle.query") => (DbLibrary::DrizzleOrm, DbOperationType::Select),
+        s if (s.to_lowercase().contains("db.insert") || s.to_lowercase().contains("drizzle.insert")) && s.to_lowercase().contains(".values") => (DbLibrary::DrizzleOrm, DbOperationType::Insert),
+        s if (s.to_lowercase().contains("db.update") || s.to_lowercase().contains("drizzle.update")) => (DbLibrary::DrizzleOrm, DbOperationType::Update),
+        s if (s.to_lowercase().contains("db.delete") || s.to_lowercase().contains("drizzle.delete")) => (DbLibrary::DrizzleOrm, DbOperationType::Delete),
+
+        // TypeORM patterns - check before Sequelize since patterns can overlap
+        s if s.to_lowercase().contains("createquerybuilder") => (DbLibrary::TypeOrm, DbOperationType::RawSql),
+        s if s.to_lowercase().contains("entitymanager") && s.to_lowercase().contains("find") => (DbLibrary::TypeOrm, DbOperationType::Select),
+        s if s.to_lowercase().contains("repository") || s.to_lowercase().contains("userrepo") || s.to_lowercase().contains("entitymanager") => {
+            let op_type = if s.to_lowercase().contains("findone") || s.to_lowercase().contains(".find(") {
+                DbOperationType::Select
+            } else if s.to_lowercase().contains(".save") {
+                DbOperationType::Insert
+            } else if s.to_lowercase().contains(".update") {
+                DbOperationType::Update
+            } else if s.to_lowercase().contains(".delete") {
+                DbOperationType::Delete
+            } else {
+                return None;
+            };
+            (DbLibrary::TypeOrm, op_type)
+        }
+
+        // Sequelize patterns - Model can be any name (User, Product, etc.)
+        s if s.to_lowercase().contains("findall") || s.to_lowercase().contains("find_many") => (DbLibrary::Sequelize, DbOperationType::Select),
+        s if s.to_lowercase().contains("findone") || s.to_lowercase().contains("find_one") => (DbLibrary::Sequelize, DbOperationType::Select),
+        s if s.to_lowercase().contains("model") && s.to_lowercase().contains("find") => (DbLibrary::Sequelize, DbOperationType::Select),
+        s if s.to_lowercase().contains("model") && s.to_lowercase().contains("create") => (DbLibrary::Sequelize, DbOperationType::Insert),
+        s if s.to_lowercase().contains("model") && s.to_lowercase().contains("update") => (DbLibrary::Sequelize, DbOperationType::Update),
+        s if s.to_lowercase().contains("model") && s.to_lowercase().contains("destroy") => (DbLibrary::Sequelize, DbOperationType::Delete),
+        s if s.to_lowercase().contains("sequelize") && s.to_lowercase().contains("query") => (DbLibrary::Sequelize, DbOperationType::RawSql),
+
+        _ => return None,
+    };
+
+    let text = parsed.text_for_node(node);
+    let ast_location = parsed.location_for_node(node);
+
+    Some(DbOperation {
+        library,
+        operation_type,
+        has_timeout: false,
+        timeout_value: None,
+        in_transaction: false,
+        eager_loading: None,
+        in_loop: ctx.in_loop,
+        in_iteration: false,
+        model_name: None,
+        relationship_field: None,
+        operation_text: text,
+        location: CommonLocation {
+            file_id: ast_location.file_id,
+            line: ast_location.range.start_line + 1,
+            column: ast_location.range.start_col + 1,
+            start_byte: node.start_byte(),
+            end_byte: node.end_byte(),
+        },
+        enclosing_function: ctx.current_function.clone(),
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1185,6 +1549,121 @@ try {
         assert!(sem.functions.is_empty());
         assert!(sem.classes.is_empty());
         assert!(sem.variables.is_empty());
+    }
+
+    #[test]
+    fn detects_prisma_find_operations() {
+        let src = r#"
+async function getUsers(prisma: any) {
+    const users = await prisma.user.findMany();
+    const user = await prisma.user.findUnique({ where: { id: 1 } });
+    return { users, user };
+}
+"#;
+        let sem = parse_and_build_semantics(src);
+        assert!(!sem.db_operations.is_empty());
+        assert_eq!(sem.db_operations[0].library.as_str(), "Prisma");
+        assert_eq!(sem.db_operations[0].operation_type.as_str(), "SELECT");
+    }
+
+    #[test]
+    fn detects_prisma_create_update_delete() {
+        let src = r#"
+async function manageUser(prisma: any) {
+    await prisma.user.create({ data: { name: "test" } });
+    await prisma.user.update({ where: { id: 1 }, data: { name: "updated" } });
+    await prisma.user.delete({ where: { id: 1 } });
+}
+"#;
+        let sem = parse_and_build_semantics(src);
+        assert_eq!(sem.db_operations.len(), 3);
+        assert_eq!(sem.db_operations[0].library.as_str(), "Prisma");
+        assert_eq!(sem.db_operations[0].operation_type.as_str(), "INSERT");
+        assert_eq!(sem.db_operations[1].library.as_str(), "Prisma");
+        assert_eq!(sem.db_operations[1].operation_type.as_str(), "UPDATE");
+        assert_eq!(sem.db_operations[2].library.as_str(), "Prisma");
+        assert_eq!(sem.db_operations[2].operation_type.as_str(), "DELETE");
+    }
+
+    #[test]
+    fn detects_typeorm_operations() {
+        let src = r#"
+async function manageUsers(userRepo: any) {
+    const users = await userRepo.find();
+    const user = await userRepo.findOne({ where: { id: 1 } });
+    await userRepo.save(user);
+    await userRepo.update({ id: 1 }, { name: "updated" });
+    await userRepo.delete({ id: 1 });
+}
+"#;
+        let sem = parse_and_build_semantics(src);
+        assert!(!sem.db_operations.is_empty());
+        assert_eq!(sem.db_operations[0].library.as_str(), "TypeORM");
+        assert_eq!(sem.db_operations[0].operation_type.as_str(), "SELECT");
+    }
+
+    #[test]
+    fn detects_knex_operations() {
+        let src = r#"
+async function queryDatabase(knex: any) {
+    const users = await knex.select("*").from("users").where("active", true);
+    await knex("users").insert({ name: "test" });
+    await knex("users").where("id", 1).update({ name: "updated" });
+    await knex("users").where("id", 1).del();
+}
+"#;
+        let sem = parse_and_build_semantics(src);
+        assert!(!sem.db_operations.is_empty());
+        assert_eq!(sem.db_operations[0].library.as_str(), "Knex");
+        assert_eq!(sem.db_operations[0].operation_type.as_str(), "SELECT");
+    }
+
+    #[test]
+    fn detects_sequelize_operations() {
+        let src = r#"
+async function manageUsers(User: any) {
+    const users = await User.findAll();
+    const user = await User.findOne({ where: { id: 1 } });
+    await User.create({ name: "test" });
+    await User.update({ name: "updated" }, { where: { id: 1 } });
+    await User.destroy({ where: { id: 1 } });
+}
+"#;
+        let sem = parse_and_build_semantics(src);
+        assert!(!sem.db_operations.is_empty());
+        assert_eq!(sem.db_operations[0].library.as_str(), "Sequelize");
+        assert_eq!(sem.db_operations[0].operation_type.as_str(), "SELECT");
+    }
+
+    #[test]
+    fn detects_drizzle_orm_operations() {
+        let src = r#"
+async function queryDb(db: any) {
+    const users = await db.query.users.findMany();
+    await db.insert(users).values({ name: "test" });
+    await db.update(users).set({ name: "updated" }).where(eq(users.id, 1));
+    await db.delete(users).where(eq(users.id, 1));
+}
+"#;
+        let sem = parse_and_build_semantics(src);
+        assert!(!sem.db_operations.is_empty());
+        assert_eq!(sem.db_operations[0].library.as_str(), "Drizzle ORM");
+        assert_eq!(sem.db_operations[0].operation_type.as_str(), "SELECT");
+    }
+
+    #[test]
+    fn detects_db_operation_in_loop() {
+        let src = r#"
+async function problematic(prisma: any) {
+    const ids = [1, 2, 3, 4, 5];
+    for (const id of ids) {
+        await prisma.user.findUnique({ where: { id } });
+    }
+}
+"#;
+        let sem = parse_and_build_semantics(src);
+        assert!(!sem.db_operations.is_empty());
+        assert!(sem.db_operations[0].in_loop);
     }
 }
 

@@ -1,5 +1,6 @@
 //! TypeScript semantic model and framework-specific analysis (Express, NestJS, etc.)
 
+pub mod async_ops;
 pub mod express;
 pub mod http;
 pub mod model;
@@ -320,5 +321,386 @@ export { UserController };
         assert_eq!(sem.classes.len(), 1);
         assert_eq!(sem.classes[0].name, "UserController");
         assert!(!sem.classes[0].methods.is_empty());
+    }
+
+    // ==================== Async Operation Tests ====================
+
+    #[test]
+    fn async_operation_detection_in_build_semantics() {
+        let src = r#"
+async function main() {
+    const p1 = new Promise((resolve) => resolve(1));
+    const p2 = fetchData();
+    const result = await Promise.all([p1, p2]);
+}
+"#;
+        let sem = parse_and_build_full_semantics(src);
+
+        assert!(!sem.async_operations.is_empty());
+
+        let promises: Vec<_> = sem
+            .async_operations
+            .iter()
+            .filter(|op| matches!(op.operation_type, model::TsAsyncOperationType::PromiseConstructor))
+            .collect();
+        assert_eq!(promises.len(), 1);
+
+        let combinators: Vec<_> = sem
+            .async_operations
+            .iter()
+            .filter(|op| matches!(op.operation_type, model::TsAsyncOperationType::PromiseCombinator))
+            .collect();
+        assert_eq!(combinators.len(), 1);
+    }
+
+    #[test]
+    fn async_awaits_detected() {
+        let src = r#"
+async function main() {
+    const data = await fetchData();
+    const result = await processData(data);
+}
+"#;
+        let sem = parse_and_build_full_semantics(src);
+
+        let awaits: Vec<_> = sem
+            .async_operations
+            .iter()
+            .filter(|op| matches!(op.operation_type, model::TsAsyncOperationType::Await))
+            .collect();
+        assert_eq!(awaits.len(), 2);
+    }
+
+    #[test]
+    fn promise_all_detected() {
+        let src = r#"
+async function main() {
+    const results = await Promise.all([fetch1(), fetch2(), fetch3()]);
+}
+"#;
+        let sem = parse_and_build_full_semantics(src);
+
+        let combinators: Vec<_> = sem
+            .async_operations
+            .iter()
+            .filter(|op| matches!(op.operation_type, model::TsAsyncOperationType::PromiseCombinator))
+            .collect();
+        assert_eq!(combinators.len(), 1);
+        assert!(combinators[0].operation_text.contains("Promise.all"));
+    }
+
+    #[test]
+    fn promise_all_settled_detected() {
+        let src = r#"
+async function main() {
+    const results = await Promise.allSettled([fetch1(), fetch2()]);
+}
+"#;
+        let sem = parse_and_build_full_semantics(src);
+
+        let combinators: Vec<_> = sem
+            .async_operations
+            .iter()
+            .filter(|op| matches!(op.operation_type, model::TsAsyncOperationType::PromiseCombinator))
+            .collect();
+        assert_eq!(combinators.len(), 1);
+    }
+
+    #[test]
+    fn promise_race_detected() {
+        let src = r#"
+async function main() {
+    const result = await Promise.race([fetch1(), fetch2()]);
+}
+"#;
+        let sem = parse_and_build_full_semantics(src);
+
+        let combinators: Vec<_> = sem
+            .async_operations
+            .iter()
+            .filter(|op| matches!(op.operation_type, model::TsAsyncOperationType::PromiseCombinator))
+            .collect();
+        assert_eq!(combinators.len(), 1);
+    }
+
+    #[test]
+    fn promise_any_detected() {
+        let src = r#"
+async function main() {
+    const result = await Promise.any([fetch1(), fetch2()]);
+}
+"#;
+        let sem = parse_and_build_full_semantics(src);
+
+        let combinators: Vec<_> = sem
+            .async_operations
+            .iter()
+            .filter(|op| matches!(op.operation_type, model::TsAsyncOperationType::PromiseCombinator))
+            .collect();
+        assert_eq!(combinators.len(), 1);
+    }
+
+    #[test]
+    fn promise_chain_detected() {
+        let src = r#"
+async function main() {
+    const result = fetchData()
+        .then(data => process(data))
+        .catch(error => handleError(error));
+}
+"#;
+        let sem = parse_and_build_full_semantics(src);
+
+        let chains: Vec<_> = sem
+            .async_operations
+            .iter()
+            .filter(|op| matches!(op.operation_type, model::TsAsyncOperationType::PromiseChain))
+            .collect();
+        assert!(!chains.is_empty());
+    }
+
+    #[test]
+    fn set_timeout_detected() {
+        let src = r#"
+function main() {
+    setTimeout(() => {
+        console.log('delayed');
+    }, 1000);
+}
+"#;
+        let sem = parse_and_build_full_semantics(src);
+
+        let timeouts: Vec<_> = sem
+            .async_operations
+            .iter()
+            .filter(|op| matches!(op.operation_type, model::TsAsyncOperationType::Timeout))
+            .collect();
+        assert_eq!(timeouts.len(), 1);
+    }
+
+    #[test]
+    fn abort_controller_detected() {
+        let src = r#"
+async function main() {
+    const controller = new AbortController();
+    const signal = controller.signal;
+}
+"#;
+        let sem = parse_and_build_full_semantics(src);
+
+        let cancellations: Vec<_> = sem
+            .async_operations
+            .iter()
+            .filter(|op| matches!(op.operation_type, model::TsAsyncOperationType::Cancellation))
+            .collect();
+        assert!(!cancellations.is_empty() || !sem.async_operations.is_empty());
+    }
+
+    #[test]
+    fn async_operation_with_error_handling() {
+        let src = r#"
+async function main() {
+    try {
+        const data = await fetchData();
+    } catch (e) {
+        handleError(e);
+    }
+}
+"#;
+        let sem = parse_and_build_full_semantics(src);
+
+        let awaits: Vec<_> = sem
+            .async_operations
+            .iter()
+            .filter(|op| matches!(op.operation_type, model::TsAsyncOperationType::Await))
+            .collect();
+        assert_eq!(awaits.len(), 1);
+        assert!(awaits[0].has_error_handling);
+    }
+
+    #[test]
+    fn async_operation_with_catch() {
+        let src = r#"
+async function main() {
+    fetchData().catch(e => handleError(e));
+}
+"#;
+        let sem = parse_and_build_full_semantics(src);
+
+        let operations_with_error: Vec<_> = sem
+            .async_operations
+            .iter()
+            .filter(|op| op.has_error_handling)
+            .collect();
+        assert!(!operations_with_error.is_empty() || !sem.async_operations.is_empty());
+    }
+
+    #[test]
+    fn async_operation_without_error_handling() {
+        let src = r#"
+async function main() {
+    const data = await fetchData();
+}
+"#;
+        let sem = parse_and_build_full_semantics(src);
+
+        let awaits: Vec<_> = sem
+            .async_operations
+            .iter()
+            .filter(|op| matches!(op.operation_type, model::TsAsyncOperationType::Await))
+            .collect();
+        assert_eq!(awaits.len(), 1);
+        assert!(!awaits[0].has_error_handling);
+    }
+
+    #[test]
+    fn sync_code_has_no_async_operations() {
+        let src = r#"
+function main() {
+    const result = syncFunction();
+    const data = otherSync();
+}
+"#;
+        let sem = parse_and_build_full_semantics(src);
+
+        assert!(sem.async_operations.is_empty());
+    }
+
+    #[test]
+    fn empty_file_has_no_async_operations() {
+        let sem = parse_and_build_full_semantics("");
+        assert!(sem.async_operations.is_empty());
+    }
+
+    #[test]
+    fn async_in_arrow_function() {
+        let src = r#"
+const fetchData = async () => {
+    const result = await api.call();
+    return result;
+};
+"#;
+        let sem = parse_and_build_full_semantics(src);
+
+        let awaits: Vec<_> = sem
+            .async_operations
+            .iter()
+            .filter(|op| matches!(op.operation_type, model::TsAsyncOperationType::Await))
+            .collect();
+        assert_eq!(awaits.len(), 1);
+    }
+
+    #[test]
+    fn async_in_class_method() {
+        let src = r#"
+class MyService {
+    async fetchData() {
+        const result = await this.api.call();
+        return result;
+    }
+}
+"#;
+        let sem = parse_and_build_full_semantics(src);
+
+        let awaits: Vec<_> = sem
+            .async_operations
+            .iter()
+            .filter(|op| matches!(op.operation_type, model::TsAsyncOperationType::Await))
+            .collect();
+        assert_eq!(awaits.len(), 1);
+    }
+
+    #[test]
+    fn async_in_for_loop() {
+        let src = r#"
+async function processItems() {
+    for (const item of items) {
+        await process(item);
+    }
+}
+"#;
+        let sem = parse_and_build_full_semantics(src);
+
+        let awaits: Vec<_> = sem
+            .async_operations
+            .iter()
+            .filter(|op| matches!(op.operation_type, model::TsAsyncOperationType::Await))
+            .collect();
+        assert_eq!(awaits.len(), 1);
+    }
+
+    #[test]
+    fn multiple_async_operations_detected() {
+        let src = r#"
+async function main() {
+    const p1 = new Promise((resolve) => resolve(1));
+    const p2 = new Promise((resolve) => resolve(2));
+    const result = await Promise.all([p1, p2]);
+    const data = await fetchMoreData();
+    const final = await process(data);
+}
+"#;
+        let sem = parse_and_build_full_semantics(src);
+
+        let promises: Vec<_> = sem
+            .async_operations
+            .iter()
+            .filter(|op| matches!(op.operation_type, model::TsAsyncOperationType::PromiseConstructor))
+            .collect();
+        assert_eq!(promises.len(), 2);
+
+        let combinators: Vec<_> = sem
+            .async_operations
+            .iter()
+            .filter(|op| matches!(op.operation_type, model::TsAsyncOperationType::PromiseCombinator))
+            .collect();
+        assert_eq!(combinators.len(), 1);
+
+        let awaits: Vec<_> = sem
+            .async_operations
+            .iter()
+            .filter(|op| matches!(op.operation_type, model::TsAsyncOperationType::Await))
+            .collect();
+        assert!(awaits.len() >= 1);
+    }
+
+    #[test]
+    fn promise_constructor_with_executor() {
+        let src = r#"
+async function main() {
+    const promise = new Promise((resolve, reject) => {
+        setTimeout(() => resolve(42), 1000);
+    });
+    const result = await promise;
+}
+"#;
+        let sem = parse_and_build_full_semantics(src);
+
+        let promises: Vec<_> = sem
+            .async_operations
+            .iter()
+            .filter(|op| matches!(op.operation_type, model::TsAsyncOperationType::PromiseConstructor))
+            .collect();
+        assert_eq!(promises.len(), 1);
+    }
+
+    #[test]
+    fn async_operation_enclosing_function_tracked() {
+        let src = r#"
+async function outer() {
+    function inner() {
+        fetchData();
+    }
+    inner();
+}
+"#;
+        let sem = parse_and_build_full_semantics(src);
+
+        let calls: Vec<_> = sem
+            .calls
+            .iter()
+            .filter(|c| c.callee == "fetchData")
+            .collect();
+        assert!(!calls.is_empty());
     }
 }

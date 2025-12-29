@@ -15,6 +15,8 @@ pub use model::RustFileSemantics;
 use anyhow::Result;
 
 use crate::parse::ast::ParsedFile;
+use crate::semantics::common::db::{DbOperation, DbLibrary, DbOperationType};
+use crate::semantics::common::CommonLocation;
 
 /// Build the semantic model for a single Rust file.
 ///
@@ -125,6 +127,10 @@ fn walk_nodes(
             if let Some(call) = build_call_site(parsed, &node, &new_ctx) {
                 sem.calls.push(call);
             }
+            // Check for database operations (Diesel, SeaORM, sqlx, etc.)
+            if let Some(db_op) = detect_db_operation_from_call(parsed, &node, &new_ctx) {
+                sem.db_operations.push(db_op);
+            }
         }
         "field_expression" => {
             // Only collect field accesses that are not part of a method call
@@ -150,12 +156,74 @@ fn walk_nodes(
     }
 
     // Recurse into children
-    let child_count = node.child_count();
-    for i in 0..child_count {
+    for i in 0..node.child_count() {
         if let Some(child) = node.child(i) {
             walk_nodes(child, parsed, sem, new_ctx.clone());
         }
     }
+}
+
+/// Detect database operations from call expressions.
+fn detect_db_operation_from_call(
+    parsed: &ParsedFile,
+    node: &tree_sitter::Node,
+    ctx: &TraversalContext,
+) -> Option<DbOperation> {
+    let func_node = node.child_by_field_name("function")?;
+    let callee_expr = parsed.text_for_node(&func_node);
+
+    let (library, operation_type) = match callee_expr.as_str() {
+        // Diesel ORM patterns
+        s if s.contains("schema::") && s.contains(".execute") => (DbLibrary::Diesel, DbOperationType::Update),
+        s if s.contains("schema::") && s.contains(".load") => (DbLibrary::Diesel, DbOperationType::Select),
+        s if s.contains("schema::") && s.contains(".delete") => (DbLibrary::Diesel, DbOperationType::Delete),
+        s if s.contains(".insert_into") => (DbLibrary::Diesel, DbOperationType::Insert),
+        s if s.contains("select(") && s.contains("::") => (DbLibrary::Diesel, DbOperationType::Select),
+        s if s.contains(".update(") => (DbLibrary::Diesel, DbOperationType::Update),
+
+        // SeaORM patterns
+        s if s.contains("Entity::") && s.contains(".find") => (DbLibrary::SeaOrm, DbOperationType::Select),
+        s if s.contains("Entity::") && s.contains(".insert") => (DbLibrary::SeaOrm, DbOperationType::Insert),
+        s if s.contains("Entity::") && s.contains(".update") => (DbLibrary::SeaOrm, DbOperationType::Update),
+        s if s.contains("Entity::") && s.contains(".delete") => (DbLibrary::SeaOrm, DbOperationType::Delete),
+
+        // sqlx patterns
+        s if s.contains("query_as") && s.contains("PgPool") => (DbLibrary::Sqlx, DbOperationType::Select),
+        s if s.contains("query_as") && s.contains("execute") && s.contains("PgPool") => (DbLibrary::Sqlx, DbOperationType::Update),
+
+        // tokio-postgres patterns
+        s if s.contains("PgPool") && s.contains("query") => (DbLibrary::TokioPostgres, DbOperationType::Select),
+        s if s.contains("PgPool") && s.contains("execute") => (DbLibrary::TokioPostgres, DbOperationType::Update),
+
+        _ => return None,
+    };
+
+    let text = parsed.text_for_node(node);
+    let ast_location = parsed.location_for_node(node);
+
+    Some(DbOperation {
+        library,
+        operation_type,
+        has_timeout: false,
+        timeout_value: None,
+        in_transaction: false,
+        eager_loading: None,
+        in_loop: ctx.in_loop,
+        in_iteration: false,
+        model_name: None,
+        relationship_field: None,
+        operation_text: text,
+        location: CommonLocation {
+            file_id: ast_location.file_id,
+            line: ast_location.range.start_line + 1,
+            column: ast_location.range.start_col + 1,
+            start_byte: node.start_byte(),
+            end_byte: node.end_byte(),
+        },
+        enclosing_function: ctx.current_function.clone(),
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+    })
 }
 
 /// Update the traversal context based on the current node.

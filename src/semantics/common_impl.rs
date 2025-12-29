@@ -355,8 +355,57 @@ impl CommonSemantics for GoFileSemantics {
     }
 
     fn db_operations(&self) -> Vec<DbOperation> {
-        // TODO: Track database operations in Go semantics
-        vec![]
+        use crate::semantics::common::db::DbLibrary;
+
+        self.db_operations
+            .iter()
+            .map(|db_op| {
+                let library = match db_op.library.as_str() {
+                    "database/sql" => DbLibrary::DatabaseSql,
+                    "GORM" => DbLibrary::Gorm,
+                    "sqlx" => DbLibrary::Sqlx,
+                    "sqlc" => DbLibrary::Sqlc,
+                    _ => DbLibrary::Other(db_op.library.as_str().to_string()),
+                };
+
+                let operation_type = match db_op.operation_type.as_str() {
+                    "SELECT" => DbOperationType::Select,
+                    "INSERT" => DbOperationType::Insert,
+                    "UPDATE" => DbOperationType::Update,
+                    "DELETE" => DbOperationType::Delete,
+                    "CONNECT" => DbOperationType::Connect,
+                    "BEGIN" => DbOperationType::TransactionBegin,
+                    "COMMIT" => DbOperationType::TransactionCommit,
+                    "ROLLBACK" => DbOperationType::TransactionRollback,
+                    "RAW_SQL" => DbOperationType::RawSql,
+                    _ => DbOperationType::Unknown,
+                };
+
+                DbOperation {
+                    library,
+                    operation_type,
+                    has_timeout: db_op.has_timeout,
+                    timeout_value: db_op.timeout_value,
+                    in_transaction: db_op.in_transaction,
+                    eager_loading: db_op.eager_loading.clone(),
+                    in_loop: db_op.in_loop,
+                    in_iteration: db_op.in_iteration,
+                    model_name: db_op.model_name.clone(),
+                    relationship_field: db_op.relationship_field.clone(),
+                    operation_text: db_op.operation_text.clone(),
+                    location: CommonLocation {
+                        file_id: db_op.location.file_id,
+                        line: db_op.location.line,
+                        column: db_op.location.column,
+                        start_byte: db_op.start_byte,
+                        end_byte: db_op.end_byte,
+                    },
+                    enclosing_function: db_op.enclosing_function.clone(),
+                    start_byte: db_op.start_byte,
+                    end_byte: db_op.end_byte,
+                }
+            })
+            .collect()
     }
 
     fn async_operations(&self) -> Vec<AsyncOperation> {
@@ -510,7 +559,53 @@ impl CommonSemantics for RustFileSemantics {
     }
 
     fn db_operations(&self) -> Vec<DbOperation> {
-        vec![]
+        use crate::semantics::common::db::DbLibrary;
+
+        self.db_operations
+            .iter()
+            .map(|db_op| {
+                let library = match db_op.library.as_str() {
+                    "Diesel" => DbLibrary::Diesel,
+                    "SeaORM" => DbLibrary::SeaOrm,
+                    "sqlx" => DbLibrary::SqlxRust,
+                    "tokio-postgres" => DbLibrary::TokioPostgres,
+                    _ => DbLibrary::Other(db_op.library.as_str().to_string()),
+                };
+
+                let operation_type = match db_op.operation_type.as_str() {
+                    "SELECT" => DbOperationType::Select,
+                    "INSERT" => DbOperationType::Insert,
+                    "UPDATE" => DbOperationType::Update,
+                    "DELETE" => DbOperationType::Delete,
+                    "RAW_SQL" => DbOperationType::RawSql,
+                    _ => DbOperationType::Unknown,
+                };
+
+                DbOperation {
+                    library,
+                    operation_type,
+                    has_timeout: db_op.has_timeout,
+                    timeout_value: db_op.timeout_value,
+                    in_transaction: db_op.in_transaction,
+                    eager_loading: db_op.eager_loading.clone(),
+                    in_loop: db_op.in_loop,
+                    in_iteration: db_op.in_iteration,
+                    model_name: db_op.model_name.clone(),
+                    relationship_field: db_op.relationship_field.clone(),
+                    operation_text: db_op.operation_text.clone(),
+                    location: CommonLocation {
+                        file_id: db_op.location.file_id,
+                        line: db_op.location.line,
+                        column: db_op.location.column,
+                        start_byte: db_op.start_byte,
+                        end_byte: db_op.end_byte,
+                    },
+                    enclosing_function: db_op.enclosing_function.clone(),
+                    start_byte: db_op.start_byte,
+                    end_byte: db_op.end_byte,
+                }
+            })
+            .collect()
     }
 
     fn async_operations(&self) -> Vec<AsyncOperation> {
@@ -727,7 +822,55 @@ impl CommonSemantics for TsFileSemantics {
     }
 
     fn db_operations(&self) -> Vec<DbOperation> {
-        vec![]
+        use crate::semantics::common::db::DbLibrary;
+
+        self.db_operations
+            .iter()
+            .map(|db_op| {
+                let library = match db_op.library.as_str() {
+                    "Prisma" => DbLibrary::Prisma,
+                    "TypeORM" => DbLibrary::TypeOrm,
+                    "Knex" => DbLibrary::Knex,
+                    "Sequelize" => DbLibrary::Sequelize,
+                    "Drizzle ORM" => DbLibrary::DrizzleOrm,
+                    _ => DbLibrary::Other(db_op.library.as_str().to_string()),
+                };
+
+                let operation_type = match db_op.operation_type.as_str() {
+                    "SELECT" => DbOperationType::Select,
+                    "INSERT" => DbOperationType::Insert,
+                    "UPDATE" => DbOperationType::Update,
+                    "DELETE" => DbOperationType::Delete,
+                    "CONNECT" => DbOperationType::Connect,
+                    "RAW_SQL" => DbOperationType::RawSql,
+                    _ => DbOperationType::Unknown,
+                };
+
+                DbOperation {
+                    library,
+                    operation_type,
+                    has_timeout: db_op.has_timeout,
+                    timeout_value: db_op.timeout_value,
+                    in_transaction: db_op.in_transaction,
+                    eager_loading: db_op.eager_loading.clone(),
+                    in_loop: db_op.in_loop,
+                    in_iteration: db_op.in_iteration,
+                    model_name: db_op.model_name.clone(),
+                    relationship_field: db_op.relationship_field.clone(),
+                    operation_text: db_op.operation_text.clone(),
+                    location: CommonLocation {
+                        file_id: db_op.location.file_id,
+                        line: db_op.location.line,
+                        column: db_op.location.column,
+                        start_byte: db_op.start_byte,
+                        end_byte: db_op.end_byte,
+                    },
+                    enclosing_function: db_op.enclosing_function.clone(),
+                    start_byte: db_op.start_byte,
+                    end_byte: db_op.end_byte,
+                }
+            })
+            .collect()
     }
 
     fn async_operations(&self) -> Vec<AsyncOperation> {

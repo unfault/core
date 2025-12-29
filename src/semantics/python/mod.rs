@@ -1,5 +1,6 @@
 //! Python semantic model and framework-specific analysis (FastAPI, Django, etc.)
 
+pub mod async_ops;
 pub mod fastapi;
 pub mod http;
 pub mod model;
@@ -354,5 +355,221 @@ def fetch_sync(url: str) -> Dict[str, Any]:
 
         // No FastAPI in this module
         assert!(sem.fastapi.is_none());
+    }
+
+    // ==================== Async Operation Tests ====================
+
+    #[test]
+    fn async_operation_detection_in_build_semantics() {
+        let src = r#"
+import asyncio
+
+async def main():
+    task = asyncio.create_task(coro())
+    await asyncio.gather(task)
+"#;
+        let sem = parse_and_build_full_semantics(src);
+
+        assert!(!sem.async_operations.is_empty());
+        let task_spawns: Vec<_> = sem
+            .async_operations
+            .iter()
+            .filter(|op| matches!(op.operation_type, model::AsyncOperationType::TaskSpawn))
+            .collect();
+        assert_eq!(task_spawns.len(), 1);
+
+        let gathers: Vec<_> = sem
+            .async_operations
+            .iter()
+            .filter(|op| matches!(op.operation_type, model::AsyncOperationType::TaskGather))
+            .collect();
+        assert_eq!(gathers.len(), 1);
+    }
+
+    #[test]
+    fn async_awaits_detected() {
+        let src = r#"
+import asyncio
+
+async def main():
+    task = asyncio.create_task(coro())
+"#;
+        let sem = parse_and_build_full_semantics(src);
+
+        assert!(!sem.async_operations.is_empty());
+    }
+
+    #[test]
+    fn asyncio_sleep_detected() {
+        let src = r#"
+import asyncio
+
+async def main():
+    await asyncio.sleep(5)
+"#;
+        let sem = parse_and_build_full_semantics(src);
+
+        let sleeps: Vec<_> = sem
+            .async_operations
+            .iter()
+            .filter(|op| matches!(op.operation_type, model::AsyncOperationType::Sleep))
+            .collect();
+        assert_eq!(sleeps.len(), 1);
+    }
+
+    #[test]
+    fn asyncio_wait_for_with_timeout() {
+        let src = r#"
+import asyncio
+
+async def main():
+    await asyncio.wait_for(coro(), timeout=30.0)
+"#;
+        let sem = parse_and_build_full_semantics(src);
+
+        let timeouts: Vec<_> = sem
+            .async_operations
+            .iter()
+            .filter(|op| matches!(op.operation_type, model::AsyncOperationType::Timeout))
+            .collect();
+        assert!(!timeouts.is_empty() || !sem.async_operations.is_empty());
+    }
+
+    #[test]
+    fn async_operation_with_error_handling() {
+        let src = r#"
+import asyncio
+
+async def main():
+    try:
+        task = asyncio.create_task(coro())
+    except Exception:
+        pass
+"#;
+        let sem = parse_and_build_full_semantics(src);
+
+        let spawns: Vec<_> = sem
+            .async_operations
+            .iter()
+            .filter(|op| matches!(op.operation_type, model::AsyncOperationType::TaskSpawn))
+            .collect();
+        assert_eq!(spawns.len(), 1);
+        assert!(spawns[0].has_error_handling);
+    }
+
+    #[test]
+    fn async_operation_without_error_handling() {
+        let src = r#"
+import asyncio
+
+async def main():
+    task = asyncio.create_task(coro())
+"#;
+        let sem = parse_and_build_full_semantics(src);
+
+        let spawns: Vec<_> = sem
+            .async_operations
+            .iter()
+            .filter(|op| matches!(op.operation_type, model::AsyncOperationType::TaskSpawn))
+            .collect();
+        assert_eq!(spawns.len(), 1);
+        assert!(!spawns[0].has_error_handling);
+    }
+
+    #[test]
+    fn sync_code_has_no_async_operations() {
+        let src = r#"
+def main():
+    result = sync_func()
+    data = other_sync()
+"#;
+        let sem = parse_and_build_full_semantics(src);
+
+        assert!(sem.async_operations.is_empty());
+    }
+
+    #[test]
+    fn empty_file_has_no_async_operations() {
+        let sem = parse_and_build_full_semantics("");
+        assert!(sem.async_operations.is_empty());
+    }
+
+    #[test]
+    fn async_operation_in_class_method() {
+        let src = r#"
+import asyncio
+
+class MyService:
+    async def async_method(self):
+        task = asyncio.create_task(self.coro())
+        await task
+"#;
+        let sem = parse_and_build_full_semantics(src);
+
+        assert!(!sem.async_operations.is_empty());
+        let tasks: Vec<_> = sem
+            .async_operations
+            .iter()
+            .filter(|op| matches!(op.operation_type, model::AsyncOperationType::TaskSpawn))
+            .collect();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].enclosing_function, Some("async_method".to_string()));
+    }
+
+    #[test]
+    fn multiple_async_operations_detected() {
+        let src = r#"
+import asyncio
+
+async def main():
+    task1 = asyncio.create_task(coro1())
+    task2 = asyncio.create_task(coro2())
+    task3 = asyncio.create_task(coro3())
+    await asyncio.gather(task1, task2, task3)
+    await asyncio.sleep(1)
+"#;
+        let sem = parse_and_build_full_semantics(src);
+
+        let spawns: Vec<_> = sem
+            .async_operations
+            .iter()
+            .filter(|op| matches!(op.operation_type, model::AsyncOperationType::TaskSpawn))
+            .collect();
+        assert_eq!(spawns.len(), 3);
+
+        let gathers: Vec<_> = sem
+            .async_operations
+            .iter()
+            .filter(|op| matches!(op.operation_type, model::AsyncOperationType::TaskGather))
+            .collect();
+        assert_eq!(gathers.len(), 1);
+
+        let sleeps: Vec<_> = sem
+            .async_operations
+            .iter()
+            .filter(|op| matches!(op.operation_type, model::AsyncOperationType::Sleep))
+            .collect();
+        assert_eq!(sleeps.len(), 1);
+    }
+
+    #[test]
+    fn async_operation_enclosing_function_tracked() {
+        let src = r#"
+import asyncio
+
+async def outer():
+    def inner():
+        task = asyncio.create_task(coro())
+    inner()
+"#;
+        let sem = parse_and_build_full_semantics(src);
+
+        let spawns: Vec<_> = sem
+            .async_operations
+            .iter()
+            .filter(|op| matches!(op.operation_type, model::AsyncOperationType::TaskSpawn))
+            .collect();
+        assert_eq!(spawns.len(), 1);
+        assert_eq!(spawns[0].enclosing_function, Some("inner".to_string()));
     }
 }

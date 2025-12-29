@@ -8,11 +8,14 @@ use crate::types::context::Language;
 
 use super::common::{
     CommonLocation, CommonSemantics,
+    annotations::{Annotation, AnnotationType, FunctionAnnotations},
     async_ops::{AsyncOperation, AsyncOperationType, AsyncRuntime},
     db::{DbLibrary, DbOperation, DbOperationType},
+    error_context::{ErrorContext, ErrorContextType},
     functions::{FunctionCall, FunctionDecorator, FunctionDef, FunctionKind, FunctionParam, Visibility},
     http::{HttpCall, HttpClientLibrary, HttpMethod},
     imports::{Import, ImportSource, ImportStyle, ImportedItem},
+    route_patterns::{RouteFramework, RoutePattern},
 };
 
 use super::go::model::{GoCallSite, GoFileSemantics, GoFunction, GoImport, GoMethod};
@@ -164,6 +167,22 @@ impl CommonSemantics for PyFileSemantics {
             .iter()
             .filter_map(|func| convert_python_function(func, self.file_id, &self.calls))
             .collect()
+    }
+
+    fn annotations(&self) -> Vec<Annotation> {
+        Vec::new()
+    }
+
+    fn route_patterns(&self) -> Vec<RoutePattern> {
+        Vec::new()
+    }
+
+    fn n_plus_one_patterns(&self) -> Vec<DbOperation> {
+        Vec::new()
+    }
+
+    fn error_contexts(&self) -> Vec<ErrorContext> {
+        Vec::new()
     }
 }
 
@@ -669,6 +688,22 @@ impl CommonSemantics for GoFileSemantics {
             .collect();
         funcs.into_iter().chain(methods).collect()
     }
+
+    fn annotations(&self) -> Vec<Annotation> {
+        Vec::new()
+    }
+
+    fn route_patterns(&self) -> Vec<RoutePattern> {
+        Vec::new()
+    }
+
+    fn n_plus_one_patterns(&self) -> Vec<DbOperation> {
+        Vec::new()
+    }
+
+    fn error_contexts(&self) -> Vec<ErrorContext> {
+        Vec::new()
+    }
 }
 
 /// Convert a Go import to the common Import type
@@ -992,6 +1027,22 @@ impl CommonSemantics for RustFileSemantics {
             .collect();
         funcs.into_iter().chain(impl_methods).collect()
     }
+
+    fn annotations(&self) -> Vec<Annotation> {
+        Vec::new()
+    }
+
+    fn route_patterns(&self) -> Vec<RoutePattern> {
+        Vec::new()
+    }
+
+    fn n_plus_one_patterns(&self) -> Vec<DbOperation> {
+        Vec::new()
+    }
+
+    fn error_contexts(&self) -> Vec<ErrorContext> {
+        Vec::new()
+    }
 }
 
 /// Convert a Rust use statement to the common Import type
@@ -1267,6 +1318,22 @@ impl CommonSemantics for TsFileSemantics {
             })
             .collect();
         funcs.into_iter().chain(class_methods).collect()
+    }
+
+    fn annotations(&self) -> Vec<Annotation> {
+        Vec::new()
+    }
+
+    fn route_patterns(&self) -> Vec<RoutePattern> {
+        Vec::new()
+    }
+
+    fn n_plus_one_patterns(&self) -> Vec<DbOperation> {
+        Vec::new()
+    }
+
+    fn error_contexts(&self) -> Vec<ErrorContext> {
+        Vec::new()
     }
 }
 

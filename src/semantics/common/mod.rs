@@ -3,16 +3,23 @@
 //! This module provides language-agnostic traits and types that can be
 //! implemented by each language's semantic model, enabling shared rule logic.
 
+pub mod annotations;
 pub mod async_ops;
 pub mod calls;
 pub mod db;
+pub mod error_context;
 pub mod frameworks;
 pub mod functions;
 pub mod http;
 pub mod imports;
+pub mod route_patterns;
 
 use crate::parse::ast::{AstLocation, FileId};
 use crate::types::context::Language;
+
+pub use self::annotations::{Annotation, AnnotationType, FunctionAnnotations};
+pub use self::error_context::{ErrorContext, ErrorContextType, ErrorSummary};
+pub use self::route_patterns::{RouteFramework, RoutePattern};
 
 /// Language-agnostic semantic information for a source file.
 ///
@@ -46,6 +53,18 @@ pub trait CommonSemantics: Send + Sync {
 
     /// Get function/method definitions in this file
     fn functions(&self) -> Vec<functions::FunctionDef>;
+
+    /// Get annotations/decorators on functions (logging, retry, feature flags, etc.)
+    fn annotations(&self) -> Vec<annotations::Annotation>;
+
+    /// Get HTTP route patterns for embeddings and analysis
+    fn route_patterns(&self) -> Vec<route_patterns::RoutePattern>;
+
+    /// Get N+1 query patterns detected in the file
+    fn n_plus_one_patterns(&self) -> Vec<db::DbOperation>;
+
+    /// Get error handling contexts (try/catch, error propagation)
+    fn error_contexts(&self) -> Vec<error_context::ErrorContext>;
 
     /// Check if a specific import exists by module path
     fn has_import(&self, module: &str) -> bool {
@@ -94,6 +113,69 @@ pub trait CommonSemantics: Send + Sync {
         self.async_operations()
             .into_iter()
             .filter(|op| !op.has_error_handling)
+            .collect()
+    }
+
+    /// Get annotations of a specific type
+    fn annotations_of_type(&self, annotation_type: &str) -> Vec<annotations::Annotation> {
+        self.annotations()
+            .into_iter()
+            .filter(|a| match &a.annotation_type {
+                annotations::AnnotationType::Logging => annotation_type == "logging",
+                annotations::AnnotationType::Retry => annotation_type == "retry",
+                annotations::AnnotationType::FeatureFlag => annotation_type == "feature_flag",
+                annotations::AnnotationType::RateLimit => annotation_type == "rate_limit",
+                annotations::AnnotationType::Cache => annotation_type == "cache",
+                annotations::AnnotationType::Validation { .. } => annotation_type == "validation",
+                annotations::AnnotationType::Auth { .. } => annotation_type == "auth",
+                annotations::AnnotationType::Timeout => annotation_type == "timeout",
+                annotations::AnnotationType::Route => annotation_type == "route",
+                annotations::AnnotationType::Controller => annotation_type == "controller",
+                annotations::AnnotationType::Injectable => annotation_type == "injectable",
+                annotations::AnnotationType::CustomDecorator => annotation_type == "custom_decorator",
+                annotations::AnnotationType::Interceptor => annotation_type == "interceptor",
+                annotations::AnnotationType::Other(name) => name.contains(annotation_type),
+            })
+            .collect()
+    }
+
+    /// Get routes that require authentication
+    fn routes_with_auth(&self) -> Vec<route_patterns::RoutePattern> {
+        self.route_patterns()
+            .into_iter()
+            .filter(|r| r.has_auth)
+            .collect()
+    }
+
+    /// Get routes with path parameters
+    fn routes_with_params(&self) -> Vec<route_patterns::RoutePattern> {
+        self.route_patterns()
+            .into_iter()
+            .filter(|r| r.has_path_parameters())
+            .collect()
+    }
+
+    /// Get N+1 query patterns (database operations in loops without eager loading)
+    fn potential_n_plus_one_queries(&self) -> Vec<db::DbOperation> {
+        self.db_operations()
+            .into_iter()
+            .filter(|op| op.is_potential_n_plus_one())
+            .collect()
+    }
+
+    /// Get error contexts that swallow errors
+    fn error_contexts_swallowing_errors(&self) -> Vec<error_context::ErrorContext> {
+        self.error_contexts()
+            .into_iter()
+            .filter(|ec| ec.swallows_error)
+            .collect()
+    }
+
+    /// Get error contexts that add logging/context
+    fn error_contexts_adding_context(&self) -> Vec<error_context::ErrorContext> {
+        self.error_contexts()
+            .into_iter()
+            .filter(|ec| ec.adds_context)
             .collect()
     }
 }

@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::parse::ast::{AstLocation, FileId, ParsedFile};
 use crate::semantics::common::db::DbOperation;
+use crate::semantics::common::http::HttpCall;
 use crate::semantics::rust::frameworks::RustFrameworkSummary;
 use crate::types::context::Language;
 
@@ -76,6 +77,9 @@ pub struct RustFileSemantics {
 
     /// Database operations (Diesel, SeaORM, sqlx, etc.)
     pub db_operations: Vec<DbOperation>,
+
+    /// HTTP client calls (reqwest, ureq, hyper, etc.)
+    pub http_calls: Vec<HttpCall>,
 }
 
 /// Use statement (import).
@@ -670,6 +674,7 @@ impl RustFileSemantics {
             variable_bindings: Vec::new(),
             rust_framework: None,
             db_operations: Vec::new(),
+            http_calls: Vec::new(),
         }
     }
 }

@@ -5,6 +5,7 @@
 //! error handling patterns, and more.
 
 pub mod frameworks;
+pub mod http;
 pub mod model;
 
 pub use frameworks::{
@@ -28,6 +29,7 @@ pub fn build_rust_semantics(parsed: &ParsedFile) -> Result<RustFileSemantics> {
     analyze_error_handling(parsed, &mut sem);
     analyze_unsafe_patterns(parsed, &mut sem);
     analyze_frameworks(parsed, &mut sem);
+    analyze_http_calls(parsed, &mut sem);
     Ok(sem)
 }
 
@@ -36,6 +38,64 @@ fn analyze_frameworks(parsed: &ParsedFile, sem: &mut RustFileSemantics) {
     let summary = frameworks::extract_rust_routes(parsed);
     if summary.has_framework() {
         sem.rust_framework = Some(summary);
+    }
+}
+
+/// Analyze HTTP client calls (reqwest, ureq, hyper, etc.).
+fn analyze_http_calls(parsed: &ParsedFile, sem: &mut RustFileSemantics) {
+    let http_calls = http::summarize_http_clients(parsed);
+    sem.http_calls = http_calls
+        .into_iter()
+        .map(|call_site| convert_http_call_site(call_site, parsed))
+        .collect();
+}
+
+/// Convert Rust-specific HttpCallSite to common HttpCall.
+fn convert_http_call_site(site: http::HttpCallSite, _parsed: &ParsedFile) -> crate::semantics::common::http::HttpCall {
+    let library = match site.client_kind {
+        http::HttpClientKind::Reqwest => crate::semantics::common::http::HttpClientLibrary::Reqwest,
+        http::HttpClientKind::ReqwestBlocking => crate::semantics::common::http::HttpClientLibrary::Reqwest,
+        http::HttpClientKind::Ureq => crate::semantics::common::http::HttpClientLibrary::Ureq,
+        http::HttpClientKind::Hyper => crate::semantics::common::http::HttpClientLibrary::Hyper,
+        http::HttpClientKind::Surf => crate::semantics::common::http::HttpClientLibrary::Other("surf".to_string()),
+        http::HttpClientKind::Awc => crate::semantics::common::http::HttpClientLibrary::Other("awc".to_string()),
+        http::HttpClientKind::Isahc => crate::semantics::common::http::HttpClientLibrary::Other("isahc".to_string()),
+        http::HttpClientKind::Other(name) => crate::semantics::common::http::HttpClientLibrary::Other(name),
+    };
+
+    let method = match site.method_name.to_lowercase().as_str() {
+        "get" => crate::semantics::common::http::HttpMethod::Get,
+        "post" => crate::semantics::common::http::HttpMethod::Post,
+        "put" => crate::semantics::common::http::HttpMethod::Put,
+        "patch" => crate::semantics::common::http::HttpMethod::Patch,
+        "delete" => crate::semantics::common::http::HttpMethod::Delete,
+        "head" => crate::semantics::common::http::HttpMethod::Head,
+        "options" => crate::semantics::common::http::HttpMethod::Options,
+        _ => crate::semantics::common::http::HttpMethod::Other(site.method_name),
+    };
+
+    let location = CommonLocation {
+        file_id: site.location.file_id,
+        line: site.location.range.start_line + 1,
+        column: site.location.range.start_col + 1,
+        start_byte: site.start_byte,
+        end_byte: site.end_byte,
+    };
+
+    crate::semantics::common::http::HttpCall {
+        library,
+        method,
+        url: None,
+        has_timeout: site.has_timeout,
+        timeout_value: site.timeout_value,
+        retry_mechanism: None,
+        call_text: site.call_text,
+        location,
+        enclosing_function: site.function_name,
+        in_async_context: site.in_async_function,
+        in_loop: false,
+        start_byte: site.start_byte,
+        end_byte: site.end_byte,
     }
 }
 

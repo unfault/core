@@ -1,9 +1,11 @@
-//! TypeScript semantic model and framework-specific analysis (Express, NestJS, etc.)
+//! TypeScript semantic model and framework-specific analysis (Express, NestJS, Fastify, etc.)
 
 pub mod async_ops;
 pub mod express;
+pub mod fastify;
 pub mod http;
 pub mod model;
+pub mod nestjs;
 
 use anyhow::Result;
 

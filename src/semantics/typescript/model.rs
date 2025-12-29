@@ -88,6 +88,12 @@ pub struct TsFileSemantics {
     /// Express.js related semantics
     pub express: Option<ExpressFileSummary>,
 
+    /// NestJS related semantics
+    pub nestjs: Option<NestJSFileSummary>,
+
+    /// Fastify related semantics
+    pub fastify: Option<FastifyFileSummary>,
+
     /// Async functions without proper error handling
     pub async_without_error_handling: Vec<AsyncWithoutErrorHandling>,
 
@@ -358,6 +364,80 @@ pub struct ExpressMiddleware {
     pub location: AstLocation,
 }
 
+/// NestJS-specific semantics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NestJSFileSummary {
+    pub controllers: Vec<NestJSController>,
+    pub services: Vec<NestJSService>,
+    pub modules: Vec<NestJSModule>,
+    pub routes: Vec<NestJSRoute>,
+    pub guards: Vec<NestJSGuard>,
+    pub interceptors: Vec<NestJSInterceptor>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NestJSController {
+    pub class_name: String,
+    pub routes: Vec<String>,
+    pub location: AstLocation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NestJSService {
+    pub class_name: String,
+    pub location: AstLocation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NestJSModule {
+    pub class_name: String,
+    pub location: AstLocation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NestJSRoute {
+    pub method: String,
+    pub path: String,
+    pub handler_name: String,
+    pub is_async: bool,
+    pub location: AstLocation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NestJSGuard {
+    pub class_name: String,
+    pub location: AstLocation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NestJSInterceptor {
+    pub class_name: String,
+    pub location: AstLocation,
+}
+
+/// Fastify-specific semantics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FastifyFileSummary {
+    pub apps: Vec<String>,
+    pub routes: Vec<FastifyRoute>,
+    pub middlewares: Vec<FastifyMiddleware>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FastifyRoute {
+    pub method: String,
+    pub path: Option<String>,
+    pub handler_name: Option<String>,
+    pub is_async: bool,
+    pub location: AstLocation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FastifyMiddleware {
+    pub middleware_name: String,
+    pub location: AstLocation,
+}
+
 /// Async operation without proper error handling
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AsyncWithoutErrorHandling {
@@ -399,6 +479,8 @@ impl TsFileSemantics {
             empty_catches: Vec::new(),
             bare_catches: Vec::new(),
             express: None,
+            nestjs: None,
+            fastify: None,
             async_without_error_handling: Vec::new(),
             global_mutable_state: Vec::new(),
             async_operations: Vec::new(),
@@ -418,6 +500,18 @@ impl TsFileSemantics {
         let express_summary = super::express::summarize_express(parsed);
         if express_summary.is_some() {
             self.express = express_summary;
+        }
+
+        // NestJS analysis
+        let nestjs_summary = super::nestjs::summarize_nestjs(parsed);
+        if nestjs_summary.is_some() {
+            self.nestjs = nestjs_summary;
+        }
+
+        // Fastify analysis
+        let fastify_summary = super::fastify::summarize_fastify(parsed);
+        if fastify_summary.is_some() {
+            self.fastify = fastify_summary;
         }
 
         // HTTP client calls

@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::parse::ast::{AstLocation, FileId, ParsedFile};
 use crate::types::context::Language;
+use crate::semantics::common::calls::FunctionCall;
 use crate::semantics::common::db::{DbOperation, DbLibrary, DbOperationType};
 use crate::semantics::common::CommonLocation;
 
@@ -294,8 +295,8 @@ pub enum VariableKind {
 /// Representation of a function/method call
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TsCallSite {
-    /// e.g. "express", "app.get", "fetch"
-    pub callee: String,
+    /// The full function call with metadata
+    pub function_call: FunctionCall,
 
     /// Arguments for the call
     pub args: Vec<TsCallArg>,
@@ -308,14 +309,6 @@ pub struct TsCallSite {
 
     /// Whether this call is awaited
     pub is_awaited: bool,
-
-    /// Start byte offset of the call
-    pub start_byte: usize,
-
-    /// End byte offset of the call
-    pub end_byte: usize,
-
-    pub location: AstLocation,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -443,6 +436,7 @@ impl TsFileSemantics {
 struct TraversalContext {
     in_loop: bool,
     current_function: Option<String>,
+    current_qualified_name: Option<String>,
 }
 
 /// Collect semantics by walking the tree-sitter AST.
@@ -1098,7 +1092,39 @@ fn build_callsite(
 
     // Get the function being called
     let func_node = node.child_by_field_name("function")?;
-    let callee = parsed.text_for_node(&func_node);
+    let callee_expr = parsed.text_for_node(&func_node);
+
+    // Parse callee into parts (e.g., "obj.method" -> ["obj", "method"])
+    let callee_parts: Vec<String> = callee_expr.split('.').map(String::from).collect();
+    let first_part = callee_parts.first().cloned().unwrap_or_default();
+
+    // Detect if method call (has receiver)
+    let is_method_call = callee_parts.len() > 1;
+    let _receiver = if is_method_call {
+        Some(first_part.clone())
+    } else {
+        None
+    };
+
+    // Detect self call (TypeScript uses 'this')
+    let is_self_call = first_part == "this";
+
+    let function_call = FunctionCall {
+        callee_expr: callee_expr.clone(),
+        callee_parts,
+        caller_function: ctx.current_function.clone().unwrap_or_default(),
+        caller_qualified_name: ctx.current_qualified_name.clone().unwrap_or_default(),
+        location: CommonLocation {
+            file_id: parsed.file_id,
+            line: location.range.start_line + 1,
+            column: location.range.start_col + 1,
+            start_byte: node.start_byte(),
+            end_byte: node.end_byte(),
+        },
+        is_self_call,
+        is_import_call: false, // Will be enhanced with import analysis
+        import_alias: None,
+    };
 
     // Get arguments
     let args_repr = if let Some(args_node) = node.child_by_field_name("arguments") {
@@ -1127,14 +1153,11 @@ fn build_callsite(
         .unwrap_or(false);
 
     Some(TsCallSite {
-        callee,
+        function_call,
         args,
         args_repr,
         in_loop: ctx.in_loop,
         is_awaited,
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        location,
     })
 }
 
@@ -1148,7 +1171,27 @@ fn build_new_expression(
     // Get the constructor being called
     let constructor_node = node.child_by_field_name("constructor")?;
     let constructor_name = parsed.text_for_node(&constructor_node);
-    let callee = format!("new {}", constructor_name);
+    let callee_expr = format!("new {}", constructor_name);
+
+    // Parse callee into parts
+    let callee_parts: Vec<String> = callee_expr.split('.').map(String::from).collect();
+
+    let function_call = FunctionCall {
+        callee_expr: callee_expr.clone(),
+        callee_parts,
+        caller_function: ctx.current_function.clone().unwrap_or_default(),
+        caller_qualified_name: ctx.current_qualified_name.clone().unwrap_or_default(),
+        location: CommonLocation {
+            file_id: parsed.file_id,
+            line: location.range.start_line + 1,
+            column: location.range.start_col + 1,
+            start_byte: node.start_byte(),
+            end_byte: node.end_byte(),
+        },
+        is_self_call: false,
+        is_import_call: false,
+        import_alias: None,
+    };
 
     // Get arguments
     let args_repr = if let Some(args_node) = node.child_by_field_name("arguments") {
@@ -1177,14 +1220,11 @@ fn build_new_expression(
         .unwrap_or(false);
 
     Some(TsCallSite {
-        callee,
+        function_call,
         args,
         args_repr,
         in_loop: ctx.in_loop,
         is_awaited,
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        location,
     })
 }
 
@@ -1569,7 +1609,7 @@ class MyClass {
     fn collects_calls() {
         let sem = parse_and_build_semantics("fetch('https://api.example.com');");
         assert!(!sem.calls.is_empty());
-        assert!(sem.calls.iter().any(|c| c.callee == "fetch"));
+        assert!(sem.calls.iter().any(|c| c.function_call.callee_expr == "fetch"));
     }
 
     #[test]

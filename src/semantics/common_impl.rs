@@ -17,11 +17,15 @@ use super::common::{
 
 use super::go::model::{GoCallSite, GoFileSemantics, GoFunction, GoImport, GoMethod};
 use super::python::model::{
+    AsyncOperation as PyAsyncOperation, AsyncOperationType as PyAsyncOperationType,
     ImportCategory as PyImportCategory, ImportStyle as PyImportStyle, PyCallSite, PyFileSemantics,
     PyFunction, PyImport,
 };
 use super::rust::model::{RustCallSite, RustFileSemantics, RustFunction, RustUse, Visibility as RustVisibility};
-use super::typescript::model::{TsCallSite, TsFileSemantics, TsFunction, TsImport, TsMethod};
+use super::typescript::model::{
+    TsAsyncOperation, TsAsyncOperationType, TsCallSite, TsFileSemantics,
+    TsFunction, TsImport, TsMethod,
+};
 
 // =============================================================================
 // Python Implementation
@@ -142,9 +146,10 @@ impl CommonSemantics for PyFileSemantics {
     }
 
     fn async_operations(&self) -> Vec<AsyncOperation> {
-        // For Python, we could track asyncio.create_task, etc.
-        // For now, return empty - can be enhanced later
-        vec![]
+        self.async_operations
+            .iter()
+            .map(|py_op| convert_python_async_op(py_op, self.file_id))
+            .collect()
     }
 
     fn imports(&self) -> Vec<Import> {
@@ -159,6 +164,62 @@ impl CommonSemantics for PyFileSemantics {
             .iter()
             .filter_map(|func| convert_python_function(func, self.file_id, &self.calls))
             .collect()
+    }
+}
+
+/// Convert a Python AsyncOperation to the common AsyncOperation type
+fn convert_python_async_op(py_op: &PyAsyncOperation, file_id: FileId) -> AsyncOperation {
+    let operation_type = match py_op.operation_type {
+        PyAsyncOperationType::TaskSpawn => AsyncOperationType::TaskSpawn,
+        PyAsyncOperationType::Await => AsyncOperationType::TaskAwait,
+        PyAsyncOperationType::TaskGather => AsyncOperationType::TaskGather,
+        PyAsyncOperationType::ChannelSend => AsyncOperationType::ChannelSend,
+        PyAsyncOperationType::ChannelReceive => AsyncOperationType::ChannelReceive,
+        PyAsyncOperationType::LockAcquire => AsyncOperationType::LockAcquire,
+        PyAsyncOperationType::LockRelease => AsyncOperationType::LockRelease,
+        PyAsyncOperationType::SemaphoreAcquire => AsyncOperationType::SemaphoreAcquire,
+        PyAsyncOperationType::Sleep => AsyncOperationType::Sleep,
+        PyAsyncOperationType::Timeout => AsyncOperationType::Timeout,
+        PyAsyncOperationType::Select => AsyncOperationType::SelectRace,
+        PyAsyncOperationType::AsyncFor => AsyncOperationType::TaskAwait,
+        PyAsyncOperationType::Unknown => AsyncOperationType::Unknown,
+    };
+
+    let error_handling = if py_op.has_error_handling {
+        Some(crate::semantics::common::async_ops::ErrorHandling::TryCatch)
+    } else {
+        None
+    };
+
+    let cancellation_handling = if py_op.has_cancellation {
+        Some(crate::semantics::common::async_ops::CancellationHandling::CancellationToken)
+    } else {
+        None
+    };
+
+    AsyncOperation {
+        runtime: AsyncRuntime::Asyncio,
+        operation_type,
+        has_error_handling: py_op.has_error_handling,
+        error_handling,
+        has_timeout: py_op.has_timeout,
+        timeout_value: py_op.timeout_value,
+        has_cancellation: py_op.has_cancellation,
+        cancellation_handling,
+        is_bounded: py_op.is_bounded,
+        bound_limit: py_op.bound_limit,
+        has_cleanup: false,
+        operation_text: py_op.operation_text.clone(),
+        location: CommonLocation {
+            file_id,
+            line: py_op.location.range.start_line + 1,
+            column: py_op.location.range.start_col + 1,
+            start_byte: py_op.start_byte,
+            end_byte: py_op.end_byte,
+        },
+        enclosing_function: py_op.enclosing_function.clone(),
+        start_byte: py_op.start_byte,
+        end_byte: py_op.end_byte,
     }
 }
 
@@ -663,8 +724,7 @@ impl CommonSemantics for RustFileSemantics {
     }
 
     fn http_calls(&self) -> Vec<HttpCall> {
-        // Rust doesn't have http_calls field yet - return empty
-        vec![]
+        self.http_calls.clone()
     }
 
     fn db_operations(&self) -> Vec<DbOperation> {
@@ -853,7 +913,7 @@ fn convert_rust_function(
     // Filter calls that are within this function's byte range
     let calls: Vec<FunctionCall> = all_calls
         .iter()
-        .filter(|call| call.start_byte >= rust_func.start_byte && call.end_byte <= rust_func.end_byte)
+        .filter(|call| call.function_call.location.start_byte >= rust_func.start_byte && call.function_call.location.end_byte <= rust_func.end_byte)
         .map(|call| convert_rust_call_site(call))
         .collect();
 
@@ -884,19 +944,21 @@ fn convert_rust_function(
 
 /// Convert a RustCallSite to the common FunctionCall type
 fn convert_rust_call_site(call: &RustCallSite) -> FunctionCall {
-    let callee = call.method_name.clone().unwrap_or_else(|| call.callee.clone());
-    let receiver = if call.is_method_call {
-        Some(call.callee.clone())
+    let callee_expr = &call.function_call.callee_expr;
+    let (callee, receiver) = if let Some(idx) = callee_expr.rfind('.') {
+        let callee_name = callee_expr[idx + 1..].to_string();
+        let receiver_name = callee_expr[..idx].to_string();
+        (callee_name, Some(receiver_name))
     } else {
-        None
+        (callee_expr.clone(), None)
     };
 
     FunctionCall {
         callee,
-        callee_expr: call.callee.clone(),
+        callee_expr: callee_expr.clone(),
         receiver,
-        line: call.location.range.start_line + 1,
-        column: call.location.range.start_col + 1,
+        line: call.function_call.location.line,
+        column: call.function_call.location.column,
     }
 }
 
@@ -1024,7 +1086,10 @@ impl CommonSemantics for TsFileSemantics {
     }
 
     fn async_operations(&self) -> Vec<AsyncOperation> {
-        vec![]
+        self.async_operations
+            .iter()
+            .map(|ts_op| convert_ts_async_op(ts_op, self.file_id))
+            .collect()
     }
 
     fn imports(&self) -> Vec<Import> {
@@ -1101,6 +1166,58 @@ fn convert_ts_import(ts_import: &TsImport, file_id: FileId) -> Option<Import> {
     })
 }
 
+/// Convert a TypeScript AsyncOperation to the common AsyncOperation type
+fn convert_ts_async_op(ts_op: &TsAsyncOperation, file_id: FileId) -> AsyncOperation {
+    let operation_type = match ts_op.operation_type {
+        TsAsyncOperationType::PromiseConstructor => AsyncOperationType::TaskSpawn,
+        TsAsyncOperationType::Await => AsyncOperationType::TaskAwait,
+        TsAsyncOperationType::PromiseCombinator => AsyncOperationType::TaskGather,
+        TsAsyncOperationType::PromiseChain => AsyncOperationType::TaskGather,
+        TsAsyncOperationType::Timeout => AsyncOperationType::Sleep,
+        TsAsyncOperationType::Cancellation => AsyncOperationType::TaskSpawn,
+        TsAsyncOperationType::AsyncFunction => AsyncOperationType::TaskSpawn,
+        TsAsyncOperationType::AsyncArrow => AsyncOperationType::TaskSpawn,
+        TsAsyncOperationType::Unknown => AsyncOperationType::Unknown,
+    };
+
+    let error_handling = if ts_op.has_error_handling {
+        Some(crate::semantics::common::async_ops::ErrorHandling::TryCatch)
+    } else {
+        None
+    };
+
+    let cancellation_handling = if ts_op.has_cancellation {
+        Some(crate::semantics::common::async_ops::CancellationHandling::CancellationToken)
+    } else {
+        None
+    };
+
+    AsyncOperation {
+        runtime: AsyncRuntime::PromiseNative,
+        operation_type,
+        has_error_handling: ts_op.has_error_handling,
+        error_handling,
+        has_timeout: ts_op.has_timeout,
+        timeout_value: ts_op.timeout_value,
+        has_cancellation: ts_op.has_cancellation,
+        cancellation_handling,
+        is_bounded: false,
+        bound_limit: None,
+        has_cleanup: false,
+        operation_text: ts_op.operation_text.clone(),
+        location: CommonLocation {
+            file_id,
+            line: ts_op.location.range.start_line + 1,
+            column: ts_op.location.range.start_col + 1,
+            start_byte: ts_op.start_byte,
+            end_byte: ts_op.end_byte,
+        },
+        enclosing_function: ts_op.enclosing_function.clone(),
+        start_byte: ts_op.start_byte,
+        end_byte: ts_op.end_byte,
+    }
+}
+
 /// Convert a TypeScript function to the common FunctionDef type
 fn convert_ts_function(
     ts_func: &TsFunction,
@@ -1140,7 +1257,7 @@ fn convert_ts_function(
     // Filter calls that are within this function's byte range
     let calls: Vec<FunctionCall> = all_calls
         .iter()
-        .filter(|call| call.start_byte >= ts_func.start_byte && call.end_byte <= ts_func.end_byte)
+        .filter(|call| call.function_call.location.start_byte >= ts_func.start_byte && call.function_call.location.end_byte <= ts_func.end_byte)
         .map(|call| convert_ts_call_site(call))
         .collect();
 
@@ -1171,7 +1288,7 @@ fn convert_ts_function(
 
 /// Convert a TsCallSite to the common FunctionCall type
 fn convert_ts_call_site(call: &TsCallSite) -> FunctionCall {
-    let callee_expr = &call.callee;
+    let callee_expr = &call.function_call.callee_expr;
     let (callee, receiver) = if let Some(idx) = callee_expr.rfind('.') {
         let callee_name = callee_expr[idx + 1..].to_string();
         let receiver_name = callee_expr[..idx].to_string();
@@ -1184,8 +1301,8 @@ fn convert_ts_call_site(call: &TsCallSite) -> FunctionCall {
         callee,
         callee_expr: callee_expr.clone(),
         receiver,
-        line: call.location.range.start_line + 1,
-        column: call.location.range.start_col + 1,
+        line: call.function_call.location.line,
+        column: call.function_call.location.column,
     }
 }
 
@@ -1222,7 +1339,7 @@ fn convert_ts_method(
     // Filter calls that are within this method's byte range
     let calls: Vec<FunctionCall> = all_calls
         .iter()
-        .filter(|call| call.start_byte >= method.start_byte && call.end_byte <= method.end_byte)
+        .filter(|call| call.function_call.location.start_byte >= method.start_byte && call.function_call.location.end_byte <= method.end_byte)
         .map(|call| convert_ts_call_site(call))
         .collect();
 

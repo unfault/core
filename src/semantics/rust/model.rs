@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::parse::ast::{AstLocation, FileId, ParsedFile};
+use crate::semantics::common::calls::FunctionCall;
 use crate::semantics::common::db::DbOperation;
 use crate::semantics::common::http::HttpCall;
 use crate::semantics::rust::frameworks::RustFrameworkSummary;
@@ -571,12 +572,10 @@ pub struct StaticDecl {
 /// Generic call site for analysis.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RustCallSite {
-    /// The callee expression
-    pub callee: String,
-    /// Method name if method call
-    pub method_name: Option<String>,
-    /// Whether this is a method call (obj.method())
-    pub is_method_call: bool,
+    /// The full function call with metadata
+    pub function_call: FunctionCall,
+    /// Arguments for the call
+    pub args_repr: String,
     /// Whether this call is inside a loop
     pub in_loop: bool,
     /// Whether this is in an async context
@@ -584,11 +583,6 @@ pub struct RustCallSite {
     /// Whether this is in a static initializer (LazyLock::new, OnceLock, etc.)
     /// Such patterns are the correct way to initialize compile-time constants.
     pub in_static_init: bool,
-    /// Enclosing function name
-    pub function_name: Option<String>,
-    pub location: AstLocation,
-    pub start_byte: usize,
-    pub end_byte: usize,
 }
 
 /// Field access expression (e.g., `obj.field`).

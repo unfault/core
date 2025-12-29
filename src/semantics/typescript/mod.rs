@@ -676,7 +676,7 @@ async function outer() {
         let calls: Vec<_> = sem
             .calls
             .iter()
-            .filter(|c| c.callee == "fetchData")
+            .filter(|c| c.function_call.callee_expr == "fetchData")
             .collect();
         assert!(!calls.is_empty());
     }

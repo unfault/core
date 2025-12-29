@@ -16,6 +16,7 @@ pub use model::RustFileSemantics;
 use anyhow::Result;
 
 use crate::parse::ast::ParsedFile;
+use crate::semantics::common::calls::FunctionCall;
 use crate::semantics::common::db::{DbOperation, DbLibrary, DbOperationType};
 use crate::semantics::common::CommonLocation;
 
@@ -114,6 +115,7 @@ struct TraversalContext {
     /// Whether we're inside an impl block (methods should go to impl.methods, not sem.functions)
     in_impl: bool,
     current_function: Option<String>,
+    current_qualified_name: Option<String>,
 }
 
 /// Collect basic semantics by walking the tree-sitter AST.
@@ -797,29 +799,55 @@ fn build_call_site(
     ctx: &TraversalContext,
 ) -> Option<model::RustCallSite> {
     let func_node = node.child_by_field_name("function")?;
-    let callee = parsed.text_for_node(&func_node);
+    let callee_expr = parsed.text_for_node(&func_node);
 
-    // Check if method call
-    let is_method_call = func_node.kind() == "field_expression";
-    let method_name = if is_method_call {
-        func_node
-            .child_by_field_name("field")
-            .map(|n| parsed.text_for_node(&n))
+    // Parse callee into parts (e.g., "obj.method" -> ["obj", "method"])
+    let callee_parts: Vec<String> = callee_expr.split('.').map(String::from).collect();
+    let first_part = callee_parts.first().cloned().unwrap_or_default();
+
+    // Detect if method call (has receiver)
+    let is_method_call = callee_parts.len() > 1;
+    let _receiver = if is_method_call {
+        Some(first_part.clone())
     } else {
         None
     };
 
+    // Detect self call (Rust uses 'self', not 'self')
+    let is_self_call = first_part == "self";
+
+    let location = parsed.location_for_node(node);
+
+    let function_call = FunctionCall {
+        callee_expr: callee_expr.clone(),
+        callee_parts,
+        caller_function: ctx.current_function.clone().unwrap_or_default(),
+        caller_qualified_name: ctx.current_qualified_name.clone().unwrap_or_default(),
+        location: CommonLocation {
+            file_id: parsed.file_id,
+            line: location.range.start_line + 1,
+            column: location.range.start_col + 1,
+            start_byte: node.start_byte(),
+            end_byte: node.end_byte(),
+        },
+        is_self_call,
+        is_import_call: false, // Will be enhanced with import analysis
+        import_alias: None,
+    };
+
+    // Get arguments representation
+    let args_repr = if let Some(args_node) = node.child_by_field_name("arguments") {
+        parsed.text_for_node(&args_node)
+    } else {
+        String::new()
+    };
+
     Some(model::RustCallSite {
-        callee,
-        method_name,
-        is_method_call,
+        function_call,
+        args_repr,
         in_loop: ctx.in_loop,
         in_async: ctx.in_async_fn,
         in_static_init: ctx.in_static_init,
-        function_name: ctx.current_function.clone(),
-        location: parsed.location_for_node(node),
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
     })
 }
 
@@ -2088,5 +2116,42 @@ mod tests {
             test_unwraps[0].in_test,
             "actual_test unwrap should be in_test"
         );
+    }
+
+    #[test]
+    fn build_rust_semantics_populates_http_calls() {
+        let src = r#"
+use reqwest;
+
+async fn fetch_data() -> Result<String, reqwest::Error> {
+    let client = reqwest::Client::new();
+    let response = client.get("https://api.example.com/data").send().await?;
+    response.text().await
+}
+"#;
+        let sem = parse_and_build_semantics(src);
+
+        // HTTP calls should be populated by analyze_http_calls
+        assert_eq!(sem.http_calls.len(), 1);
+        assert!(sem.http_calls[0].in_async_context);
+        assert_eq!(sem.http_calls[0].method, crate::semantics::common::http::HttpMethod::Get);
+    }
+
+    #[test]
+    fn rust_http_calls_via_common_semantics() {
+        use crate::semantics::common::CommonSemantics;
+
+        let src = r#"
+use reqwest;
+
+async fn fetch() -> Result<String, reqwest::Error> {
+    reqwest::Client::new().get("https://example.com").send().await?.text().await
+}
+"#;
+        let sem = parse_and_build_semantics(src);
+
+        // Verify via CommonSemantics trait
+        let http_calls = sem.http_calls();
+        assert_eq!(http_calls.len(), 1);
     }
 }

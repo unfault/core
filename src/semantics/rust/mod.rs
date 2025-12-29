@@ -428,14 +428,13 @@ fn build_use(parsed: &ParsedFile, node: &tree_sitter::Node) -> Option<model::Rus
         alias: extract_use_alias(parsed, node),
         is_glob,
         is_pub,
-        items: Vec::new(), // TODO: extract grouped items
+        items: extract_use_items(parsed, node),
         location: parsed.location_for_node(node),
     })
 }
 
 /// Extract the path from a use declaration.
 fn extract_use_path(parsed: &ParsedFile, node: &tree_sitter::Node) -> String {
-    // Find the use_tree or scoped_identifier
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i) {
             if child.kind() == "use_list"
@@ -443,18 +442,98 @@ fn extract_use_path(parsed: &ParsedFile, node: &tree_sitter::Node) -> String {
                 || child.kind() == "identifier"
                 || child.kind() == "scoped_use_list"
             {
-                // Get text and clean it up
                 let text = parsed.text_for_node(&child);
                 return text.trim().to_string();
             }
         }
     }
-    // Fallback: extract from full text
     let text = parsed.text_for_node(node);
     let text = text.trim_start_matches("pub ");
     let text = text.trim_start_matches("use ");
     let text = text.trim_end_matches(';');
     text.trim().to_string()
+}
+
+/// Extract grouped items from a use declaration like `use std::{io, fs}`.
+fn extract_use_items(parsed: &ParsedFile, node: &tree_sitter::Node) -> Vec<String> {
+    let mut items = Vec::new();
+
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i) {
+            if child.kind() == "use_list" || child.kind() == "scoped_use_list" {
+                for j in 0..child.child_count() {
+                    if let Some(item) = child.child(j) {
+                        if item.kind() == "identifier" || item.kind() == "use_as_clause" || item.kind() == "use_prelude_clause" {
+                            let text = parsed.text_for_node(&item);
+                            if !text.is_empty() {
+                                items.push(text.trim().to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    items
+}
+
+/// Extract generics parameters from a node.
+fn extract_generics(parsed: &ParsedFile, node: &tree_sitter::Node) -> Vec<String> {
+    let text = parsed.text_for_node(node);
+
+    if let Some(start) = text.find('<') {
+        let after = &text[start + 1..];
+        let mut depth = 0;
+        let mut end = 0;
+        for (i, c) in after.char_indices() {
+            match c {
+                '<' => depth += 1,
+                '>' => {
+                    if depth == 0 {
+                        end = i;
+                        break;
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            }
+        }
+        if end > 0 {
+            let generics_text = &after[..end];
+            return generics_text
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+    }
+
+    Vec::new()
+}
+
+/// Extract attributes from preceding attribute items.
+fn extract_attributes(parsed: &ParsedFile, node: &tree_sitter::Node) -> Vec<String> {
+    extract_attributes_for_node(parsed, node)
+}
+
+/// Extract attributes for any node by looking at previous siblings.
+fn extract_attributes_for_node(parsed: &ParsedFile, node: &tree_sitter::Node) -> Vec<String> {
+    let mut attributes = Vec::new();
+
+    let mut prev = node.prev_sibling();
+    while let Some(p) = prev {
+        if p.kind() == "attribute_item" {
+            let text = parsed.text_for_node(&p);
+            attributes.push(text);
+        } else {
+            break;
+        }
+        prev = p.prev_sibling();
+    }
+
+    attributes.reverse();
+    attributes
 }
 
 /// Extract alias from use declaration if present.
@@ -489,6 +568,9 @@ fn build_function(
     let returns_result = return_type.as_ref().is_some_and(|t| t.contains("Result"));
     let returns_option = return_type.as_ref().is_some_and(|t| t.contains("Option"));
 
+    let generics = extract_generics(parsed, node);
+    let attributes = extract_attributes(parsed, node);
+
     Some(model::RustFunction {
         name: name.clone(),
         visibility,
@@ -496,7 +578,7 @@ fn build_function(
         is_unsafe,
         is_const,
         is_extern,
-        generics: Vec::new(), // TODO: extract generics
+        generics,
         params: extract_params(parsed, node),
         return_type,
         returns_result,
@@ -504,7 +586,7 @@ fn build_function(
         is_test: ctx.in_test || has_test_attribute(parsed, node),
         is_main: name == "main",
         has_test_attribute: has_test_attribute(parsed, node),
-        attributes: Vec::new(), // TODO: extract attributes
+        attributes,
         location: parsed.location_for_node(node),
         start_byte: node.start_byte(),
         end_byte: node.end_byte(),
@@ -585,24 +667,64 @@ fn build_struct(parsed: &ParsedFile, node: &tree_sitter::Node) -> Option<model::
     let text = parsed.text_for_node(node);
     let visibility = extract_visibility(&text);
 
-    // Check struct type
     let is_tuple = text.contains('(') && !text.contains('{');
     let is_unit = !text.contains('(') && !text.contains('{');
 
-    // Extract derives from attributes
     let derives = extract_derives(parsed, node);
+    let generics = extract_generics(parsed, node);
+    let fields = extract_struct_fields(parsed, node);
+    let attributes = extract_attributes(parsed, node);
 
     Some(model::RustStruct {
         name,
         visibility,
-        generics: Vec::new(),
-        fields: Vec::new(), // TODO: extract fields
+        generics,
+        fields,
         is_tuple,
         is_unit,
         derives,
-        attributes: Vec::new(),
+        attributes,
         location: parsed.location_for_node(node),
     })
+}
+
+/// Extract struct fields.
+fn extract_struct_fields(parsed: &ParsedFile, node: &tree_sitter::Node) -> Vec<model::RustField> {
+    let mut fields = Vec::new();
+
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i) {
+            if child.kind() == "field_declaration_list" {
+                for j in 0..child.child_count() {
+                    if let Some(field) = child.child(j) {
+                        if field.kind() == "field_declaration" {
+                            if let Some(name_node) = field.child_by_field_name("name") {
+                                let name = parsed.text_for_node(&name_node);
+                                let field_text = parsed.text_for_node(&field);
+                                let visibility = extract_visibility(&field_text);
+
+                                let field_type = field
+                                    .child_by_field_name("type")
+                                    .map(|n| parsed.text_for_node(&n))
+                                    .unwrap_or_default();
+
+                                let field_attrs = extract_attributes_for_node(parsed, &field);
+
+                                fields.push(model::RustField {
+                                    name,
+                                    field_type,
+                                    visibility,
+                                    attributes: field_attrs,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fields
 }
 
 /// Extract derive macros from preceding attributes.
@@ -643,16 +765,83 @@ fn build_enum(parsed: &ParsedFile, node: &tree_sitter::Node) -> Option<model::Ru
     let text = parsed.text_for_node(node);
     let visibility = extract_visibility(&text);
     let derives = extract_derives(parsed, node);
+    let generics = extract_generics(parsed, node);
+    let variants = extract_enum_variants(parsed, node);
+    let attributes = extract_attributes(parsed, node);
 
     Some(model::RustEnum {
         name,
         visibility,
-        generics: Vec::new(),
-        variants: Vec::new(), // TODO: extract variants
+        generics,
+        variants,
         derives,
-        attributes: Vec::new(),
+        attributes,
         location: parsed.location_for_node(node),
     })
+}
+
+/// Extract enum variants.
+fn extract_enum_variants(parsed: &ParsedFile, node: &tree_sitter::Node) -> Vec<model::EnumVariant> {
+    let mut variants = Vec::new();
+
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i) {
+            if child.kind() == "enum_variant_list" {
+                for j in 0..child.child_count() {
+                    if let Some(variant) = child.child(j) {
+                        if variant.kind() == "enum_variant" {
+                            if let Some(name_node) = variant.child_by_field_name("name") {
+                                let name = parsed.text_for_node(&name_node);
+                                let _variant_text = parsed.text_for_node(&variant);
+
+                                let mut tuple_fields = Vec::new();
+                                let mut struct_fields = Vec::new();
+                                let mut discriminant = None;
+
+                                for k in 0..variant.child_count() {
+                                    if let Some(field) = variant.child(k) {
+                                        if field.kind() == "tuple_field"
+                                            || field.kind() == "positional_field"
+                                        {
+                                            let field_type = parsed.text_for_node(&field);
+                                            tuple_fields.push(field_type);
+                                        } else if field.kind() == "struct_field"
+                                            || field.kind() == "named_field"
+                                        {
+                                            if let Some(name) = field.child_by_field_name("name") {
+                                                let field_name = parsed.text_for_node(&name);
+                                                let field_type = field
+                                                    .child_by_field_name("type")
+                                                    .map(|n| parsed.text_for_node(&n))
+                                                    .unwrap_or_default();
+                                                struct_fields.push(model::RustField {
+                                                    name: field_name,
+                                                    field_type,
+                                                    visibility: model::Visibility::Private,
+                                                    attributes: Vec::new(),
+                                                });
+                                            }
+                                        } else if field.kind() == "discriminant_value" {
+                                            discriminant = Some(parsed.text_for_node(&field));
+                                        }
+                                    }
+                                }
+
+                                variants.push(model::EnumVariant {
+                                    name,
+                                    tuple_fields,
+                                    struct_fields,
+                                    discriminant,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    variants
 }
 
 /// Build a RustTrait from a trait_item node.
@@ -663,14 +852,17 @@ fn build_trait(parsed: &ParsedFile, node: &tree_sitter::Node) -> Option<model::R
     let text = parsed.text_for_node(node);
     let visibility = extract_visibility(&text);
 
+    let generics = extract_generics(parsed, node);
+    let attributes = extract_attributes(parsed, node);
+
     Some(model::RustTrait {
         name,
         visibility,
-        generics: Vec::new(),
+        generics,
         bounds: Vec::new(),
         associated_types: Vec::new(),
         methods: Vec::new(),
-        attributes: Vec::new(),
+        attributes,
         location: parsed.location_for_node(node),
     })
 }
@@ -711,7 +903,7 @@ fn build_impl(
     Some(model::RustImpl {
         self_type,
         trait_name,
-        generics: Vec::new(),
+        generics: extract_generics(parsed, node),
         methods,
         is_unsafe,
         location: parsed.location_for_node(node),
@@ -1239,16 +1431,110 @@ fn detect_spawn_call(
     let handle_captured = parent
         .is_some_and(|p| p.kind() == "let_declaration" || p.kind() == "assignment_expression");
 
+    let has_error_handling = analyze_join_handle_error_handling(parsed, node, &callee);
+
     Some(model::SpawnCall {
         spawn_type,
         handle_captured,
-        has_error_handling: false, // TODO: analyze join handle usage
+        has_error_handling,
         spawned_expr: parsed.text_for_node(node),
         function_name: ctx.current_function.clone(),
         location: parsed.location_for_node(node),
         start_byte: node.start_byte(),
         end_byte: node.end_byte(),
     })
+}
+
+/// Analyze if JoinHandle is properly awaited or error is handled.
+fn analyze_join_handle_error_handling(parsed: &ParsedFile, spawn_node: &tree_sitter::Node, _callee: &str) -> bool {
+    let parent = match spawn_node.parent() {
+        Some(p) => p,
+        None => return false,
+    };
+
+    if parent.kind() == "let_declaration" {
+        let pattern = match parent.child_by_field_name("pattern") {
+            Some(p) => p,
+            None => return false,
+        };
+        let pattern_text = parsed.text_for_node(&pattern);
+
+        if let Some(value_node) = parent.child_by_field_name("value") {
+            if value_node.id() == spawn_node.id() {
+                let handle_var = if pattern_text.starts_with("let ") {
+                    match pattern_text[4..].trim().split_whitespace().next() {
+                        Some(v) => v,
+                        None => return false,
+                    }
+                } else {
+                    &pattern_text
+                };
+
+                return check_handle_usage(parsed, &parent, handle_var);
+            }
+        }
+    } else if parent.kind() == "assignment_expression" {
+        let left = match parent.child_by_field_name("left") {
+            Some(l) => l,
+            None => return false,
+        };
+        let left_text = parsed.text_for_node(&left);
+        let handle_var = left_text.trim();
+
+        return check_handle_usage(parsed, &parent, handle_var);
+    }
+
+    false
+}
+
+/// Check if a JoinHandle variable is properly awaited.
+fn check_handle_usage(parsed: &ParsedFile, start_node: &tree_sitter::Node, handle_var: &str) -> bool {
+    let mut current = start_node.next_sibling();
+    let mut max_nodes = 50;
+
+    while let Some(node) = current {
+        if max_nodes == 0 {
+            break;
+        }
+        max_nodes -= 1;
+
+        if node.kind() == "call_expression" {
+            if let Some(func_node) = node.child_by_field_name("function") {
+                let func_text = parsed.text_for_node(&func_node);
+
+                if func_text.contains(&format!("{}.await", handle_var))
+                    || func_text.contains(&format!("{}.join().await", handle_var))
+                {
+                    return true;
+                }
+
+                if func_text.contains(&format!("{}.abort()", handle_var)) {
+                    return true;
+                }
+
+                if func_text.contains("tokio::spawn")
+                    && func_text.contains(&format!("await {}", handle_var))
+                {
+                    return true;
+                }
+            }
+        }
+
+        if node.kind() == "expression_statement" {
+            if let Some(child) = node.child(0) {
+                let text = parsed.text_for_node(&child);
+                if text.contains(&format!("{}.await", handle_var))
+                    || text.contains(&format!("{}.join()", handle_var))
+                {
+                    return true;
+                }
+            }
+        }
+
+        current = node.next_sibling();
+    }
+
+    false
 }
 
 /// Analyze select! macro usage.

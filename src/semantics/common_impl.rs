@@ -10,18 +10,18 @@ use super::common::{
     CommonLocation, CommonSemantics,
     async_ops::{AsyncOperation, AsyncOperationType, AsyncRuntime},
     db::{DbLibrary, DbOperation, DbOperationType},
-    functions::{FunctionCall, FunctionDef, FunctionKind, FunctionParam, Visibility},
+    functions::{FunctionCall, FunctionDecorator, FunctionDef, FunctionKind, FunctionParam, Visibility},
     http::{HttpCall, HttpClientLibrary, HttpMethod},
     imports::{Import, ImportSource, ImportStyle, ImportedItem},
 };
 
-use super::go::model::{GoFileSemantics, GoFunction, GoImport};
+use super::go::model::{GoCallSite, GoFileSemantics, GoFunction, GoImport, GoMethod};
 use super::python::model::{
     ImportCategory as PyImportCategory, ImportStyle as PyImportStyle, PyCallSite, PyFileSemantics,
     PyFunction, PyImport,
 };
-use super::rust::model::{RustFileSemantics, RustFunction, RustUse, Visibility as RustVisibility};
-use super::typescript::model::{TsFileSemantics, TsFunction, TsImport};
+use super::rust::model::{RustCallSite, RustFileSemantics, RustFunction, RustUse, Visibility as RustVisibility};
+use super::typescript::model::{TsCallSite, TsFileSemantics, TsFunction, TsImport, TsMethod};
 
 // =============================================================================
 // Python Implementation
@@ -446,10 +446,17 @@ impl CommonSemantics for GoFileSemantics {
     }
 
     fn functions(&self) -> Vec<FunctionDef> {
-        self.functions
+        let funcs: Vec<FunctionDef> = self
+            .functions
             .iter()
-            .filter_map(|func| convert_go_function(func, self.file_id))
-            .collect()
+            .filter_map(|func| convert_go_function(func, self.file_id, &self.calls))
+            .collect();
+        let methods: Vec<FunctionDef> = self
+            .methods
+            .iter()
+            .filter_map(|method| convert_go_method(method, self.file_id, &self.calls))
+            .collect();
+        funcs.into_iter().chain(methods).collect()
     }
 }
 
@@ -486,7 +493,11 @@ fn convert_go_import(go_import: &GoImport, file_id: FileId) -> Option<Import> {
 }
 
 /// Convert a Go function to the common FunctionDef type
-fn convert_go_function(go_func: &GoFunction, file_id: FileId) -> Option<FunctionDef> {
+fn convert_go_function(
+    go_func: &GoFunction,
+    file_id: FileId,
+    all_calls: &[GoCallSite],
+) -> Option<FunctionDef> {
     let visibility = if go_func
         .name
         .chars()
@@ -511,6 +522,13 @@ fn convert_go_function(go_func: &GoFunction, file_id: FileId) -> Option<Function
         Some(go_func.return_types.join(", "))
     };
 
+    // Filter calls that are within this function's byte range
+    let calls: Vec<FunctionCall> = all_calls
+        .iter()
+        .filter(|call| call.start_byte >= go_func.start_byte && call.end_byte <= go_func.end_byte)
+        .map(|call| convert_go_call_site(call))
+        .collect();
+
     Some(FunctionDef {
         name: go_func.name.clone(),
         kind: FunctionKind::Function,
@@ -520,7 +538,7 @@ fn convert_go_function(go_func: &GoFunction, file_id: FileId) -> Option<Function
         return_type,
         decorators: vec![],
         class_name: None,
-        calls: vec![], // TODO: Extract calls from Go function body
+        calls,
         body_lines: 0,
         has_error_handling: go_func.returns_error,
         has_documentation: false,
@@ -528,11 +546,102 @@ fn convert_go_function(go_func: &GoFunction, file_id: FileId) -> Option<Function
             file_id,
             line: go_func.location.range.start_line + 1,
             column: go_func.location.range.start_col + 1,
-            start_byte: 0,
-            end_byte: 0,
+            start_byte: go_func.start_byte,
+            end_byte: go_func.end_byte,
         },
-        start_byte: 0,
-        end_byte: 0,
+        start_byte: go_func.start_byte,
+        end_byte: go_func.end_byte,
+    })
+}
+
+/// Convert a GoCallSite to the common FunctionCall type
+fn convert_go_call_site(call: &GoCallSite) -> FunctionCall {
+    let callee_expr = &call.function_call.callee_expr;
+    let (callee, receiver) = if let Some(idx) = callee_expr.rfind('.') {
+        let callee_name = callee_expr[idx + 1..].to_string();
+        let receiver_name = callee_expr[..idx].to_string();
+        (callee_name, Some(receiver_name))
+    } else {
+        (callee_expr.clone(), None)
+    };
+
+    FunctionCall {
+        callee,
+        callee_expr: callee_expr.clone(),
+        receiver,
+        line: call.function_call.location.line,
+        column: call.function_call.location.column,
+    }
+}
+
+/// Convert a Go method to the common FunctionDef type
+fn convert_go_method(
+    go_method: &GoMethod,
+    file_id: FileId,
+    all_calls: &[GoCallSite],
+) -> Option<FunctionDef> {
+    let visibility = if go_method
+        .name
+        .chars()
+        .next()
+        .map(|c| c.is_uppercase())
+        .unwrap_or(false)
+    {
+        Visibility::Public
+    } else {
+        Visibility::Package
+    };
+
+    let receiver = if go_method.receiver_is_pointer {
+        format!("*{}", go_method.receiver_type)
+    } else {
+        go_method.receiver_type.clone()
+    };
+
+    let params: Vec<FunctionParam> = std::iter::once(FunctionParam::new("self").with_type(&receiver))
+        .chain(
+            go_method
+                .params
+                .iter()
+                .map(|p| FunctionParam::new(&p.name).with_type(&p.param_type)),
+        )
+        .collect();
+
+    let return_type = if go_method.return_types.is_empty() {
+        None
+    } else {
+        Some(go_method.return_types.join(", "))
+    };
+
+    // Filter calls that are within this method's byte range
+    let calls: Vec<FunctionCall> = all_calls
+        .iter()
+        .filter(|call| call.start_byte >= go_method.start_byte && call.end_byte <= go_method.end_byte)
+        .map(|call| convert_go_call_site(call))
+        .collect();
+
+    Some(FunctionDef {
+        name: go_method.name.clone(),
+        kind: FunctionKind::Method,
+        visibility,
+        is_async: false,
+        params,
+        return_type,
+        decorators: vec![],
+        class_name: Some(go_method.receiver_type.clone()),
+        calls,
+        body_lines: 0,
+        has_error_handling: go_method.returns_error,
+        has_documentation: false,
+        location: CommonLocation {
+            file_id,
+            line: go_method.location.range.start_line + 1,
+            column: go_method.location.range.start_col + 1,
+            start_byte: go_method.start_byte,
+            end_byte: go_method.end_byte,
+        },
+        start_byte: go_method.start_byte,
+        end_byte: go_method.end_byte,
     })
 }
 
@@ -656,10 +765,22 @@ impl CommonSemantics for RustFileSemantics {
     }
 
     fn functions(&self) -> Vec<FunctionDef> {
-        self.functions
+        let funcs: Vec<FunctionDef> = self
+            .functions
             .iter()
-            .filter_map(|func| convert_rust_function(func, self.file_id))
-            .collect()
+            .filter_map(|func| convert_rust_function(func, self.file_id, &self.calls))
+            .collect();
+        let impl_methods: Vec<FunctionDef> = self
+            .impls
+            .iter()
+            .flat_map(|impl_block| {
+                impl_block
+                    .methods
+                    .iter()
+                    .filter_map(|method| convert_rust_function(method, self.file_id, &self.calls))
+            })
+            .collect();
+        funcs.into_iter().chain(impl_methods).collect()
     }
 }
 
@@ -710,7 +831,11 @@ fn convert_rust_use(rust_use: &RustUse, file_id: FileId) -> Option<Import> {
 }
 
 /// Convert a Rust function to the common FunctionDef type
-fn convert_rust_function(rust_func: &RustFunction, file_id: FileId) -> Option<FunctionDef> {
+fn convert_rust_function(
+    rust_func: &RustFunction,
+    file_id: FileId,
+    all_calls: &[RustCallSite],
+) -> Option<FunctionDef> {
     let visibility = match rust_func.visibility {
         RustVisibility::Pub => Visibility::Public,
         RustVisibility::PubCrate => Visibility::Package,
@@ -725,6 +850,13 @@ fn convert_rust_function(rust_func: &RustFunction, file_id: FileId) -> Option<Fu
         .map(|p| FunctionParam::new(&p.name).with_type(&p.param_type))
         .collect();
 
+    // Filter calls that are within this function's byte range
+    let calls: Vec<FunctionCall> = all_calls
+        .iter()
+        .filter(|call| call.start_byte >= rust_func.start_byte && call.end_byte <= rust_func.end_byte)
+        .map(|call| convert_rust_call_site(call))
+        .collect();
+
     Some(FunctionDef {
         name: rust_func.name.clone(),
         kind: FunctionKind::Function,
@@ -734,7 +866,7 @@ fn convert_rust_function(rust_func: &RustFunction, file_id: FileId) -> Option<Fu
         return_type: rust_func.return_type.clone(),
         decorators: vec![],
         class_name: None,
-        calls: vec![], // TODO: Extract calls from Rust function body
+        calls,
         body_lines: 0,
         has_error_handling: false,
         has_documentation: false,
@@ -748,6 +880,24 @@ fn convert_rust_function(rust_func: &RustFunction, file_id: FileId) -> Option<Fu
         start_byte: rust_func.start_byte,
         end_byte: rust_func.end_byte,
     })
+}
+
+/// Convert a RustCallSite to the common FunctionCall type
+fn convert_rust_call_site(call: &RustCallSite) -> FunctionCall {
+    let callee = call.method_name.clone().unwrap_or_else(|| call.callee.clone());
+    let receiver = if call.is_method_call {
+        Some(call.callee.clone())
+    } else {
+        None
+    };
+
+    FunctionCall {
+        callee,
+        callee_expr: call.callee.clone(),
+        receiver,
+        line: call.location.range.start_line + 1,
+        column: call.location.range.start_col + 1,
+    }
 }
 
 // =============================================================================
@@ -885,10 +1035,23 @@ impl CommonSemantics for TsFileSemantics {
     }
 
     fn functions(&self) -> Vec<FunctionDef> {
-        self.functions
+        let funcs: Vec<FunctionDef> = self
+            .functions
             .iter()
-            .filter_map(|func| convert_ts_function(func, self.file_id))
-            .collect()
+            .filter_map(|func| convert_ts_function(func, self.file_id, &self.calls))
+            .collect();
+        // Also include class methods
+        let class_methods: Vec<FunctionDef> = self
+            .classes
+            .iter()
+            .flat_map(|class| {
+                class
+                    .methods
+                    .iter()
+                    .filter_map(|method| convert_ts_method(method, self.file_id, &self.calls, &class.name))
+            })
+            .collect();
+        funcs.into_iter().chain(class_methods).collect()
     }
 }
 
@@ -939,7 +1102,11 @@ fn convert_ts_import(ts_import: &TsImport, file_id: FileId) -> Option<Import> {
 }
 
 /// Convert a TypeScript function to the common FunctionDef type
-fn convert_ts_function(ts_func: &TsFunction, file_id: FileId) -> Option<FunctionDef> {
+fn convert_ts_function(
+    ts_func: &TsFunction,
+    file_id: FileId,
+    all_calls: &[TsCallSite],
+) -> Option<FunctionDef> {
     let visibility = if ts_func.is_exported {
         Visibility::Public
     } else {
@@ -970,6 +1137,13 @@ fn convert_ts_function(ts_func: &TsFunction, file_id: FileId) -> Option<Function
         })
         .collect();
 
+    // Filter calls that are within this function's byte range
+    let calls: Vec<FunctionCall> = all_calls
+        .iter()
+        .filter(|call| call.start_byte >= ts_func.start_byte && call.end_byte <= ts_func.end_byte)
+        .map(|call| convert_ts_call_site(call))
+        .collect();
+
     Some(FunctionDef {
         name: ts_func.name.clone(),
         kind,
@@ -979,7 +1153,7 @@ fn convert_ts_function(ts_func: &TsFunction, file_id: FileId) -> Option<Function
         return_type: ts_func.return_type.clone(),
         decorators: vec![],
         class_name: None,
-        calls: vec![], // TODO: Extract calls from TypeScript function body
+        calls,
         body_lines: 0,
         has_error_handling: ts_func.has_try_catch,
         has_documentation: false,
@@ -987,11 +1161,97 @@ fn convert_ts_function(ts_func: &TsFunction, file_id: FileId) -> Option<Function
             file_id,
             line: ts_func.location.range.start_line + 1,
             column: ts_func.location.range.start_col + 1,
-            start_byte: 0,
-            end_byte: 0,
+            start_byte: ts_func.start_byte,
+            end_byte: ts_func.end_byte,
         },
-        start_byte: 0,
-        end_byte: 0,
+        start_byte: ts_func.start_byte,
+        end_byte: ts_func.end_byte,
+    })
+}
+
+/// Convert a TsCallSite to the common FunctionCall type
+fn convert_ts_call_site(call: &TsCallSite) -> FunctionCall {
+    let callee_expr = &call.callee;
+    let (callee, receiver) = if let Some(idx) = callee_expr.rfind('.') {
+        let callee_name = callee_expr[idx + 1..].to_string();
+        let receiver_name = callee_expr[..idx].to_string();
+        (callee_name, Some(receiver_name))
+    } else {
+        (callee_expr.clone(), None)
+    };
+
+    FunctionCall {
+        callee,
+        callee_expr: callee_expr.clone(),
+        receiver,
+        line: call.location.range.start_line + 1,
+        column: call.location.range.start_col + 1,
+    }
+}
+
+/// Convert a TypeScript method to the common FunctionDef type
+fn convert_ts_method(
+    method: &TsMethod,
+    file_id: FileId,
+    all_calls: &[TsCallSite],
+    class_name: &str,
+) -> Option<FunctionDef> {
+    let visibility = if method.is_private {
+        Visibility::Private
+    } else if method.is_protected {
+        Visibility::Protected
+    } else {
+        Visibility::Public
+    };
+
+    let params: Vec<FunctionParam> = method
+        .params
+        .iter()
+        .map(|p| {
+            let mut param = FunctionParam::new(&p.name);
+            if let Some(ref type_ann) = p.type_annotation {
+                param = param.with_type(type_ann);
+            }
+            if p.is_rest {
+                param = param.variadic();
+            }
+            param
+        })
+        .collect();
+
+    // Filter calls that are within this method's byte range
+    let calls: Vec<FunctionCall> = all_calls
+        .iter()
+        .filter(|call| call.start_byte >= method.start_byte && call.end_byte <= method.end_byte)
+        .map(|call| convert_ts_call_site(call))
+        .collect();
+
+    Some(FunctionDef {
+        name: method.name.clone(),
+        kind: FunctionKind::Method,
+        visibility,
+        is_async: method.is_async,
+        params,
+        return_type: method.return_type.clone(),
+        decorators: method
+            .decorators
+            .iter()
+            .map(|d| FunctionDecorator::new(d, format!("@{}", d)))
+            .collect(),
+        class_name: Some(class_name.to_string()),
+        calls,
+        body_lines: 0,
+        has_error_handling: false,
+        has_documentation: false,
+        location: CommonLocation {
+            file_id,
+            line: method.location.range.start_line + 1,
+            column: method.location.range.start_col + 1,
+            start_byte: method.start_byte,
+            end_byte: method.end_byte,
+        },
+        start_byte: method.start_byte,
+        end_byte: method.end_byte,
     })
 }
 
@@ -999,8 +1259,28 @@ fn convert_ts_function(ts_func: &TsFunction, file_id: FileId) -> Option<Function
 mod tests {
     use super::*;
     use crate::parse::ast::FileId;
+    use crate::parse::go::parse_go_file;
     use crate::parse::python::parse_python_file;
+    use crate::parse::rust::parse_rust_file;
+    use crate::parse::typescript::parse_typescript_file;
     use crate::types::context::SourceFile;
+
+    // =============================================================================
+    // Go Function Calls Tests
+    // =============================================================================
+
+    fn parse_go(source: &str) -> GoFileSemantics {
+        let sf = SourceFile {
+            path: "test.go".to_string(),
+            language: Language::Go,
+            content: source.to_string(),
+        };
+        let parsed = parse_go_file(FileId(1), &sf).expect("parsing should succeed");
+        let mut sem = GoFileSemantics::from_parsed(&parsed);
+        sem.analyze_frameworks(&parsed)
+            .expect("analysis should succeed");
+        sem
+    }
 
     fn parse_python(source: &str) -> PyFileSemantics {
         let sf = SourceFile {
@@ -1013,6 +1293,115 @@ mod tests {
         sem.analyze_frameworks(&parsed)
             .expect("analysis should succeed");
         sem
+    }
+
+    fn parse_rust(source: &str) -> RustFileSemantics {
+        let sf = SourceFile {
+            path: "test.rs".to_string(),
+            language: Language::Rust,
+            content: source.to_string(),
+        };
+        let parsed = parse_rust_file(FileId(2), &sf).expect("parsing should succeed");
+        super::super::rust::build_rust_semantics(&parsed).expect("semantics should succeed")
+    }
+
+    fn parse_typescript(source: &str) -> TsFileSemantics {
+        let sf = SourceFile {
+            path: "test.ts".to_string(),
+            language: Language::Typescript,
+            content: source.to_string(),
+        };
+        let parsed = parse_typescript_file(FileId(3), &sf).expect("parsing should succeed");
+        let mut sem = TsFileSemantics::from_parsed(&parsed);
+        sem.analyze_frameworks(&parsed)
+            .expect("analysis should succeed");
+        sem
+    }
+
+    #[test]
+    fn go_function_has_byte_range() {
+        let sem = parse_go(
+            r#"
+package main
+
+func hello() {
+    println("hello")
+}
+"#,
+        );
+
+        let functions = sem.functions();
+        assert_eq!(functions.len(), 1);
+
+        let func = &functions[0];
+        assert!(func.start_byte > 0, "GoFunction should have start_byte > 0");
+        assert!(
+            func.end_byte > func.start_byte,
+            "GoFunction should have end_byte > start_byte"
+        );
+    }
+
+    #[test]
+    fn go_functions_with_calls_extraction() {
+        let sem = parse_go(
+            r#"
+package main
+
+import "fmt"
+
+func helper() {
+    // no calls
+}
+
+func caller() {
+    helper()
+    fmt.Println("hello")
+}
+"#,
+        );
+
+        let functions = sem.functions();
+        assert_eq!(functions.len(), 2);
+
+        let helper_fn = functions.iter().find(|f| f.name == "helper").unwrap();
+        assert_eq!(helper_fn.calls.len(), 0);
+
+        let caller_fn = functions.iter().find(|f| f.name == "caller").unwrap();
+        assert_eq!(caller_fn.calls.len(), 2);
+
+        let callee_names: Vec<&str> = caller_fn.calls.iter().map(|c| c.callee.as_str()).collect();
+        assert!(callee_names.contains(&"helper"));
+        assert!(callee_names.contains(&"Println"));
+    }
+
+    #[test]
+    fn go_method_call_extraction() {
+        let sem = parse_go(
+            r#"
+package main
+
+type Server struct{}
+
+func (s *Server) Handle() {
+    s.Process()
+    s.Validate()
+}
+
+func (s *Server) Process() {}
+
+func (s *Server) Validate() {}
+"#,
+        );
+
+        let functions = sem.functions();
+        assert_eq!(functions.len(), 3);
+
+        let handle_fn = functions.iter().find(|f| f.name == "Handle").unwrap();
+        assert_eq!(handle_fn.calls.len(), 2);
+
+        let callee_names: Vec<&str> = handle_fn.calls.iter().map(|c| c.callee.as_str()).collect();
+        assert!(callee_names.contains(&"Process"));
+        assert!(callee_names.contains(&"Validate"));
     }
 
     #[test]
@@ -1163,5 +1552,189 @@ def my_func():
             func.end_byte > func.start_byte,
             "end_byte should be > start_byte"
         );
+    }
+
+    // =============================================================================
+    // Rust Function Calls Tests
+    // =============================================================================
+
+    #[test]
+    fn rust_function_has_byte_range() {
+        let sem = parse_rust(
+            r#"
+fn my_func() {
+    let x = 1;
+}
+"#,
+        );
+
+        let functions = sem.functions();
+        assert_eq!(functions.len(), 1);
+
+        let func = &functions[0];
+        assert!(func.start_byte > 0, "RustFunction should have start_byte > 0");
+        assert!(func.end_byte > func.start_byte);
+    }
+
+    #[test]
+    fn rust_functions_with_calls_extraction() {
+        let sem = parse_rust(
+            r#"
+fn helper() {
+    // no calls
+}
+
+fn other() {
+    println!("hello");
+}
+
+fn caller() {
+    helper();
+    other();
+}
+"#,
+        );
+
+        let functions = sem.functions();
+        assert_eq!(functions.len(), 3);
+
+        let helper_fn = functions.iter().find(|f| f.name == "helper").unwrap();
+        assert_eq!(helper_fn.calls.len(), 0);
+
+        let caller_fn = functions.iter().find(|f| f.name == "caller").unwrap();
+        assert_eq!(caller_fn.calls.len(), 2);
+
+        let callee_names: Vec<&str> = caller_fn.calls.iter().map(|c| c.callee.as_str()).collect();
+        assert!(callee_names.contains(&"helper"));
+        assert!(callee_names.contains(&"other"));
+    }
+
+    #[test]
+    fn rust_method_call_extraction() {
+        let sem = parse_rust(
+            r#"
+struct Server;
+
+impl Server {
+    fn handle(&self) {
+        self.process();
+        self.validate();
+    }
+
+    fn process(&self) {}
+
+    fn validate(&self) {}
+}
+"#,
+        );
+
+        let functions = sem.functions();
+        assert_eq!(functions.len(), 3);
+
+        let handle_fn = functions.iter().find(|f| f.name == "handle").unwrap();
+        assert_eq!(handle_fn.calls.len(), 2);
+
+        let callee_names: Vec<&str> = handle_fn.calls.iter().map(|c| c.callee.as_str()).collect();
+        assert!(callee_names.contains(&"process"));
+        assert!(callee_names.contains(&"validate"));
+    }
+
+    // =============================================================================
+    // TypeScript Function Calls Tests
+    // =============================================================================
+
+    #[test]
+    fn typescript_function_has_byte_range() {
+        let sem = parse_typescript(
+            r#"
+function hello(): void {
+    console.log("hello");
+}
+"#,
+        );
+
+        let functions = sem.functions();
+        assert_eq!(functions.len(), 1);
+
+        let func = &functions[0];
+        assert!(func.start_byte > 0, "TsFunction should have start_byte > 0");
+        assert!(func.end_byte > func.start_byte);
+    }
+
+    #[test]
+    fn typescript_functions_with_calls_extraction() {
+        let sem = parse_typescript(
+            r#"
+function helper(): void {
+    // no calls
+}
+
+function caller(): void {
+    helper();
+    console.log("hello");
+}
+"#,
+        );
+
+        let functions = sem.functions();
+        assert_eq!(functions.len(), 2);
+
+        let helper_fn = functions.iter().find(|f| f.name == "helper").unwrap();
+        assert_eq!(helper_fn.calls.len(), 0);
+
+        let caller_fn = functions.iter().find(|f| f.name == "caller").unwrap();
+        assert_eq!(caller_fn.calls.len(), 2);
+
+        let callee_names: Vec<&str> = caller_fn.calls.iter().map(|c| c.callee.as_str()).collect();
+        assert!(callee_names.contains(&"helper"));
+        assert!(callee_names.contains(&"log"));
+    }
+
+    #[test]
+    fn typescript_method_call_extraction() {
+        let sem = parse_typescript(
+            r#"
+class Server {
+    handle(): void {
+        this.process();
+        this.validate();
+    }
+
+    process(): void {}
+
+    validate(): void {}
+}
+"#,
+        );
+
+        let functions = sem.functions();
+        assert_eq!(functions.len(), 3);
+
+        let handle_fn = functions.iter().find(|f| f.name == "handle").unwrap();
+        assert_eq!(handle_fn.calls.len(), 2);
+
+        let callee_names: Vec<&str> = handle_fn.calls.iter().map(|c| c.callee.as_str()).collect();
+        assert!(callee_names.contains(&"process"));
+        assert!(callee_names.contains(&"validate"));
+    }
+
+    #[test]
+    fn typescript_arrow_function_with_calls() {
+        let sem = parse_typescript(
+            r#"
+const myFunc = (): void => {
+    helper();
+    console.log("test");
+};
+
+function helper(): void {}
+"#,
+        );
+
+        let functions = sem.functions();
+        assert_eq!(functions.len(), 2);
+
+        let my_func = functions.iter().find(|f| f.name == "myFunc").unwrap();
+        assert_eq!(my_func.calls.len(), 2);
     }
 }

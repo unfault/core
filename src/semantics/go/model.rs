@@ -250,6 +250,10 @@ pub struct GoFunction {
     pub returns_error: bool,
     /// Location
     pub location: AstLocation,
+    /// Start byte offset for patching
+    pub start_byte: usize,
+    /// End byte offset for patching
+    pub end_byte: usize,
 }
 
 /// Representation of a Go method.
@@ -266,6 +270,10 @@ pub struct GoMethod {
     pub returns_error: bool,
     /// Location
     pub location: AstLocation,
+    /// Start byte offset for patching
+    pub start_byte: usize,
+    /// End byte offset for patching
+    pub end_byte: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -608,6 +616,8 @@ fn build_function(parsed: &ParsedFile, node: &tree_sitter::Node) -> Option<GoFun
         return_types,
         returns_error,
         location: parsed.location_for_node(node),
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
     })
 }
 
@@ -631,6 +641,8 @@ fn build_method(parsed: &ParsedFile, node: &tree_sitter::Node) -> Option<GoMetho
         return_types,
         returns_error,
         location: parsed.location_for_node(node),
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
     })
 }
 

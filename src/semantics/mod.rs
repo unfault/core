@@ -144,6 +144,8 @@ mod tests {
     use crate::parse::ast::FileId;
     use crate::parse::go::parse_go_file;
     use crate::parse::python::parse_python_file;
+    use crate::parse::rust::parse_rust_file;
+    use crate::parse::typescript::parse_typescript_file;
     use crate::types::context::SourceFile;
 
     fn make_source_file(path: &str, language: Language, content: &str) -> SourceFile {
@@ -364,5 +366,204 @@ app = FastAPI()
         } else {
             panic!("Expected Python semantics");
         }
+    }
+
+    // =============================================================================
+    // Rust Function Calls Tests
+    // =============================================================================
+
+    fn parse_rust(source: &str) -> RustFileSemantics {
+        let sf = make_source_file("test.rs", Language::Rust, source);
+        let parsed = parse_rust_file(FileId(2), &sf).expect("parsing should succeed");
+        rust::build_rust_semantics(&parsed).expect("semantics should succeed")
+    }
+
+    #[test]
+    fn rust_functions_with_calls_extraction() {
+        let sem = parse_rust(
+            r#"
+fn helper() {
+    // no calls
+}
+
+fn other() {
+    println!("hello");
+}
+
+fn caller() {
+    helper();
+    other();
+}
+"#,
+        );
+
+        let functions = sem.functions();
+        assert_eq!(functions.len(), 3);
+
+        let helper_fn = functions.iter().find(|f| f.name == "helper").unwrap();
+        assert_eq!(helper_fn.calls.len(), 0);
+
+        let caller_fn = functions.iter().find(|f| f.name == "caller").unwrap();
+        assert_eq!(caller_fn.calls.len(), 2);
+
+        let callee_names: Vec<&str> = caller_fn.calls.iter().map(|c| c.callee.as_str()).collect();
+        assert!(callee_names.contains(&"helper"));
+        assert!(callee_names.contains(&"other"));
+    }
+
+    #[test]
+    fn rust_method_call_extraction() {
+        let sem = parse_rust(
+            r#"
+struct Server;
+
+impl Server {
+    fn handle(&self) {
+        self.process();
+        self.validate();
+    }
+
+    fn process(&self) {}
+
+    fn validate(&self) {}
+}
+"#,
+        );
+
+        let functions = sem.functions();
+        assert_eq!(functions.len(), 3);
+
+        let handle_fn = functions.iter().find(|f| f.name == "handle").unwrap();
+        assert_eq!(handle_fn.calls.len(), 2);
+
+        let callee_names: Vec<&str> = handle_fn.calls.iter().map(|c| c.callee.as_str()).collect();
+        assert!(callee_names.contains(&"process"));
+        assert!(callee_names.contains(&"validate"));
+    }
+
+    #[test]
+    fn rust_function_has_byte_range() {
+        let sem = parse_rust(
+            r#"
+fn my_func() {
+    let x = 1;
+}
+"#,
+        );
+
+        let functions = sem.functions();
+        assert_eq!(functions.len(), 1);
+
+        let func = &functions[0];
+        assert!(func.start_byte > 0, "RustFunction should have start_byte > 0");
+        assert!(func.end_byte > func.start_byte);
+    }
+
+    // =============================================================================
+    // TypeScript Function Calls Tests
+    // =============================================================================
+
+    fn parse_typescript(source: &str) -> TsFileSemantics {
+        let sf = make_source_file("test.ts", Language::Typescript, source);
+        let parsed = parse_typescript_file(FileId(3), &sf).expect("parsing should succeed");
+        let mut sem = TsFileSemantics::from_parsed(&parsed);
+        sem.analyze_frameworks(&parsed)
+            .expect("analysis should succeed");
+        sem
+    }
+
+    #[test]
+    fn typescript_function_has_byte_range() {
+        let sem = parse_typescript(
+            r#"
+function hello(): void {
+    console.log("hello");
+}
+"#,
+        );
+
+        let functions = sem.functions();
+        assert_eq!(functions.len(), 1);
+
+        let func = &functions[0];
+        assert!(func.start_byte > 0, "TsFunction should have start_byte > 0");
+        assert!(func.end_byte > func.start_byte);
+    }
+
+    #[test]
+    fn typescript_functions_with_calls_extraction() {
+        let sem = parse_typescript(
+            r#"
+function helper(): void {
+    // no calls
+}
+
+function caller(): void {
+    helper();
+    console.log("hello");
+}
+"#,
+        );
+
+        let functions = sem.functions();
+        assert_eq!(functions.len(), 2);
+
+        let helper_fn = functions.iter().find(|f| f.name == "helper").unwrap();
+        assert_eq!(helper_fn.calls.len(), 0);
+
+        let caller_fn = functions.iter().find(|f| f.name == "caller").unwrap();
+        assert_eq!(caller_fn.calls.len(), 2);
+
+        let callee_names: Vec<&str> = caller_fn.calls.iter().map(|c| c.callee.as_str()).collect();
+        assert!(callee_names.contains(&"helper"));
+        assert!(callee_names.contains(&"log"));
+    }
+
+    #[test]
+    fn typescript_method_call_extraction() {
+        let sem = parse_typescript(
+            r#"
+class Server {
+    handle(): void {
+        this.process();
+        this.validate();
+    }
+
+    process(): void {}
+
+    validate(): void {}
+}
+"#,
+        );
+
+        let functions = sem.functions();
+        assert_eq!(functions.len(), 3);
+
+        let handle_fn = functions.iter().find(|f| f.name == "handle").unwrap();
+        assert_eq!(handle_fn.calls.len(), 2);
+
+        let callee_names: Vec<&str> = handle_fn.calls.iter().map(|c| c.callee.as_str()).collect();
+        assert!(callee_names.contains(&"process"));
+        assert!(callee_names.contains(&"validate"));
+    }
+
+    #[test]
+    fn typescript_arrow_function_with_calls() {
+        let sem = parse_typescript(
+            r#"
+const myFunc = (): void => {
+    helper();
+    console.log("test");
+};
+
+function helper(): void {}
+"#,
+        );
+
+        let functions = sem.functions();
+        assert_eq!(functions.len(), 2);
+
+        let my_func = functions.iter().find(|f| f.name == "myFunc").unwrap();
+        assert_eq!(my_func.calls.len(), 2);
     }
 }

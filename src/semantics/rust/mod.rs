@@ -111,6 +111,8 @@ struct TraversalContext {
     /// Whether we're inside a static/const initializer with LazyLock, OnceLock, or similar.
     /// This is the correct pattern for compile-once initialization.
     in_static_init: bool,
+    /// Whether we're inside an impl block (methods should go to impl.methods, not sem.functions)
+    in_impl: bool,
     current_function: Option<String>,
 }
 
@@ -146,11 +148,15 @@ fn walk_nodes(
             }
         }
         "function_item" => {
-            if let Some(func) = build_function(parsed, &node, &new_ctx) {
-                if func.is_async {
-                    sem.async_info.async_fn_count += 1;
+            // Only add to sem.functions if NOT inside an impl block
+            // (methods in impl blocks are handled separately in build_impl)
+            if !ctx.in_impl {
+                if let Some(func) = build_function(parsed, &node, &new_ctx) {
+                    if func.is_async {
+                        sem.async_info.async_fn_count += 1;
+                    }
+                    sem.functions.push(func);
                 }
-                sem.functions.push(func);
             }
         }
         "struct_item" => {
@@ -315,6 +321,9 @@ fn update_context(
             if has_cfg_test_attribute(parsed, node) {
                 new_ctx.in_test = true;
             }
+        }
+        "impl_item" => {
+            new_ctx.in_impl = true;
         }
         "closure_expression" => {
             new_ctx.in_closure = true;

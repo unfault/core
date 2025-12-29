@@ -216,6 +216,10 @@ pub struct TsFunction {
     pub has_try_catch: bool,
     /// Calls made inside this function
     pub inner_calls: Vec<String>,
+    /// Start byte offset for patching
+    pub start_byte: usize,
+    /// End byte offset for patching
+    pub end_byte: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -252,6 +256,10 @@ pub struct TsMethod {
     pub params: Vec<TsParam>,
     pub return_type: Option<String>,
     pub location: AstLocation,
+    /// Start byte offset for patching
+    pub start_byte: usize,
+    /// End byte offset for patching
+    pub end_byte: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -480,17 +488,25 @@ fn walk_nodes_with_context(
         }
         "lexical_declaration" | "variable_declaration" => {
             if node.parent().map(|p| p.kind()) == Some("program") {
-                // Top-level variable
+                for i in 0..node.child_count() {
+                    if let Some(child) = node.child(i) {
+                        if child.kind() == "variable_declarator" {
+                            if let Some(name_node) = child.child_by_field_name("name") {
+                                let var_name = parsed.text_for_node(&name_node);
+                                if let Some(value_node) = child.child_by_field_name("value") {
+                                    if value_node.kind() == "arrow_function" {
+                                        if let Some(func) = build_arrow_function(parsed, &value_node, &var_name) {
+                                            sem.functions.push(func);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 if let Some(var) = build_variable(parsed, &node) {
-                    // Check for global mutable state
                     if var.kind != VariableKind::Const {
-                        // Find the keyword byte positions
-                        let _text = parsed.text_for_node(&node);
-                        let keyword = if var.kind == VariableKind::Let {
-                            "let"
-                        } else {
-                            "var"
-                        };
+                        let keyword = if var.kind == VariableKind::Let { "let" } else { "var" };
                         let keyword_start = node.start_byte();
                         let keyword_end = keyword_start + keyword.len();
 
@@ -763,6 +779,45 @@ fn build_function(parsed: &ParsedFile, node: &tree_sitter::Node) -> Option<TsFun
         location,
         has_try_catch,
         inner_calls: Vec::new(),
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+    })
+}
+
+fn build_arrow_function(parsed: &ParsedFile, node: &tree_sitter::Node, name: &str) -> Option<TsFunction> {
+    let location = parsed.location_for_node(node);
+    let text = parsed.text_for_node(node);
+
+    let is_async = text.contains("async ");
+    let is_exported = node
+        .parent()
+        .map(|p| p.kind() == "export_statement")
+        .unwrap_or(false);
+
+    let params = if let Some(params_node) = node.child_by_field_name("parameters") {
+        extract_params(parsed, &params_node)
+    } else {
+        Vec::new()
+    };
+
+    let return_type = node
+        .child_by_field_name("return_type")
+        .map(|n| parsed.text_for_node(&n));
+
+    let has_try_catch = has_try_catch_in_body(node);
+
+    Some(TsFunction {
+        name: name.to_string(),
+        is_async,
+        is_generator: false,
+        is_exported,
+        params,
+        return_type,
+        location,
+        has_try_catch,
+        inner_calls: Vec::new(),
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
     })
 }
 
@@ -1002,6 +1057,8 @@ fn build_method(parsed: &ParsedFile, node: &tree_sitter::Node) -> Option<TsMetho
         params,
         return_type,
         location,
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
     })
 }
 

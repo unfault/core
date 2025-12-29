@@ -110,6 +110,11 @@ fn detect_frameworks(parsed: &ParsedFile, node: Node, summary: &mut GoFrameworkS
                 summary.frameworks.push(GoHttpFramework::Mux);
             }
         }
+        if text.contains("net/http") {
+            if !summary.frameworks.contains(&GoHttpFramework::NetHttp) {
+                summary.frameworks.push(GoHttpFramework::NetHttp);
+            }
+        }
     }
     
     // Recurse
@@ -139,78 +144,81 @@ fn extract_route(parsed: &ParsedFile, call_node: Node, frameworks: &[GoHttpFrame
     let func = call_node.child_by_field_name("function")?;
     
     // Check for selector expression: router.GET, e.POST, app.Get, etc.
-    if func.kind() != "selector_expression" {
-        return None;
-    }
-    
-    let field = func.child_by_field_name("field")?;
-    let method_name = parsed.text_for_node(&field);
-    
-    // Determine HTTP method and framework
-    let (http_method, framework) = if HTTP_METHODS_UPPER.contains(&method_name.as_str()) {
-        // Gin or Echo style: .GET, .POST
-        let fw = if frameworks.contains(&GoHttpFramework::Echo) {
-            GoHttpFramework::Echo
+    if func.kind() == "selector_expression" {
+        let field = func.child_by_field_name("field")?;
+        let method_name = parsed.text_for_node(&field);
+        
+        // Determine HTTP method and framework
+        let (http_method, framework) = if HTTP_METHODS_UPPER.contains(&method_name.as_str()) {
+            // Gin or Echo style: .GET, .POST
+            let fw = if frameworks.contains(&GoHttpFramework::Echo) {
+                GoHttpFramework::Echo
+            } else {
+                GoHttpFramework::Gin // Default to Gin for uppercase methods
+            };
+            (method_name.clone(), fw)
+        } else if HTTP_METHODS_LOWER.contains(&method_name.as_str()) {
+            // Fiber or Chi style: .Get, .Post
+            let fw = if frameworks.contains(&GoHttpFramework::Fiber) {
+                GoHttpFramework::Fiber
+            } else {
+                GoHttpFramework::Chi // Default to Chi for lowercase methods
+            };
+            (method_name.to_uppercase(), fw)
+        } else if method_name == "Any" || method_name == "Handle" {
+            // Gin's Any and Handle methods
+            ("ANY".to_string(), GoHttpFramework::Gin)
+        } else if method_name == "HandleFunc" {
+            // Gorilla mux or net/http style
+            return extract_mux_route(parsed, call_node);
         } else {
-            GoHttpFramework::Gin // Default to Gin for uppercase methods
+            return None;
         };
-        (method_name.clone(), fw)
-    } else if HTTP_METHODS_LOWER.contains(&method_name.as_str()) {
-        // Fiber or Chi style: .Get, .Post
-        let fw = if frameworks.contains(&GoHttpFramework::Fiber) {
-            GoHttpFramework::Fiber
-        } else {
-            GoHttpFramework::Chi // Default to Chi for lowercase methods
-        };
-        (method_name.to_uppercase(), fw)
-    } else if method_name == "Any" || method_name == "Handle" {
-        // Gin's Any and Handle methods
-        ("ANY".to_string(), GoHttpFramework::Gin)
-    } else if method_name == "HandleFunc" {
-        // Gorilla mux or net/http style
-        return extract_mux_route(parsed, call_node);
-    } else {
-        return None;
-    };
-    
-    // Get arguments: first should be path, second should be handler(s)
-    let args = call_node.child_by_field_name("arguments")?;
-    
-    let mut path: Option<String> = None;
-    let mut handler_name: Option<String> = None;
-    
-    let mut arg_index = 0;
-    for i in 0..args.child_count() {
-        if let Some(arg) = args.child(i) {
-            // Skip commas and parentheses
-            if arg.kind() == "," || arg.kind() == "(" || arg.kind() == ")" {
-                continue;
+        
+        // Get arguments: first should be path, second should be handler(s)
+        let args = call_node.child_by_field_name("arguments")?;
+        
+        let mut path: Option<String> = None;
+        let mut handler_name: Option<String> = None;
+        
+        let mut arg_index = 0;
+        for i in 0..args.child_count() {
+            if let Some(arg) = args.child(i) {
+                // Skip commas and parentheses
+                if arg.kind() == "," || arg.kind() == "(" || arg.kind() == ")" {
+                    continue;
+                }
+                
+                if arg_index == 0 {
+                    // First argument is the path
+                    let path_text = parsed.text_for_node(&arg);
+                    path = Some(path_text.trim_matches('"').to_string());
+                } else if arg_index == 1 && handler_name.is_none() {
+                    // Second argument is the handler
+                    let handler_text = parsed.text_for_node(&arg);
+                    handler_name = extract_handler_name(&handler_text);
+                }
+                arg_index += 1;
             }
-            
-            if arg_index == 0 {
-                // First argument is the path
-                let path_text = parsed.text_for_node(&arg);
-                path = Some(path_text.trim_matches('"').to_string());
-            } else if arg_index == 1 && handler_name.is_none() {
-                // Second argument is the handler
-                let handler_text = parsed.text_for_node(&arg);
-                handler_name = extract_handler_name(&handler_text);
-            }
-            arg_index += 1;
         }
+        
+        let route_path = path?;
+        
+        Some(GoRoute {
+            framework,
+            http_method,
+            path: route_path,
+            handler_name,
+            location: parsed.location_for_node(&call_node),
+            start_byte: call_node.start_byte(),
+            end_byte: call_node.end_byte(),
+        })
+    } else if func.kind() == "identifier_expression" || func.kind() == "identifier" {
+        // Check for net/http: http.HandleFunc("/path", handler) or http.Handle("/path", handler)
+        extract_net_http_route(parsed, call_node)
+    } else {
+        None
     }
-    
-    let route_path = path?;
-    
-    Some(GoRoute {
-        framework,
-        http_method,
-        path: route_path,
-        handler_name,
-        location: parsed.location_for_node(&call_node),
-        start_byte: call_node.start_byte(),
-        end_byte: call_node.end_byte(),
-    })
 }
 
 fn extract_mux_route(parsed: &ParsedFile, call_node: Node) -> Option<GoRoute> {
@@ -248,6 +256,54 @@ fn extract_mux_route(parsed: &ParsedFile, call_node: Node) -> Option<GoRoute> {
     Some(GoRoute {
         framework: GoHttpFramework::Mux,
         http_method,
+        path: route_path,
+        handler_name,
+        location: parsed.location_for_node(&call_node),
+        start_byte: call_node.start_byte(),
+        end_byte: call_node.end_byte(),
+    })
+}
+
+fn extract_net_http_route(parsed: &ParsedFile, call_node: Node) -> Option<GoRoute> {
+    // net/http pattern: http.HandleFunc("/path", handler) or http.Handle("/path", handler)
+    // The function is an identifier like "http.HandleFunc" or "http.Handle"
+    
+    let func = call_node.child_by_field_name("function")?;
+    let func_text = parsed.text_for_node(&func);
+    
+    // Check if this is http.HandleFunc or http.Handle
+    if !func_text.starts_with("http.HandleFunc(") && !func_text.starts_with("http.Handle(") {
+        return None;
+    }
+    
+    let args = call_node.child_by_field_name("arguments")?;
+    
+    let mut path: Option<String> = None;
+    let mut handler_name: Option<String> = None;
+    
+    let mut arg_index = 0;
+    for i in 0..args.child_count() {
+        if let Some(arg) = args.child(i) {
+            if arg.kind() == "," || arg.kind() == "(" || arg.kind() == ")" {
+                continue;
+            }
+            
+            if arg_index == 0 {
+                let path_text = parsed.text_for_node(&arg);
+                path = Some(path_text.trim_matches('"').to_string());
+            } else if arg_index == 1 {
+                let handler_text = parsed.text_for_node(&arg);
+                handler_name = extract_handler_name(&handler_text);
+            }
+            arg_index += 1;
+        }
+    }
+    
+    let route_path = path?;
+    
+    Some(GoRoute {
+        framework: GoHttpFramework::NetHttp,
+        http_method: "ANY".to_string(),
         path: route_path,
         handler_name,
         location: parsed.location_for_node(&call_node),
@@ -422,5 +478,56 @@ func main() {
         let summary = parse_and_extract(src);
         assert_eq!(summary.routes.len(), 1);
         assert_eq!(summary.routes[0].handler_name, Some("GetUsers".to_string()));
+    }
+
+    #[test]
+    fn detects_net_http_routes() {
+        let src = r#"
+package main
+
+import (
+    "fmt"
+    "net/http"
+)
+
+func handler(w http.ResponseWriter, r *http.Request) {
+    fmt.Fprintf(w, "Hello, World!")
+}
+
+func main() {
+    http.HandleFunc("/", handler)
+    http.ListenAndServe(":8080", nil)
+}
+"#;
+        let summary = parse_and_extract(src);
+        assert!(summary.frameworks.contains(&GoHttpFramework::NetHttp));
+        assert_eq!(summary.routes.len(), 1);
+        assert_eq!(summary.routes[0].path, "/");
+        assert_eq!(summary.routes[0].handler_name, Some("handler".to_string()));
+    }
+
+    #[test]
+    fn detects_multiple_net_http_routes() {
+        let src = r#"
+package main
+
+import (
+    "net/http"
+)
+
+func homeHandler(w http.ResponseWriter, r *http.Request) {}
+func usersHandler(w http.ResponseWriter, r *http.Request) {}
+
+func main() {
+    http.HandleFunc("/", homeHandler)
+    http.HandleFunc("/users", usersHandler)
+    http.ListenAndServe(":8080", nil)
+}
+"#;
+        let summary = parse_and_extract(src);
+        assert!(summary.frameworks.contains(&GoHttpFramework::NetHttp));
+        assert_eq!(summary.routes.len(), 2);
+        assert_eq!(summary.routes[0].path, "/");
+        assert_eq!(summary.routes[1].path, "/users");
     }
 }

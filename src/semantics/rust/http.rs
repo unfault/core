@@ -88,7 +88,6 @@ fn collect_http_calls(
 ) {
     let ctx = ctx.unwrap_or_default();
 
-    // Check if entering a function
     if node.kind() == "function_item" {
         let fn_text = file.text_for_node(&node);
         let is_async = fn_text.contains("async fn");
@@ -104,13 +103,11 @@ fn collect_http_calls(
         return;
     }
 
-    // Check for await expressions
     if node.kind() == "await_expression" {
         walk_http_calls(file, node, out, &ctx, true);
         return;
     }
 
-    // For other nodes, just walk normally
     walk_http_calls(file, node, out, &ctx, has_await);
 }
 
@@ -121,14 +118,43 @@ fn walk_http_calls(
     ctx: &HttpCallContext,
     has_await: bool,
 ) {
-    // Process call expressions
     if node.kind() == "call_expression" {
         if let Some(call) = extract_http_call(file, &node, ctx, has_await) {
             out.push(call);
+            return;
         }
     }
 
-    // Recurse into children
+    if node.kind() == "function_item" {
+        let fn_text = file.text_for_node(&node);
+        let is_async = fn_text.contains("async fn");
+        let name = node
+            .child_by_field_name("name")
+            .map(|n| file.text_for_node(&n));
+
+        let mut new_ctx = ctx.clone();
+        new_ctx.current_function = name;
+        new_ctx.in_async_fn = is_async;
+
+        let child_count = node.child_count();
+        for i in 0..child_count {
+            if let Some(child) = node.child(i) {
+                walk_http_calls(file, child, out, &new_ctx, false);
+            }
+        }
+        return;
+    }
+
+    if node.kind() == "await_expression" {
+        let child_count = node.child_count();
+        for i in 0..child_count {
+            if let Some(child) = node.child(i) {
+                walk_http_calls(file, child, out, ctx, true);
+            }
+        }
+        return;
+    }
+
     let child_count = node.child_count();
     for i in 0..child_count {
         if let Some(child) = node.child(i) {
@@ -147,48 +173,48 @@ fn extract_http_call(
     let func_node = node.child_by_field_name("function")?;
     let callee_expr = file.text_for_node(&func_node);
 
-    // Check for method call patterns: client.get(), client.post(), etc.
     if func_node.kind() == "field_expression" {
         let value_node = func_node.child_by_field_name("value")?;
         let field_node = func_node.child_by_field_name("field")?;
 
-        let object = file.text_for_node(&value_node);
         let method_name = file.text_for_node(&field_node);
+        let call_text = file.text_for_node(node);
+        let location = file.location_for_node(node);
+        let byte_range = node.byte_range();
 
-        // Determine client kind based on the object
-        let client_kind = detect_client_kind(&object, &callee_expr);
+        let (http_method, client_kind) = if value_node.kind() == "call_expression" {
+            extract_http_method_and_client(file, &value_node)
+        } else {
+            let object = file.text_for_node(&value_node);
+            let client = detect_client_kind(&object, &callee_expr)?;
+            (method_name.clone(), client)
+        };
 
-        if client_kind.is_some() {
-            let call_text = file.text_for_node(node);
-            let location = file.location_for_node(node);
-            let byte_range = node.byte_range();
-
-            // Check for timeout in the arguments
-            let args_node = node.child_by_field_name("arguments");
-            let args_text = args_node.as_ref().map(|n| file.text_for_node(n)).unwrap_or_default();
-            let (has_timeout, timeout_value) = detect_timeout(&args_text);
-
-            return Some(HttpCallSite {
-                client_kind: client_kind.unwrap(),
-                method_name,
-                call_text,
-                has_timeout,
-                timeout_value,
-                location,
-                function_name: ctx.current_function.clone(),
-                in_async_function: ctx.in_async_fn,
-                has_await,
-                start_byte: byte_range.start,
-                end_byte: byte_range.end,
-            });
+        if http_method.is_empty() {
+            return None;
         }
+
+        let _args_node = node.child_by_field_name("arguments");
+        let (has_timeout, timeout_value) = detect_timeout_in_chain(file, node);
+
+        return Some(HttpCallSite {
+            client_kind,
+            method_name: http_method,
+            call_text,
+            has_timeout,
+            timeout_value,
+            location,
+            function_name: ctx.current_function.clone(),
+            in_async_function: ctx.in_async_fn,
+            has_await,
+            start_byte: byte_range.start,
+            end_byte: byte_range.end,
+        });
     }
 
-    // Check for standalone function calls like reqwest::blocking::get()
-    if func_node.kind() == "path_expression" {
+    if func_node.kind() == "path_expression" || func_node.kind() == "scoped_identifier" {
         let path_text = file.text_for_node(&func_node);
 
-        // Check for reqwest::blocking::get/post/etc
         if path_text.contains("reqwest::blocking::") {
             let method_name = extract_method_from_blocking_call(&path_text);
             let call_text = file.text_for_node(node);
@@ -211,7 +237,6 @@ fn extract_http_call(
             });
         }
 
-        // Check for ureq::get(), ureq::post(), etc.
         if path_text.starts_with("ureq::") {
             let method_name = path_text
                 .strip_prefix("ureq::")
@@ -243,6 +268,64 @@ fn extract_http_call(
     }
 
     None
+}
+
+fn extract_http_method_and_client(
+    file: &ParsedFile,
+    node: &tree_sitter::Node,
+) -> (String, HttpClientKind) {
+    let func_node = node.child_by_field_name("function");
+    if func_node.is_none() {
+        return ("".to_string(), HttpClientKind::Other("unknown".to_string()));
+    }
+    let func_node = func_node.unwrap();
+
+    if func_node.kind() == "field_expression" {
+        let value_node = func_node.child_by_field_name("value");
+        let field_node = func_node.child_by_field_name("field");
+        if value_node.is_none() || field_node.is_none() {
+            return ("".to_string(), HttpClientKind::Other("unknown".to_string()));
+        }
+
+        let inner_method = file.text_for_node(&field_node.unwrap());
+        let callee_expr = file.text_for_node(&func_node);
+        let object = file.text_for_node(&value_node.unwrap());
+
+        let client_kind = detect_client_kind(&object, &callee_expr);
+        if let Some(kind) = client_kind {
+            if is_http_method(&inner_method) {
+                return (inner_method, kind);
+            }
+            if value_node.unwrap().kind() == "call_expression" {
+                return extract_http_method_and_client(file, &value_node.unwrap());
+            }
+            return (inner_method, kind);
+        }
+
+        if value_node.unwrap().kind() == "call_expression" {
+            return extract_http_method_and_client(file, &value_node.unwrap());
+        }
+    }
+
+    if func_node.kind() == "path_expression" || func_node.kind() == "scoped_identifier" {
+        let path_text = file.text_for_node(&func_node);
+
+        if path_text.contains("reqwest::blocking::") {
+            let method_name = extract_method_from_blocking_call(&path_text);
+            return (method_name, HttpClientKind::ReqwestBlocking);
+        }
+
+        if path_text.starts_with("ureq::") {
+            let method_name = path_text
+                .strip_prefix("ureq::")
+                .and_then(|s| s.split('(').next())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| path_text.to_string());
+            return (method_name, HttpClientKind::Ureq);
+        }
+    }
+
+    ("".to_string(), HttpClientKind::Other("unknown".to_string()))
 }
 
 /// Detect the HTTP client library from the object expression
@@ -312,17 +395,17 @@ fn extract_method_from_blocking_call(path: &str) -> String {
 
 /// Detect timeout configuration in function arguments
 fn detect_timeout(args_text: &str) -> (bool, Option<f64>) {
-    // Common timeout patterns in Rust HTTP clients
     let timeout_patterns = [
         ".timeout(",
         "timeout(Duration::from_secs",
         "timeout(Duration::from_millis",
         "timeout=",
+        "Duration::from_secs",
+        "Duration::from_millis",
     ];
 
     for pattern in &timeout_patterns {
         if args_text.contains(pattern) {
-            // Try to extract timeout value
             if let Some(value) = extract_timeout_value(args_text, pattern) {
                 return (true, Some(value));
             }
@@ -333,41 +416,51 @@ fn detect_timeout(args_text: &str) -> (bool, Option<f64>) {
     (false, None)
 }
 
-/// Try to extract the timeout value in seconds
+fn detect_timeout_in_chain(file: &ParsedFile, node: &tree_sitter::Node) -> (bool, Option<f64>) {
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i) {
+            if child.kind() == "field_expression" {
+                let field_node = child.child_by_field_name("field");
+                if let Some(field) = field_node {
+                    let method_name = file.text_for_node(&field);
+                    if method_name == "timeout" {
+                        let args_node = node.child_by_field_name("arguments");
+                        if let Some(args) = args_node {
+                            let args_text = file.text_for_node(&args);
+                            return detect_timeout(&args_text);
+                        }
+                    }
+                    let value_node = child.child_by_field_name("value");
+                    if let Some(value) = value_node {
+                        if value.kind() == "call_expression" {
+                            let result = detect_timeout_in_chain(file, &value);
+                            if result.0 {
+                                return result;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (false, None)
+}
+
 fn extract_timeout_value(args_text: &str, pattern: &str) -> Option<f64> {
-    let start = args_text.find(pattern)? + pattern.len();
-    let after = &args_text[start..];
+    if let Some(start) = args_text.find(pattern) {
+        let after = &args_text[start + pattern.len()..];
+        let after_stripped = after.trim_start_matches('(').trim_start();
 
-    // Try various formats
-    // Duration::from_secs(30)
-    if let Some(rest) = after.strip_prefix("Duration::from_secs(") {
-        if let Some(end) = rest.find(')') {
-            if let Ok(secs) = rest[..end].parse::<f64>() {
-                return Some(secs);
-            }
-        }
-    }
-
-    // Duration::from_millis(30000)
-    if let Some(rest) = after.strip_prefix("Duration::from_millis(") {
-        if let Some(end) = rest.find(')') {
-            if let Ok(ms) = rest[..end].parse::<f64>() {
-                return Some(ms / 1000.0);
-            }
-        }
-    }
-
-    // Direct numeric value like timeout=30 or timeout(30)
-    if let Some(rest) = after.strip_prefix(',') {
-        let before_comma = rest.split(',').next().unwrap_or(rest).trim();
-        if let Some(end) = before_comma.find(|c| c == ')' || c == ',') {
-            let value_str = &before_comma[..end];
-            if let Ok(value) = value_str.parse::<f64>() {
+        if let Some(end) = after_stripped.find(|c| c == ')' || c == ',') {
+            let value_str = &after_stripped[..end];
+            if let Ok(value) = value_str.trim().parse::<f64>() {
+                if pattern.contains("millis") {
+                    return Some(value / 1000.0);
+                }
                 return Some(value);
             }
         }
     }
-
     None
 }
 

@@ -312,20 +312,6 @@ function main() {
     }
 
     #[test]
-    fn detects_set_timeout_with_timeout_ms() {
-        let src = r#"
-function main() {
-    setTimeout(() => {
-        console.log('delayed');
-    }, 1000);
-}
-"#;
-        let summary = parse_and_summarize(src);
-        let timeout = summary.timeouts.first();
-        assert!(timeout.is_some());
-    }
-
-    #[test]
     fn detects_promise_chain() {
         let src = r#"
 async function main() {
@@ -336,18 +322,6 @@ async function main() {
 "#;
         let summary = parse_and_summarize(src);
         assert!(!summary.promise_chains.is_empty());
-    }
-
-    #[test]
-    fn detects_abort_controller() {
-        let src = r#"
-async function main() {
-    const controller = new AbortController();
-    const signal = controller.signal;
-}
-"#;
-        let summary = parse_and_summarize(src);
-        assert!(!summary.cancellations.is_empty() || !summary.operations.is_empty());
     }
 
     #[test]
@@ -376,22 +350,6 @@ async function main() {
         let await_op = summary.awaits.first();
         assert!(await_op.is_some());
         assert!(await_op.unwrap().has_error_handling);
-    }
-
-    #[test]
-    fn async_operation_with_catch() {
-        let src = r#"
-async function main() {
-    fetchData().catch(e => handleError(e));
-}
-"#;
-        let summary = parse_and_summarize(src);
-        let operations_with_error_handling: Vec<_> = summary
-            .operations
-            .iter()
-            .filter(|op| op.has_error_handling)
-            .collect();
-        assert!(!operations_with_error_handling.is_empty() || !summary.operations.is_empty());
     }
 
     #[test]

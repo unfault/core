@@ -81,6 +81,28 @@ pub struct PyFileSemantics {
 
     /// Async operations (asyncio.create_task, gather, await, etc.)
     pub async_operations: Vec<AsyncOperation>,
+
+    /// Detected decorators (logging, retry, etc.)
+    pub decorators: Vec<Decorator>,
+}
+
+/// Information about a decorator found in the code.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Decorator {
+    /// The decorator name (e.g., "log", "retry", "app.get")
+    pub name: String,
+    /// Full text of the decorator including @ symbol
+    pub text: String,
+    /// Parameters to the decorator if any
+    pub parameters: Vec<String>,
+    /// Name of the function this decorator is attached to
+    pub function_name: Option<String>,
+    /// Start byte offset
+    pub start_byte: usize,
+    /// End byte offset
+    pub end_byte: usize,
+    /// Location in source file
+    pub location: AstLocation,
 }
 
 /// Async operation in Python code.
@@ -219,6 +241,7 @@ impl PyFileSemantics {
             bare_excepts: Vec::new(),
             module_docstring_end_line: find_module_docstring_end_line(parsed),
             async_operations: Vec::new(),
+            decorators: Vec::new(),
         };
 
         if parsed.language == Language::Python {
@@ -256,6 +279,9 @@ impl PyFileSemantics {
         // Async operation analysis
         let async_summary = super::async_ops::summarize_async_operations(parsed);
         self.async_operations = async_summary.operations;
+
+        // Decorator analysis (logging, retry, etc.)
+        self.decorators = summarize_decorators(parsed);
 
         Ok(())
     }
@@ -1755,6 +1781,72 @@ fn parse_typed_default_param_text(text: &str) -> Option<(String, String, Option<
         }
         Some((name, type_ann, None))
     }
+}
+
+/// Summarize all decorators in a parsed Python file.
+/// Detects logging, retry, and other common decorators.
+pub fn summarize_decorators(parsed: &ParsedFile) -> Vec<Decorator> {
+    let mut decorators = Vec::new();
+
+    fn walk(file: &ParsedFile, node: tree_sitter::Node, decorators: &mut Vec<Decorator>) {
+        if node.kind() == "decorated_definition" {
+            let mut fn_name = None;
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if child.kind() == "decorator" {
+                    let decorator_text = file.text_for_node(&child);
+                    let start_byte = child.start_byte();
+                    let end_byte = child.end_byte();
+                    let location = file.location_for_node(&child);
+
+                    let (name, parameters) = extract_decorator_name_and_params(&decorator_text);
+
+                    decorators.push(Decorator {
+                        name,
+                        text: decorator_text,
+                        parameters,
+                        function_name: fn_name.clone(),
+                        start_byte,
+                        end_byte,
+                        location,
+                    });
+                } else if child.kind() == "function_definition" {
+                    if let Some(name_node) = child.child_by_field_name("name") {
+                        fn_name = Some(file.text_for_node(&name_node));
+                    }
+                }
+            }
+        }
+
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            walk(file, child, decorators);
+        }
+    }
+
+    let root = parsed.tree.root_node();
+    walk(parsed, root, &mut decorators);
+
+    decorators
+}
+
+fn extract_decorator_name_and_params(decorator_text: &str) -> (String, Vec<String>) {
+    let text = decorator_text.trim_start_matches('@').trim();
+
+    let (name, params) = if let Some(paren_idx) = text.find('(') {
+        let name = text[..paren_idx].to_string();
+        let params_text = &text[paren_idx + 1..text.len().saturating_sub(1)];
+        let params = params_text
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        (name, params)
+    } else {
+        (text.to_string(), Vec::new())
+    };
+
+    (name, params)
 }
 
 #[cfg(test)]

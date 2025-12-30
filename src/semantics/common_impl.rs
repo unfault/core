@@ -8,7 +8,7 @@ use crate::types::context::Language;
 
 use super::common::{
     CommonLocation, CommonSemantics,
-    annotations::{Annotation, AnnotationType, FunctionAnnotations},
+    annotations::{Annotation, AnnotationType},
     async_ops::{AsyncOperation, AsyncOperationType, AsyncRuntime},
     db::{DbLibrary, DbOperation, DbOperationType},
     error_context::{ErrorContext, ErrorContextType},
@@ -170,7 +170,41 @@ impl CommonSemantics for PyFileSemantics {
     }
 
     fn annotations(&self) -> Vec<Annotation> {
-        Vec::new()
+        let mut annotations = Vec::new();
+
+        for decorator in &self.decorators {
+            let annotation_type = match decorator.name.to_lowercase().as_str() {
+                n if n.contains("log") => AnnotationType::Logging,
+                n if n.contains("retry") => AnnotationType::Retry,
+                n if n.contains("cache") => AnnotationType::Cache,
+                n if n.contains("rate") || n.contains("throttle") => AnnotationType::RateLimit,
+                n if n.contains("timeout") => AnnotationType::Timeout,
+                n if n.contains("feature") || n.contains("flag") => AnnotationType::FeatureFlag,
+                n if n.contains("auth") || n.contains("permission") => AnnotationType::Auth { library: String::new() },
+                n if n.contains("valid") => AnnotationType::Validation { library: String::new() },
+                _ => AnnotationType::Other(decorator.name.clone()),
+            };
+
+            annotations.push(Annotation::new(
+                decorator.name.clone(),
+                annotation_type,
+                decorator.function_name.clone().unwrap_or_default(),
+                &self.path,
+            ).with_parameters(decorator.parameters.clone())
+                .with_location(
+                    CommonLocation {
+                        file_id: self.file_id,
+                        line: decorator.location.range.start_line + 1,
+                        column: decorator.location.range.start_col + 1,
+                        start_byte: decorator.start_byte,
+                        end_byte: decorator.end_byte,
+                    },
+                    decorator.start_byte,
+                    decorator.end_byte,
+                ));
+        }
+
+        annotations
     }
 
     fn route_patterns(&self) -> Vec<RoutePattern> {
@@ -821,7 +855,26 @@ impl CommonSemantics for GoFileSemantics {
     }
 
     fn error_contexts(&self) -> Vec<ErrorContext> {
-        Vec::new()
+        let mut contexts = Vec::new();
+
+        for recover in &self.defer_recovers {
+            contexts.push(ErrorContext::new(
+                ErrorContextType::DeferRecover,
+            ).with_logging(recover.has_logging)
+                .with_location(
+                    CommonLocation {
+                        file_id: self.file_id,
+                        line: recover.location.range.start_line + 1,
+                        column: recover.location.range.start_col + 1,
+                        start_byte: recover.start_byte,
+                        end_byte: recover.end_byte,
+                    },
+                    recover.start_byte,
+                    recover.end_byte,
+                ).with_enclosing_function(recover.function_name.clone().unwrap_or_default()));
+        }
+
+        contexts
     }
 }
 
@@ -1160,9 +1213,10 @@ impl CommonSemantics for RustFileSemantics {
             };
 
             for attr in &func.attributes {
+                let annotation_type = classify_rust_attribute(attr);
                 annotations.push(Annotation::new(
                     attr.clone(),
-                    AnnotationType::CustomDecorator,
+                    annotation_type,
                     &func.name,
                     &self.path,
                 ).with_location(location.clone(), func.start_byte, func.end_byte)
@@ -1181,9 +1235,10 @@ impl CommonSemantics for RustFileSemantics {
                 };
 
                 for attr in &method.attributes {
+                    let annotation_type = classify_rust_attribute(attr);
                     annotations.push(Annotation::new(
                         attr.clone(),
-                        AnnotationType::CustomDecorator,
+                        annotation_type,
                         &method.name,
                         &self.path,
                     ).with_location(location.clone(), method.start_byte, method.end_byte)
@@ -1573,41 +1628,93 @@ impl CommonSemantics for TsFileSemantics {
         let mut annotations = Vec::new();
 
         for func in &self.functions {
-            let location = CommonLocation {
-                file_id: self.file_id,
-                line: func.location.range.start_line + 1,
-                column: func.location.range.start_col + 1,
-                start_byte: func.start_byte,
-                end_byte: func.end_byte,
-            };
-
-            annotations.push(Annotation::new(
-                func.name.clone(),
-                AnnotationType::CustomDecorator,
-                &func.name,
-                &self.path,
-            ).with_location(location.clone(), func.start_byte, func.end_byte)
-                .with_enclosing_function(func.name.clone()));
-        }
-
-        for class in &self.classes {
-            for method in &class.methods {
-                let location = CommonLocation {
-                    file_id: self.file_id,
-                    line: method.location.range.start_line + 1,
-                    column: method.location.range.start_col + 1,
-                    start_byte: method.start_byte,
-                    end_byte: method.end_byte,
+            for decorator in &func.decorators {
+                let annotation_type = match decorator.to_lowercase().as_str() {
+                    n if n.contains("log") => AnnotationType::Logging,
+                    n if n.contains("retry") => AnnotationType::Retry,
+                    n if n.contains("cache") => AnnotationType::Cache,
+                    n if n.contains("rate") || n.contains("throttle") => AnnotationType::RateLimit,
+                    n if n.contains("timeout") => AnnotationType::Timeout,
+                    n if n.contains("feature") || n.contains("flag") => AnnotationType::FeatureFlag,
+                    n if n.contains("auth") || n.contains("permission") || n.contains("guard") => AnnotationType::Auth { library: String::new() },
+                    n if n.contains("valid") => AnnotationType::Validation { library: String::new() },
+                    _ => AnnotationType::Other(decorator.clone()),
                 };
 
                 annotations.push(Annotation::new(
-                    method.name.clone(),
-                    AnnotationType::CustomDecorator,
-                    &method.name,
+                    decorator.clone(),
+                    annotation_type,
+                    &func.name,
                     &self.path,
-                ).with_location(location.clone(), method.start_byte, method.end_byte)
-                    .with_enclosing_function(method.name.clone())
-                    .with_enclosing_class(class.name.clone()));
+                ).with_location(
+                    CommonLocation {
+                        file_id: self.file_id,
+                        line: func.location.range.start_line + 1,
+                        column: func.location.range.start_col + 1,
+                        start_byte: func.start_byte,
+                        end_byte: func.end_byte,
+                    },
+                    func.start_byte,
+                    func.end_byte,
+                ).with_enclosing_function(func.name.clone()));
+            }
+        }
+
+        for class in &self.classes {
+                for decorator in &class.decorators {
+                    let annotation_type = match decorator.to_lowercase().as_str() {
+                        n if n.contains("log") => AnnotationType::Logging,
+                        n if n.contains("controller") || n.contains("service") || n.contains("injectable") => AnnotationType::Controller,
+                        n if n.contains("auth") || n.contains("guard") => AnnotationType::Auth { library: String::new() },
+                        _ => AnnotationType::Other(decorator.clone()),
+                    };
+
+                    annotations.push(Annotation::new(
+                        decorator.clone(),
+                        annotation_type,
+                        &class.name,
+                        &self.path,
+                    ).with_location(
+                        CommonLocation {
+                            file_id: self.file_id,
+                            line: class.location.range.start_line + 1,
+                            column: class.location.range.start_col + 1,
+                            start_byte: 0,
+                            end_byte: 0,
+                        },
+                        0,
+                        0,
+                    ).with_enclosing_class(class.name.clone()));
+                }
+
+            for method in &class.methods {
+                for decorator in &method.decorators {
+                    let annotation_type = match decorator.to_lowercase().as_str() {
+                        n if n.contains("log") => AnnotationType::Logging,
+                        n if n.contains("retry") => AnnotationType::Retry,
+                        n if n.contains("get") || n.contains("post") || n.contains("put") || n.contains("delete") || n.contains("patch") => AnnotationType::Route,
+                        n if n.contains("auth") || n.contains("guard") => AnnotationType::Auth { library: String::new() },
+                        _ => AnnotationType::Other(decorator.clone()),
+                    };
+
+                    annotations.push(Annotation::new(
+                        decorator.clone(),
+                        annotation_type,
+                        &method.name,
+                        &self.path,
+                    ).with_location(
+                        CommonLocation {
+                            file_id: self.file_id,
+                            line: method.location.range.start_line + 1,
+                            column: method.location.range.start_col + 1,
+                            start_byte: method.start_byte,
+                            end_byte: method.end_byte,
+                        },
+                        method.start_byte,
+                        method.end_byte,
+                    ).with_enclosing_function(method.name.clone())
+                        .with_enclosing_class(class.name.clone()));
+                }
             }
         }
 
@@ -1658,7 +1765,49 @@ impl CommonSemantics for TsFileSemantics {
     }
 
     fn error_contexts(&self) -> Vec<ErrorContext> {
-        Vec::new()
+        let mut contexts = Vec::new();
+
+        for try_catch in &self.try_catches {
+            contexts.push(ErrorContext::new(
+                ErrorContextType::TryCatch,
+            ).with_logging(try_catch.has_logging)
+                .with_reraise(try_catch.has_reraise)
+                .swallowing_error(try_catch.catch_text.contains("catch") && try_catch.catch_text.lines().count() <= 2)
+                .with_location(
+                    CommonLocation {
+                        file_id: self.file_id,
+                        line: try_catch.location.range.start_line + 1,
+                        column: try_catch.location.range.start_col + 1,
+                        start_byte: try_catch.start_byte,
+                        end_byte: try_catch.end_byte,
+                    },
+                    try_catch.start_byte,
+                    try_catch.end_byte,
+                ).with_enclosing_function(try_catch.function_name.clone().unwrap_or_default()));
+        }
+
+        contexts
+    }
+}
+
+/// Classify a Rust attribute into an AnnotationType.
+fn classify_rust_attribute(attr: &str) -> AnnotationType {
+    let attr_lower = attr.to_lowercase();
+
+    if attr_lower.contains("log") || attr_lower.contains("tracing") {
+        AnnotationType::Logging
+    } else if attr_lower.contains("retry") {
+        AnnotationType::Retry
+    } else if attr_lower.contains("cache") || attr_lower.contains("cached") {
+        AnnotationType::Cache
+    } else if attr_lower.contains("rate") || attr_lower.contains("throttle") {
+        AnnotationType::RateLimit
+    } else if attr_lower.contains("timeout") {
+        AnnotationType::Timeout
+    } else if attr_lower.contains("feature") || attr_lower.contains("flag") {
+        AnnotationType::FeatureFlag
+    } else {
+        AnnotationType::CustomDecorator
     }
 }
 
@@ -2593,4 +2742,117 @@ class UserController {
         let method_anns: Vec<_> = annotations.iter().filter(|a| a.enclosing_function.is_some()).collect();
         assert!(!method_anns.is_empty());
     }
+
+    #[test]
+    fn python_logging_decorator_detected() {
+        let sem = parse_python(
+            r#"
+import logging
+
+@logging.basicConfig
+def process():
+    pass
+"#,
+        );
+        let annotations = sem.annotations();
+        let logging_anns: Vec<_> = annotations.iter()
+            .filter(|a| matches!(a.annotation_type, AnnotationType::Logging))
+            .collect();
+        assert!(!logging_anns.is_empty(), "Expected logging annotation");
+    }
+
+    #[test]
+    fn python_retry_decorator_detected() {
+        let sem = parse_python(
+            r#"
+import tenacity
+
+@tenacity.retry(stop=tenacity.stop_after_attempt(3))
+def fetch_data():
+    pass
+"#,
+        );
+        let annotations = sem.annotations();
+        let retry_anns: Vec<_> = annotations.iter()
+            .filter(|a| matches!(a.annotation_type, AnnotationType::Retry))
+            .collect();
+        assert!(!retry_anns.is_empty(), "Expected retry annotation");
+    }
+
+    #[test]
+    fn go_defer_recover_error_context_detected() {
+        let sem = parse_go(
+            r#"
+package main
+
+func handle() {
+    defer func() {
+        if r := recover(); r != nil {
+            log.Println("recovered:", r)
+        }
+    }()
 }
+"#,
+        );
+        let contexts = sem.error_contexts();
+        let recover_contexts: Vec<_> = contexts.iter()
+            .filter(|c| matches!(c.context_type, ErrorContextType::DeferRecover))
+            .collect();
+        assert!(!recover_contexts.is_empty(), "Expected defer_recover context");
+        assert!(recover_contexts[0].has_logging, "Expected logging in recover");
+    }
+
+    #[test]
+    fn typescript_try_catch_with_logging_detected() {
+        let sem = parse_typescript(
+            r#"
+async function handler() {
+    try {
+        await riskyOperation();
+    } catch (err) {
+        console.error("Error:", err);
+        throw err;
+    }
+}
+"#,
+        );
+        let contexts = sem.error_contexts();
+        let try_catch_contexts: Vec<_> = contexts.iter()
+            .filter(|c| matches!(c.context_type, ErrorContextType::TryCatch))
+            .collect();
+        assert!(!try_catch_contexts.is_empty(), "Expected try-catch context");
+        assert!(try_catch_contexts[0].has_logging, "Expected logging");
+        assert!(try_catch_contexts[0].has_reraise, "Expected re-raise");
+    }
+
+    #[test]
+    fn rust_log_attribute_classified() {
+        let sem = parse_rust(
+            r#"
+#[log::info]
+fn process() {}
+"#,
+        );
+        let annotations = sem.annotations();
+        let logging_anns: Vec<_> = annotations.iter()
+            .filter(|a| matches!(a.annotation_type, AnnotationType::Logging))
+            .collect();
+        assert!(!logging_anns.is_empty(), "Expected logging annotation");
+    }
+
+    #[test]
+    fn rust_retry_attribute_classified() {
+        let sem = parse_rust(
+            r#"
+#[retry]
+fn fetch() -> Result<T, E> {}
+"#,
+        );
+        let annotations = sem.annotations();
+        let retry_anns: Vec<_> = annotations.iter()
+            .filter(|a| matches!(a.annotation_type, AnnotationType::Retry))
+            .collect();
+        assert!(!retry_anns.is_empty(), "Expected retry annotation");
+    }
+}
+

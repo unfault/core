@@ -50,6 +50,31 @@ pub struct BareCatchClause {
     pub location: AstLocation,
 }
 
+/// Information about a try-catch block in TypeScript code.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TryCatchBlock {
+    /// 1-based line number where the try block starts
+    pub line: u32,
+    /// 1-based column number
+    pub column: u32,
+    /// The text of the catch block
+    pub catch_text: String,
+    /// Whether the catch block has logging
+    pub has_logging: bool,
+    /// Whether the error is re-raised
+    pub has_reraise: bool,
+    /// Name of the enclosing function, if any
+    pub function_name: Option<String>,
+    /// Name of enclosing class, if any
+    pub class_name: Option<String>,
+    /// Start byte offset of the entire try-catch
+    pub start_byte: usize,
+    /// End byte offset of the entire try-catch
+    pub end_byte: usize,
+    /// Location information
+    pub location: AstLocation,
+}
+
 /// Semantic model for a single TypeScript file.
 /// Framework-agnostic core + optional framework-specific views.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,6 +130,9 @@ pub struct TsFileSemantics {
 
     /// Database operations (Prisma, TypeORM, Knex, Sequelize, Drizzle, etc.)
     pub db_operations: Vec<DbOperation>,
+
+    /// Try-catch blocks
+    pub try_catches: Vec<TryCatchBlock>,
 }
 
 /// Async operation in TypeScript/JavaScript code.
@@ -221,6 +249,8 @@ pub struct TsFunction {
     pub location: AstLocation,
     /// Whether this function has a try-catch block
     pub has_try_catch: bool,
+    /// Decorators on this function
+    pub decorators: Vec<String>,
     /// Calls made inside this function
     pub inner_calls: Vec<String>,
     /// Start byte offset for patching
@@ -485,6 +515,7 @@ impl TsFileSemantics {
             global_mutable_state: Vec::new(),
             async_operations: Vec::new(),
             db_operations: Vec::new(),
+            try_catches: Vec::new(),
         };
 
         if parsed.language == Language::Typescript {
@@ -530,6 +561,7 @@ impl TsFileSemantics {
 struct TraversalContext {
     in_loop: bool,
     current_function: Option<String>,
+    current_class: Option<String>,
     current_qualified_name: Option<String>,
 }
 
@@ -552,6 +584,15 @@ fn walk_nodes_with_context(
         "for_statement" | "for_in_statement" | "while_statement" | "do_statement" => {
             TraversalContext {
                 in_loop: true,
+                ..ctx.clone()
+            }
+        }
+        "class_declaration" => {
+            let class_name = node
+                .child_by_field_name("name")
+                .map(|n| parsed.text_for_node(&n));
+            TraversalContext {
+                current_class: class_name,
                 ..ctx.clone()
             }
         }
@@ -866,6 +907,7 @@ fn build_function(parsed: &ParsedFile, node: &tree_sitter::Node) -> Option<TsFun
         return_type,
         location,
         has_try_catch,
+        decorators: Vec::new(),
         inner_calls: Vec::new(),
         start_byte: node.start_byte(),
         end_byte: node.end_byte(),
@@ -903,6 +945,7 @@ fn build_arrow_function(parsed: &ParsedFile, node: &tree_sitter::Node, name: &st
         return_type,
         location,
         has_try_catch,
+        decorators: Vec::new(),
         inner_calls: Vec::new(),
         start_byte: node.start_byte(),
         end_byte: node.end_byte(),
@@ -1053,11 +1096,9 @@ fn build_class(parsed: &ParsedFile, node: &tree_sitter::Node) -> Option<TsClass>
 fn extract_decorators(parsed: &ParsedFile, node: &tree_sitter::Node) -> Vec<String> {
     let mut decorators = Vec::new();
 
-    // Check parent for decorator
     if let Some(parent) = node.parent() {
         if parent.kind() == "export_statement" {
             if let Some(grandparent) = parent.parent() {
-                // Look for decorators in siblings before this node
                 for i in 0..grandparent.child_count() {
                     if let Some(sibling) = grandparent.child(i) {
                         if sibling.kind() == "decorator" {
@@ -1066,10 +1107,17 @@ fn extract_decorators(parsed: &ParsedFile, node: &tree_sitter::Node) -> Vec<Stri
                     }
                 }
             }
+        } else if parent.kind() == "class_body" {
+            for i in 0..parent.child_count() {
+                if let Some(sibling) = parent.child(i) {
+                    if sibling.kind() == "decorator" {
+                        decorators.push(parsed.text_for_node(&sibling));
+                    }
+                }
+            }
         }
     }
 
-    // Also check direct children
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i) {
             if child.kind() == "decorator" {
@@ -1332,10 +1380,8 @@ fn check_catch_clause(
     let text = parsed.text_for_node(node);
     let range = node.range();
 
-    // Check if catch has parameter (not bare)
     let has_parameter = node.child_by_field_name("parameter").is_some();
 
-    // Check if catch body is empty
     let is_empty = if let Some(body) = node.child_by_field_name("body") {
         body.named_child_count() == 0
     } else {
@@ -1363,10 +1409,37 @@ fn check_catch_clause(
             start_byte: node.start_byte(),
             end_byte: node.end_byte(),
             catch_keyword_start: node.start_byte(),
-            catch_keyword_end: node.start_byte() + 5, // "catch"
-            location,
+            catch_keyword_end: node.start_byte() + 5,
+            location: location.clone(),
         });
     }
+
+    let catch_body = node.child_by_field_name("body");
+    let catch_body_text = catch_body.map(|b| parsed.text_for_node(&b)).unwrap_or_default();
+    let has_logging = catch_body_text.contains("console.error")
+        || catch_body_text.contains("console.warn")
+        || catch_body_text.contains("logger")
+        || catch_body_text.contains("log.")
+        || catch_body_text.contains("winston")
+        || catch_body_text.contains("pino")
+        || catch_body_text.contains("bunyan");
+
+    let catch_text = text.lines().next().unwrap_or(&text).to_string();
+    let has_reraise = text.contains("throw")
+        && text.lines().any(|line| line.trim_start().starts_with("throw"));
+
+    sem.try_catches.push(TryCatchBlock {
+        line: range.start_point.row as u32 + 1,
+        column: range.start_point.column as u32 + 1,
+        catch_text,
+        has_logging,
+        has_reraise,
+        function_name: ctx.current_function.clone(),
+        class_name: ctx.current_class.clone(),
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        location: location.clone(),
+    });
 }
 
 /// Detect if a call is an async operation (Promise.all, Promise.race, setTimeout, etc.)

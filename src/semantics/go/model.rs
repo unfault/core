@@ -27,6 +27,27 @@ pub struct UncheckedError {
     pub location: AstLocation,
 }
 
+/// Information about a defer-recover pattern in Go code.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeferRecover {
+    /// 1-based line number
+    pub line: u32,
+    /// 1-based column number
+    pub column: u32,
+    /// The text of the defer statement
+    pub defer_text: String,
+    /// Whether the recover has logging/context
+    pub has_logging: bool,
+    /// Name of the enclosing function
+    pub function_name: Option<String>,
+    /// Start byte offset
+    pub start_byte: usize,
+    /// End byte offset
+    pub end_byte: usize,
+    /// Location information
+    pub location: AstLocation,
+}
+
 /// Information about a goroutine spawn.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GoroutineSpawn {
@@ -226,6 +247,9 @@ pub struct GoFileSemantics {
 
     /// Database operations (database/sql, GORM, sqlx, etc.)
     pub db_operations: Vec<DbOperation>,
+
+    /// Defer-recover patterns (error handling in Go)
+    pub defer_recovers: Vec<DeferRecover>,
 }
 
 /// Information about a mutex operation (Lock/Unlock, RLock/RUnlock).
@@ -397,6 +421,7 @@ impl GoFileSemantics {
             mutex_operations: Vec::new(),
             go_framework: None,
             db_operations: Vec::new(),
+            defer_recovers: Vec::new(),
         };
 
         if parsed.language == Language::Go {
@@ -1315,6 +1340,52 @@ fn build_select_statement(
 fn collect_error_handling(parsed: &ParsedFile, sem: &mut GoFileSemantics) {
     let root = parsed.tree.root_node();
     collect_unchecked_errors(parsed, root, sem, None);
+    collect_defer_recover(parsed, root, sem, None);
+}
+
+/// Collect defer-recover patterns for error handling.
+fn collect_defer_recover(
+    parsed: &ParsedFile,
+    node: tree_sitter::Node,
+    sem: &mut GoFileSemantics,
+    current_fn: Option<String>,
+) {
+    let current_fn = if matches!(node.kind(), "function_declaration" | "method_declaration") {
+        node.child_by_field_name("name")
+            .map(|n| parsed.text_for_node(&n))
+    } else {
+        current_fn
+    };
+
+    if node.kind() == "defer_statement" {
+        let defer_text = parsed.text_for_node(&node);
+        let range = node.range();
+
+        if defer_text.contains("recover()") {
+            let has_logging = defer_text.contains("log.")
+                || defer_text.contains("fmt.")
+                || defer_text.contains("zap")
+                || defer_text.contains("zerolog")
+                || defer_text.contains("slog");
+
+            sem.defer_recovers.push(DeferRecover {
+                line: range.start_point.row as u32 + 1,
+                column: range.start_point.column as u32 + 1,
+                defer_text: defer_text.lines().next().unwrap_or("").to_string(),
+                has_logging,
+                function_name: current_fn.clone(),
+                start_byte: node.start_byte(),
+                end_byte: node.end_byte(),
+                location: parsed.location_for_node(&node),
+            });
+        }
+    }
+
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i) {
+            collect_defer_recover(parsed, child, sem, current_fn.clone());
+        }
+    }
 }
 
 /// Recursively collect unchecked errors.

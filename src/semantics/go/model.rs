@@ -190,6 +190,37 @@ pub struct ContextUsage {
     pub location: AstLocation,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum GoAnnotationType {
+    Json,
+    Yaml,
+    Xml,
+    Protobuf,
+    Validation,
+    Orm,
+    Sql,
+    Generate,
+    BuildConstraint,
+    Linkname,
+    Embed,
+    Linter,
+    Other(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GoAnnotation {
+    pub name: String,
+    pub value: String,
+    pub annotation_type: GoAnnotationType,
+    pub target_field: Option<String>,
+    pub target_type: Option<String>,
+    pub line: u32,
+    pub column: u32,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub location: AstLocation,
+}
+
 /// Semantic model for a single Go file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GoFileSemantics {
@@ -250,6 +281,9 @@ pub struct GoFileSemantics {
 
     /// Defer-recover patterns (error handling in Go)
     pub defer_recovers: Vec<DeferRecover>,
+
+    /// Annotations from struct tags, directives, etc.
+    pub annotations: Vec<GoAnnotation>,
 }
 
 /// Information about a mutex operation (Lock/Unlock, RLock/RUnlock).
@@ -422,10 +456,12 @@ impl GoFileSemantics {
             go_framework: None,
             db_operations: Vec::new(),
             defer_recovers: Vec::new(),
+            annotations: Vec::new(),
         };
 
         if parsed.language == Language::Go {
             collect_semantics(parsed, &mut sem);
+            collect_annotations(parsed, &mut sem);
         }
 
         sem
@@ -1679,6 +1715,209 @@ fn check_for_empty_critical_section(node: tree_sitter::Node, parsed: &ParsedFile
     next_text.contains(".Unlock()") || next_text.contains(".RUnlock()")
 }
 
+fn collect_annotations(parsed: &ParsedFile, sem: &mut GoFileSemantics) {
+    let root = parsed.tree.root_node();
+    collect_struct_tag_annotations(parsed, root, sem);
+    collect_directive_annotations(parsed, root, sem);
+}
+
+fn collect_struct_tag_annotations(parsed: &ParsedFile, node: tree_sitter::Node, sem: &mut GoFileSemantics) {
+    if node.kind() == "struct_type" {
+        let parent = node.parent();
+        if let Some(type_spec) = parent {
+            let type_name = type_spec
+                .child_by_field_name("name")
+                .map(|n| parsed.text_for_node(&n))
+                .unwrap_or_default();
+
+            collect_tags_for_struct(parsed, &node, &type_name, sem);
+        }
+    }
+
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i) {
+            collect_struct_tag_annotations(parsed, child, sem);
+        }
+    }
+}
+
+fn collect_tags_for_struct(parsed: &ParsedFile, struct_node: &tree_sitter::Node, type_name: &str, sem: &mut GoFileSemantics) {
+    for i in 0..struct_node.child_count() {
+        if let Some(child) = struct_node.child(i) {
+            let field_decls: Vec<tree_sitter::Node> = if child.kind() == "field_declaration_list" {
+                (0..child.child_count())
+                    .filter_map(|j| child.child(j))
+                    .filter(|n| n.kind() == "field_declaration")
+                    .collect()
+            } else if child.kind() == "field_declaration" {
+                vec![child]
+            } else {
+                continue;
+            };
+
+            for field_decl in field_decls {
+                let mut field_name = String::new();
+                let mut tag = None;
+
+                for j in 0..field_decl.child_count() {
+                    if let Some(field_child) = field_decl.child(j) {
+                        match field_child.kind() {
+                            "field_identifier" => {
+                                field_name = parsed.text_for_node(&field_child);
+                            }
+                            "interpreted_string_literal" | "raw_string_literal" => {
+                                tag = Some(parsed.text_for_node(&field_child));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
+                if let Some(tag_str) = tag {
+                    let range = field_decl.range();
+                    let location = AstLocation {
+                        file_id: parsed.file_id,
+                        range: crate::parse::ast::TextRange {
+                            start_line: range.start_point.row as u32,
+                            start_col: range.start_point.column as u32,
+                            end_line: range.end_point.row as u32,
+                            end_col: range.end_point.column as u32,
+                        },
+                    };
+                    parse_and_add_tag(parsed, &tag_str, &field_name, type_name, range, location, sem);
+                }
+            }
+        }
+    }
+}
+
+fn parse_and_add_tag(_parsed: &ParsedFile, tag: &str, field_name: &str, type_name: &str, range: tree_sitter::Range, location: AstLocation, sem: &mut GoFileSemantics) {
+    let tag_content = if (tag.starts_with('`') && tag.ends_with('`')) ||
+                         (tag.starts_with('"') && tag.ends_with('"')) {
+        &tag[1..tag.len()-1]
+    } else {
+        tag
+    };
+
+    let re = regex::Regex::new(r#"(\w+):"([^"]*)""#).unwrap();
+    
+    for cap in re.captures_iter(tag_content) {
+        let key = cap.get(1).unwrap().as_str();
+        let value = cap.get(2).unwrap().as_str();
+        
+        let annotation_type = determine_annotation_type(key);
+
+        sem.annotations.push(GoAnnotation {
+            name: key.to_string(),
+            value: value.to_string(),
+            annotation_type,
+            target_field: if field_name.is_empty() { None } else { Some(field_name.to_string()) },
+            target_type: Some(type_name.to_string()),
+            line: range.start_point.row as u32 + 1,
+            column: range.start_point.column as u32 + 1,
+            start_byte: range.start_byte,
+            end_byte: range.end_byte,
+            location: location.clone(),
+        });
+    }
+}
+
+fn determine_annotation_type(key: &str) -> GoAnnotationType {
+    match key.to_lowercase().as_str() {
+        "json" => GoAnnotationType::Json,
+        "yaml" => GoAnnotationType::Yaml,
+        "xml" => GoAnnotationType::Xml,
+        "protobuf" | "proto" => GoAnnotationType::Protobuf,
+        "validate" => GoAnnotationType::Validation,
+        "gorm" => GoAnnotationType::Orm,
+        "sql" => GoAnnotationType::Sql,
+        _ => GoAnnotationType::Other(key.to_string()),
+    }
+}
+
+fn collect_directive_annotations(parsed: &ParsedFile, node: tree_sitter::Node, sem: &mut GoFileSemantics) {
+    if node.kind() == "comment" {
+        let text = parsed.text_for_node(&node);
+        let range = node.range();
+
+        if let Some((name, value)) = parse_go_directive(&text) {
+            let annotation_type = match name.as_str() {
+                "go:generate" => GoAnnotationType::Generate,
+                "go:linkname" => GoAnnotationType::Linkname,
+                "go:embed" => GoAnnotationType::Embed,
+                "+build" | "build" => GoAnnotationType::BuildConstraint,
+                "nolint" | "lint-ignore" | "exported" => GoAnnotationType::Linter,
+                _ => GoAnnotationType::Other(name.clone()),
+            };
+
+            sem.annotations.push(GoAnnotation {
+                name,
+                value,
+                annotation_type,
+                target_field: None,
+                target_type: None,
+                line: range.start_point.row as u32 + 1,
+                column: range.start_point.column as u32 + 1,
+                start_byte: range.start_byte,
+                end_byte: range.end_byte,
+                location: parsed.location_for_node(&node),
+            });
+        }
+    }
+
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i) {
+            collect_directive_annotations(parsed, child, sem);
+        }
+    }
+}
+
+fn parse_go_directive(comment: &str) -> Option<(String, String)> {
+    let comment = comment.trim();
+
+    if !comment.starts_with("//") && !comment.starts_with("/*") {
+        return None;
+    }
+
+    let content = if comment.starts_with("//") {
+        &comment[2..]
+    } else if comment.starts_with("/*") {
+        &comment[2..comment.len().saturating_sub(2)]
+    } else {
+        return None;
+    };
+
+    let content = content.trim();
+
+    if content.starts_with("go:") {
+        let parts: Vec<&str> = content.splitn(2, ' ').collect();
+        if parts.len() >= 2 {
+            return Some((parts[0].to_string(), parts[1].trim().to_string()));
+        }
+        return Some((content.to_string(), String::new()));
+    }
+
+    if content.starts_with("+build") || content.starts_with("build ") {
+        let content = content.trim_start_matches("build ");
+        let parts: Vec<&str> = content.split_whitespace().collect();
+        return Some(("+build".to_string(), parts.join(" ")));
+    }
+
+    if content.starts_with("nolint") || content.starts_with("lint-ignore") || content.starts_with("exported") {
+        let parts: Vec<&str> = content.splitn(2, ' ').collect();
+        if parts.len() >= 2 {
+            return Some((parts[0].to_string(), parts[1].trim().to_string()));
+        }
+        let colon_parts: Vec<&str> = content.splitn(2, ':').collect();
+        if colon_parts.len() >= 2 {
+            return Some((colon_parts[0].to_string(), colon_parts[1].trim().to_string()));
+        }
+        return Some((content.to_string(), String::new()));
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1867,5 +2106,43 @@ func findUsers(db *gorm.DB) []User {
         assert!(!sem.db_operations.is_empty());
         assert_eq!(sem.db_operations[0].library.as_str(), "GORM");
         assert_eq!(sem.db_operations[0].operation_type.as_str(), "SELECT");
+    }
+
+    #[test]
+    fn collects_struct_tag_annotations() {
+        let src = r#"
+package main
+
+type User struct {
+    ID   int    `json:"id" validate:"required"`
+    Name string `yaml:"name" gorm:"primaryKey"`
+    Email string `xml:"email"`
+}
+"#;
+        let sem = parse_and_build_semantics(src);
+        assert!(!sem.annotations.is_empty());
+        assert!(sem.annotations.iter().any(|a| a.name == "json"));
+        assert!(sem.annotations.iter().any(|a| a.name == "validate"));
+        assert!(sem.annotations.iter().any(|a| a.name == "yaml"));
+        assert!(sem.annotations.iter().any(|a| a.name == "gorm"));
+        assert!(sem.annotations.iter().any(|a| a.name == "xml"));
+    }
+
+    #[test]
+    fn collects_go_directive_annotations() {
+        let src = r#"
+package main
+
+//go:generate mockgen -destination=mocks/mock.go github.com/example MyInterface
+//+build linux amd64
+//nolint:unused
+
+func main() {}
+"#;
+        let sem = parse_and_build_semantics(src);
+        assert!(!sem.annotations.is_empty());
+        assert!(sem.annotations.iter().any(|a| a.name == "go:generate"));
+        assert!(sem.annotations.iter().any(|a| a.name == "+build"));
+        assert!(sem.annotations.iter().any(|a| a.name == "nolint"));
     }
 }

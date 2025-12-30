@@ -801,7 +801,50 @@ impl CommonSemantics for GoFileSemantics {
     }
 
     fn annotations(&self) -> Vec<Annotation> {
-        Vec::new()
+        use super::go::model::GoAnnotationType;
+
+        let mut annotations = Vec::new();
+
+        for ann in &self.annotations {
+            let annotation_type = match &ann.annotation_type {
+                GoAnnotationType::Json => AnnotationType::Other("json".to_string()),
+                GoAnnotationType::Yaml => AnnotationType::Other("yaml".to_string()),
+                GoAnnotationType::Xml => AnnotationType::Other("xml".to_string()),
+                GoAnnotationType::Protobuf => AnnotationType::Other("protobuf".to_string()),
+                GoAnnotationType::Validation => AnnotationType::Validation { library: "go-validate".to_string() },
+                GoAnnotationType::Orm => AnnotationType::Other("orm".to_string()),
+                GoAnnotationType::Sql => AnnotationType::Other("sql".to_string()),
+                GoAnnotationType::Generate => AnnotationType::Other("go:generate".to_string()),
+                GoAnnotationType::BuildConstraint => AnnotationType::Other("build".to_string()),
+                GoAnnotationType::Linkname => AnnotationType::Other("go:linkname".to_string()),
+                GoAnnotationType::Embed => AnnotationType::Other("go:embed".to_string()),
+                GoAnnotationType::Linter => AnnotationType::Other("linter".to_string()),
+                GoAnnotationType::Other(name) => AnnotationType::Other(name.clone()),
+            };
+
+            let target_function = ann.target_field.clone()
+                .or(ann.target_type.clone())
+                .unwrap_or_default();
+
+            annotations.push(Annotation::new(
+                ann.name.clone(),
+                annotation_type,
+                target_function,
+                &self.path,
+            ).with_location(
+                CommonLocation {
+                    file_id: self.file_id,
+                    line: ann.location.range.start_line + 1,
+                    column: ann.location.range.start_col + 1,
+                    start_byte: ann.start_byte,
+                    end_byte: ann.end_byte,
+                },
+                ann.start_byte,
+                ann.end_byte,
+            ));
+        }
+
+        annotations
     }
 
     fn route_patterns(&self) -> Vec<RoutePattern> {

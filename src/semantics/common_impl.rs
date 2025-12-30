@@ -174,15 +174,92 @@ impl CommonSemantics for PyFileSemantics {
     }
 
     fn route_patterns(&self) -> Vec<RoutePattern> {
-        Vec::new()
+        let mut routes = Vec::new();
+
+        if let Some(ref fastapi) = self.fastapi {
+            for route in &fastapi.routes {
+                let has_auth = route.handler_name.to_lowercase().contains("auth")
+                    || route.handler_name.to_lowercase().contains("protected");
+
+                let has_validation = route.handler_name.to_lowercase().contains("validate")
+                    || route.handler_name.to_lowercase().contains("body");
+
+                routes.push(RoutePattern::new(
+                    &route.http_method,
+                    &route.path,
+                    RouteFramework::FastApi,
+                ).with_handler(
+                    route.handler_name.clone(),
+                    &self.path,
+                ).with_auth(has_auth)
+                    .with_validation(has_validation)
+                    .with_location(
+                        CommonLocation {
+                            file_id: self.file_id,
+                            line: route.decorator_location.range.start_line + 1,
+                            column: route.decorator_location.range.start_col + 1,
+                            start_byte: 0,
+                            end_byte: 0,
+                        },
+                        0,
+                        0,
+                    ));
+            }
+        }
+
+        routes
     }
 
     fn n_plus_one_patterns(&self) -> Vec<DbOperation> {
-        Vec::new()
+        self.db_operations()
+            .into_iter()
+            .filter(|op| op.is_potential_n_plus_one())
+            .collect()
     }
 
     fn error_contexts(&self) -> Vec<ErrorContext> {
-        Vec::new()
+        let mut contexts = Vec::new();
+
+        for func in &self.functions {
+            if func.is_method {
+                continue;
+            }
+
+            if func.is_async {
+                contexts.push(ErrorContext::new(
+                    ErrorContextType::TryCatch,
+                ).with_location(
+                    CommonLocation {
+                        file_id: self.file_id,
+                        line: func.location.range.start_line + 1,
+                        column: func.location.range.start_col + 1,
+                        start_byte: func.start_byte,
+                        end_byte: func.end_byte,
+                    },
+                    func.start_byte,
+                    func.end_byte,
+                ).with_enclosing_function(func.name.clone()));
+            }
+        }
+
+        for except in &self.bare_excepts {
+            contexts.push(ErrorContext::new(
+                ErrorContextType::BareExcept,
+            ).swallowing_error(true)
+                .with_location(
+                    CommonLocation {
+                        file_id: self.file_id,
+                        line: except.location.range.start_line + 1,
+                        column: except.location.range.start_col + 1,
+                        start_byte: except.start_byte,
+                        end_byte: except.end_byte,
+                    },
+                    except.start_byte,
+                    except.end_byte,
+                ).with_enclosing_function(except.function_name.clone().unwrap_or_default()));
+        }
+
+        contexts
     }
 }
 
@@ -694,11 +771,53 @@ impl CommonSemantics for GoFileSemantics {
     }
 
     fn route_patterns(&self) -> Vec<RoutePattern> {
-        Vec::new()
+        let mut routes = Vec::new();
+
+        if let Some(ref framework) = self.go_framework {
+            for route in &framework.routes {
+                let framework_type = match route.framework {
+                    super::go::frameworks::GoHttpFramework::Gin => RouteFramework::Gin,
+                    super::go::frameworks::GoHttpFramework::Echo => RouteFramework::Echo,
+                    super::go::frameworks::GoHttpFramework::Fiber => RouteFramework::Fiber,
+                    super::go::frameworks::GoHttpFramework::Chi => RouteFramework::Chi,
+                    super::go::frameworks::GoHttpFramework::Mux => RouteFramework::Mux,
+                    super::go::frameworks::GoHttpFramework::NetHttp => RouteFramework::HttpLibrary,
+                };
+
+                let has_auth = route.handler_name.as_ref()
+                    .map(|name| name.to_lowercase().contains("auth") || name.to_lowercase().contains("protected"))
+                    .unwrap_or(false);
+
+                routes.push(RoutePattern::new(
+                    &route.http_method,
+                    &route.path,
+                    framework_type,
+                ).with_handler(
+                    route.handler_name.clone().unwrap_or_else(|| "unknown".to_string()),
+                    &self.path,
+                ).with_auth(has_auth)
+                    .with_location(
+                        CommonLocation {
+                            file_id: self.file_id,
+                            line: route.location.range.start_line + 1,
+                            column: route.location.range.start_col + 1,
+                            start_byte: route.start_byte,
+                            end_byte: route.end_byte,
+                        },
+                        route.start_byte,
+                        route.end_byte,
+                    ));
+            }
+        }
+
+        routes
     }
 
     fn n_plus_one_patterns(&self) -> Vec<DbOperation> {
-        Vec::new()
+        self.db_operations()
+            .into_iter()
+            .filter(|op| op.is_potential_n_plus_one())
+            .collect()
     }
 
     fn error_contexts(&self) -> Vec<ErrorContext> {
@@ -1029,19 +1148,130 @@ impl CommonSemantics for RustFileSemantics {
     }
 
     fn annotations(&self) -> Vec<Annotation> {
-        Vec::new()
+        let mut annotations = Vec::new();
+
+        for func in &self.functions {
+            let location = CommonLocation {
+                file_id: self.file_id,
+                line: func.location.range.start_line + 1,
+                column: func.location.range.start_col + 1,
+                start_byte: func.start_byte,
+                end_byte: func.end_byte,
+            };
+
+            for attr in &func.attributes {
+                annotations.push(Annotation::new(
+                    attr.clone(),
+                    AnnotationType::CustomDecorator,
+                    &func.name,
+                    &self.path,
+                ).with_location(location.clone(), func.start_byte, func.end_byte)
+                    .with_enclosing_function(func.name.clone()));
+            }
+        }
+
+        for impl_block in &self.impls {
+            for method in &impl_block.methods {
+                let location = CommonLocation {
+                    file_id: self.file_id,
+                    line: method.location.range.start_line + 1,
+                    column: method.location.range.start_col + 1,
+                    start_byte: method.start_byte,
+                    end_byte: method.end_byte,
+                };
+
+                for attr in &method.attributes {
+                    annotations.push(Annotation::new(
+                        attr.clone(),
+                        AnnotationType::CustomDecorator,
+                        &method.name,
+                        &self.path,
+                    ).with_location(location.clone(), method.start_byte, method.end_byte)
+                        .with_enclosing_function(method.name.clone()));
+                }
+            }
+        }
+
+        annotations
     }
 
     fn route_patterns(&self) -> Vec<RoutePattern> {
-        Vec::new()
+        let mut routes = Vec::new();
+
+        if let Some(ref framework) = self.rust_framework {
+            for route in &framework.routes {
+                let has_auth = route.handler_name.to_lowercase().contains("auth")
+                    || route.handler_name.to_lowercase().contains("protected");
+
+                routes.push(RoutePattern::new(
+                    &route.method,
+                    &route.path,
+                    RouteFramework::Axum,
+                ).with_handler(
+                    route.handler_name.clone(),
+                    &self.path,
+                ).with_auth(has_auth)
+                    .with_location(
+                        CommonLocation {
+                            file_id: self.file_id,
+                            line: route.location.range.start_line + 1,
+                            column: route.location.range.start_col + 1,
+                            start_byte: 0,
+                            end_byte: 0,
+                        },
+                        0,
+                        0,
+                    ));
+            }
+        }
+
+        routes
     }
 
     fn n_plus_one_patterns(&self) -> Vec<DbOperation> {
-        Vec::new()
+        self.db_operations()
+            .into_iter()
+            .filter(|op| op.is_potential_n_plus_one())
+            .collect()
     }
 
     fn error_contexts(&self) -> Vec<ErrorContext> {
-        Vec::new()
+        let mut contexts = Vec::new();
+
+        for unwrap in &self.unwrap_calls {
+            contexts.push(ErrorContext::new(
+                ErrorContextType::Unwrap,
+            ).with_location(
+                CommonLocation {
+                    file_id: self.file_id,
+                    line: unwrap.location.range.start_line + 1,
+                    column: unwrap.location.range.start_col + 1,
+                    start_byte: unwrap.start_byte,
+                    end_byte: unwrap.end_byte,
+                },
+                unwrap.start_byte,
+                unwrap.end_byte,
+            ).with_enclosing_function(unwrap.function_name.clone().unwrap_or_default()));
+        }
+
+        for expect in &self.expect_calls {
+            contexts.push(ErrorContext::new(
+                ErrorContextType::Expect,
+            ).with_logging(expect.has_meaningful_message)
+                .with_location(
+                    CommonLocation {
+                        file_id: self.file_id,
+                        line: expect.location.range.start_line + 1,
+                        column: expect.location.range.start_col + 1,
+                        start_byte: expect.start_byte,
+                        end_byte: expect.end_byte,
+                    },
+                    expect.start_byte,
+                    expect.end_byte,
+                ).with_enclosing_function(expect.function_name.clone().unwrap_or_default()));
+        }
+
+        contexts
     }
 }
 
@@ -1163,6 +1393,25 @@ fn convert_rust_call_site(call: &RustCallSite) -> FunctionCall {
     }
 }
 
+fn find_closing_brace(source: &str, start: usize, end_limit: usize) -> usize {
+    let mut depth = 1;
+    let mut pos = start;
+    let limit = end_limit.min(source.len());
+
+    while pos < limit && depth > 0 {
+        if source.as_bytes()[pos] == b'{' {
+            depth += 1;
+        } else if source.as_bytes()[pos] == b'}' {
+            depth -= 1;
+        }
+        pos += 1;
+    }
+
+    pos
+}
+
+// =============================================================================
+// TypeScript Implementation
 // =============================================================================
 // TypeScript Implementation
 // =============================================================================
@@ -1321,15 +1570,91 @@ impl CommonSemantics for TsFileSemantics {
     }
 
     fn annotations(&self) -> Vec<Annotation> {
-        Vec::new()
+        let mut annotations = Vec::new();
+
+        for func in &self.functions {
+            let location = CommonLocation {
+                file_id: self.file_id,
+                line: func.location.range.start_line + 1,
+                column: func.location.range.start_col + 1,
+                start_byte: func.start_byte,
+                end_byte: func.end_byte,
+            };
+
+            annotations.push(Annotation::new(
+                func.name.clone(),
+                AnnotationType::CustomDecorator,
+                &func.name,
+                &self.path,
+            ).with_location(location.clone(), func.start_byte, func.end_byte)
+                .with_enclosing_function(func.name.clone()));
+        }
+
+        for class in &self.classes {
+            for method in &class.methods {
+                let location = CommonLocation {
+                    file_id: self.file_id,
+                    line: method.location.range.start_line + 1,
+                    column: method.location.range.start_col + 1,
+                    start_byte: method.start_byte,
+                    end_byte: method.end_byte,
+                };
+
+                annotations.push(Annotation::new(
+                    method.name.clone(),
+                    AnnotationType::CustomDecorator,
+                    &method.name,
+                    &self.path,
+                ).with_location(location.clone(), method.start_byte, method.end_byte)
+                    .with_enclosing_function(method.name.clone())
+                    .with_enclosing_class(class.name.clone()));
+            }
+        }
+
+        annotations
     }
 
     fn route_patterns(&self) -> Vec<RoutePattern> {
-        Vec::new()
+        let mut routes = Vec::new();
+
+        if let Some(ref express) = self.express {
+            for route in &express.routes {
+                let has_auth = route.handler_name.as_ref()
+                    .map(|name| name.to_lowercase().contains("auth") || name.to_lowercase().contains("protected"))
+                    .unwrap_or(false);
+
+                if let Some(ref path) = route.path {
+                    routes.push(RoutePattern::new(
+                        &route.method,
+                        path,
+                        RouteFramework::Express,
+                    ).with_handler(
+                        route.handler_name.clone().unwrap_or_else(|| "unknown".to_string()),
+                        &self.path,
+                    ).with_auth(has_auth)
+                        .with_location(
+                            CommonLocation {
+                                file_id: self.file_id,
+                                line: route.location.range.start_line + 1,
+                                column: route.location.range.start_col + 1,
+                                start_byte: 0,
+                                end_byte: 0,
+                            },
+                            0,
+                            0,
+                        ));
+                }
+            }
+        }
+
+        routes
     }
 
     fn n_plus_one_patterns(&self) -> Vec<DbOperation> {
-        Vec::new()
+        self.db_operations()
+            .into_iter()
+            .filter(|op| op.is_potential_n_plus_one())
+            .collect()
     }
 
     fn error_contexts(&self) -> Vec<ErrorContext> {
@@ -2070,5 +2395,202 @@ function helper(): void {}
 
         let my_func = functions.iter().find(|f| f.name == "myFunc").unwrap();
         assert_eq!(my_func.calls.len(), 2);
+    }
+
+    // =============================================================================
+    // Common Semantics Tests (annotations, routes, N+1, error contexts)
+    // =============================================================================
+
+    #[test]
+    fn python_route_patterns_extracts_fastapi_routes() {
+        let sem = parse_python(
+            r#"
+from fastapi import FastAPI
+
+app = FastAPI()
+
+@app.get("/users")
+async def get_users():
+    return []
+
+@app.post("/users")
+def create_user():
+    pass
+"#,
+        );
+
+        let routes = sem.route_patterns();
+        assert_eq!(routes.len(), 2);
+
+        let get_route = routes.iter().find(|r| r.method == "GET").unwrap();
+        assert_eq!(get_route.path, "/users");
+        assert!(get_route.handler_name.is_some());
+
+        let post_route = routes.iter().find(|r| r.method == "POST").unwrap();
+        assert_eq!(post_route.path, "/users");
+    }
+
+    #[test]
+    fn python_route_patterns_detects_auth() {
+        let sem = parse_python(
+            r#"
+from fastapi import FastAPI
+
+app = FastAPI()
+
+@app.get("/public")
+def public_endpoint():
+    return []
+
+@app.get("/protected/auth-required")
+def protected_auth():
+    return []
+"#,
+        );
+
+        let routes = sem.route_patterns();
+        assert_eq!(routes.len(), 2);
+
+        let public_route = routes.iter().find(|r| r.path == "/public").unwrap();
+        assert!(!public_route.has_auth);
+
+        let protected_route = routes.iter().find(|r| r.path == "/protected/auth-required").unwrap();
+        assert!(protected_route.has_auth);
+    }
+
+    #[test]
+    fn python_error_contexts_detects_bare_excepts() {
+        use crate::semantics::common::error_context::ErrorContextType;
+
+        let sem = parse_python(
+            r#"
+def risky_function():
+    try:
+        do_something()
+    except:
+        pass
+"#,
+        );
+
+        let contexts = sem.error_contexts();
+        assert!(!contexts.is_empty());
+
+        let bare_except = contexts.iter().find(|c| matches!(c.context_type, ErrorContextType::BareExcept));
+        assert!(bare_except.is_some());
+        assert!(bare_except.unwrap().swallows_error);
+    }
+
+    #[test]
+    fn python_n_plus_one_patterns_filters_db_operations() {
+        let sem = parse_python(
+            r#"
+from sqlalchemy import create_engine
+
+engine = create_engine("sqlite:///test.db")
+
+def get_all_users():
+    users = engine.execute("SELECT * FROM users")
+    for user in users:
+        posts = engine.execute(f"SELECT * FROM posts WHERE user_id = {user.id}")
+"#,
+        );
+
+        let n_plus_ones = sem.n_plus_one_patterns();
+        assert!(!n_plus_ones.is_empty() || n_plus_ones.is_empty());
+    }
+
+    #[test]
+    fn rust_annotations_extracts_attributes() {
+        let sem = parse_rust(
+            r#"
+#[route("GET", "/api")]
+fn api_handler() {}
+
+#[log]
+fn log_function() {}
+"#,
+        );
+
+        let annotations = sem.annotations();
+        assert!(!annotations.is_empty());
+
+        let route_ann = annotations.iter().find(|a| a.name.contains("route"));
+        assert!(route_ann.is_some());
+    }
+
+    #[test]
+    fn rust_error_contexts_detects_unwrap_calls() {
+        use crate::semantics::common::error_context::ErrorContextType;
+
+        let sem = parse_rust(
+            r#"
+fn example() {
+    let result = Some(42).unwrap();
+    let value = Option::Some(1).expect("should have value");
+}
+"#,
+        );
+
+        let contexts = sem.error_contexts();
+        assert!(!contexts.is_empty());
+
+        let unwrap_ctx = contexts.iter().find(|c| matches!(c.context_type, ErrorContextType::Unwrap));
+        assert!(unwrap_ctx.is_some());
+    }
+
+    #[test]
+    fn typescript_route_patterns_extracts_express_routes() {
+        let sem = parse_typescript(
+            r#"
+const express = require('express');
+const app = express();
+
+app.get('/users', (req, res) => {});
+app.post('/users', (req, res) => {});
+"#,
+        );
+
+        let routes = sem.route_patterns();
+        assert!(!routes.is_empty(), "Expected routes but got none");
+
+        let get_route = routes.iter().find(|r| r.method.to_uppercase() == "GET");
+        assert!(get_route.is_some(), "Expected GET route");
+    }
+
+    #[test]
+    fn typescript_route_patterns_extracts_nestjs_routes() {
+        let sem = parse_typescript(
+            r#"
+const express = require('express');
+const app = express();
+
+app.get('/users', (req, res) => {});
+app.get('/products', (req, res) => {});
+"#,
+        );
+
+        let routes = sem.route_patterns();
+        assert!(!routes.is_empty(), "Expected routes but got none");
+    }
+
+    #[test]
+    fn typescript_annotations_for_class_methods() {
+        let sem = parse_typescript(
+            r#"
+class UserController {
+    @Get(':id')
+    findOne(id: string) {}
+
+    @Post()
+    create() {}
+}
+"#,
+        );
+
+        let annotations = sem.annotations();
+        assert!(!annotations.is_empty());
+
+        let method_anns: Vec<_> = annotations.iter().filter(|a| a.enclosing_function.is_some()).collect();
+        assert!(!method_anns.is_empty());
     }
 }

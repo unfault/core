@@ -697,6 +697,20 @@ pub fn build_code_graph(sem_entries: &[(FileId, Arc<SourceSemantics>)]) -> CodeG
 
             // Process each call site
             for call in &func.calls {
+                // Skip method calls on objects (e.g., db.add(), obj.method())
+                // These are NOT calls to local functions with the same name.
+                // We only want to match:
+                // 1. Simple function calls: foo() where callee_expr == callee
+                // 2. Self method calls: self.method() where receiver is "self"
+                if let Some(ref receiver) = call.receiver {
+                    // This is a method call on some object
+                    // Only match if it's a self/this call (could be calling another method in same class)
+                    if receiver != "self" && receiver != "this" {
+                        // Call like db.add() or service.process() - skip intra-file matching
+                        continue;
+                    }
+                }
+
                 // Try to find callee in the same file (intra-file call resolution)
                 let callee_key = (*file_id, call.callee.clone());
                 if let Some(&callee_node) = cg.function_nodes.get(&callee_key) {
@@ -764,15 +778,30 @@ fn add_cross_file_call_edges(
 
             // Process each call site
             for call in &func.calls {
-                // Skip if already resolved intra-file
-                let callee_key = (*file_id, call.callee.clone());
-                if cg.function_nodes.contains_key(&callee_key) {
+                // Skip if this was already resolved as an intra-file call
+                // A call was resolved intra-file if:
+                // 1. It's a simple call (no receiver) AND the callee exists in this file
+                // 2. It's a self/this method call AND the callee exists in this file
+                let was_resolved_intra_file = {
+                    let callee_key = (*file_id, call.callee.clone());
+                    let callee_exists_in_file = cg.function_nodes.contains_key(&callee_key);
+                    
+                    if let Some(ref receiver) = call.receiver {
+                        // Method call - only resolved intra-file if self/this
+                        callee_exists_in_file && (receiver == "self" || receiver == "this")
+                    } else {
+                        // Simple call - resolved intra-file if callee exists
+                        callee_exists_in_file
+                    }
+                };
+                
+                if was_resolved_intra_file {
                     continue;
                 }
 
                 // Try to resolve through imports (with file path context for relative imports)
                 if let Some(callee_node) =
-                    resolve_call_through_imports(cg, &call.callee, &call.callee_expr, imports, file_path)
+                    resolve_call_through_imports(cg, &call.callee, &call.callee_expr, call.receiver.as_deref(), imports, file_path)
                 {
                     cg.graph
                         .add_edge(caller_node, callee_node, GraphEdgeKind::Calls);
@@ -791,29 +820,37 @@ fn add_cross_file_call_edges(
 /// * `cg` - The code graph containing file and function nodes
 /// * `callee` - The simple function name being called (e.g., "add")
 /// * `callee_expr` - The full call expression (e.g., "utils.add" or just "add")
+/// * `receiver` - The receiver/object if this is a method call (e.g., Some("db") for db.add())
 /// * `imports` - The list of imports in the calling file
 /// * `importing_file_path` - The path of the file making the call (for relative import resolution)
 fn resolve_call_through_imports(
     cg: &CodeGraph,
     callee: &str,
     callee_expr: &str,
+    receiver: Option<&str>,
     imports: &[Import],
     importing_file_path: &str,
 ) -> Option<NodeIndex> {
     // Strategy 1: Direct import match
     // e.g., `from utils import process` then call `process()`
     // or `from .utils import add` then call `add()`
-    for import in imports {
-        // Check if the callee is a directly imported item
-        if import.imports_item(callee) {
-            // Find the source file for this import, with context for relative imports
-            if let Some(source_file_idx) = find_import_source_file_with_context(cg, &import.module_path, importing_file_path) {
-                // Get the file_id from the source file node
-                if let GraphNode::File { file_id, .. } = &cg.graph[source_file_idx] {
-                    // Look for the function in that file
-                    let callee_key = (*file_id, callee.to_string());
-                    if let Some(&func_node) = cg.function_nodes.get(&callee_key) {
-                        return Some(func_node);
+    //
+    // IMPORTANT: Only use this strategy for simple function calls (no receiver).
+    // If there's a receiver (e.g., db.add()), this is a method call on an object,
+    // NOT a call to an imported function named "add".
+    if receiver.is_none() {
+        for import in imports {
+            // Check if the callee is a directly imported item
+            if import.imports_item(callee) {
+                // Find the source file for this import, with context for relative imports
+                if let Some(source_file_idx) = find_import_source_file_with_context(cg, &import.module_path, importing_file_path) {
+                    // Get the file_id from the source file node
+                    if let GraphNode::File { file_id, .. } = &cg.graph[source_file_idx] {
+                        // Look for the function in that file
+                        let callee_key = (*file_id, callee.to_string());
+                        if let Some(&func_node) = cg.function_nodes.get(&callee_key) {
+                            return Some(func_node);
+                        }
                     }
                 }
             }
@@ -823,6 +860,10 @@ fn resolve_call_through_imports(
     // Strategy 2: Module attribute access
     // e.g., `import utils` then call `utils.process()`
     // The callee_expr would be "utils.process" and callee would be "process"
+    //
+    // This only applies when the receiver matches an imported module name.
+    // For calls like `db.add()` where `db` is a local variable (not an imported module),
+    // this will correctly not match.
     if callee_expr.contains('.') {
         let parts: Vec<&str> = callee_expr.split('.').collect();
         if parts.len() >= 2 {
@@ -2604,5 +2645,103 @@ def main():
         // With context, relative import should succeed
         let result = find_import_source_file_with_context(&cg, ".utils", "app.py");
         assert!(result.is_some(), "Expected to find utils.py via relative import from app.py");
+    }
+
+    #[test]
+    fn method_call_does_not_match_local_function_with_same_name() {
+        // This test verifies that db.add() does NOT create a Calls edge to a local add() function.
+        // This was a bug where we incorrectly matched on just the function name "add",
+        // ignoring that the call was actually a method call on an object "db".
+        
+        let src = r#"
+def add(a, b):
+    return a + b
+
+def process(db):
+    # This should NOT create a Calls edge to the local add() function
+    # because this is calling db.add(), not add()
+    db.add(item)
+    
+    # This SHOULD create a Calls edge to the local add() function
+    result = add(1, 2)
+"#;
+        let (file_id, sem) = parse_and_build_semantics("test.py", src);
+        let sem_entries = vec![(file_id, sem)];
+        let cg = build_code_graph(&sem_entries);
+
+        // Verify both functions exist
+        assert!(cg.function_nodes.contains_key(&(file_id, "add".to_string())));
+        assert!(cg.function_nodes.contains_key(&(file_id, "process".to_string())));
+
+        // Get the function nodes
+        let add_func_idx = cg.function_nodes.get(&(file_id, "add".to_string())).expect("add function should exist");
+        let process_func_idx = cg.function_nodes.get(&(file_id, "process".to_string())).expect("process function should exist");
+
+        // Count Calls edges from process() to add()
+        let mut calls_count = 0;
+        for edge in cg.graph.edges(*process_func_idx) {
+            if matches!(edge.weight(), GraphEdgeKind::Calls) {
+                if edge.target() == *add_func_idx {
+                    calls_count += 1;
+                }
+            }
+        }
+
+        // Should have exactly 1 Calls edge (for the direct add(1, 2) call),
+        // NOT 2 (which would happen if db.add() also matched)
+        assert_eq!(calls_count, 1, 
+            "Expected exactly 1 Calls edge from process() to add() (for the direct call), but got {}. \
+            The db.add() method call should NOT create an edge to the local add() function.",
+            calls_count);
+    }
+
+    #[test]
+    fn method_call_does_not_match_imported_function_with_same_name() {
+        // This test verifies that db.add() does NOT create a Calls edge to an imported add() function.
+        
+        // utils.py defines add()
+        let utils_src = r#"
+def add(a, b):
+    return a + b
+"#;
+        let (utils_id, utils_sem) = parse_python_with_id("utils.py", utils_src, 1);
+
+        // app.py imports add() but also calls db.add()
+        let app_src = r#"
+from .utils import add
+
+def process(db):
+    # This should NOT create a Calls edge to utils.add()
+    # because this is calling db.add(), not add()
+    db.add(item)
+    
+    # This SHOULD create a Calls edge to utils.add()
+    result = add(1, 2)
+"#;
+        let (app_id, app_sem) = parse_python_with_id("app.py", app_src, 2);
+
+        let sem_entries = vec![(utils_id, utils_sem), (app_id, app_sem)];
+        let cg = build_code_graph(&sem_entries);
+
+        // Get the function nodes
+        let add_func_idx = cg.function_nodes.get(&(utils_id, "add".to_string())).expect("add function should exist in utils.py");
+        let process_func_idx = cg.function_nodes.get(&(app_id, "process".to_string())).expect("process function should exist in app.py");
+
+        // Count Calls edges from process() to add()
+        let mut calls_count = 0;
+        for edge in cg.graph.edges(*process_func_idx) {
+            if matches!(edge.weight(), GraphEdgeKind::Calls) {
+                if edge.target() == *add_func_idx {
+                    calls_count += 1;
+                }
+            }
+        }
+
+        // Should have exactly 1 Calls edge (for the direct add(1, 2) call),
+        // NOT 2 (which would happen if db.add() also matched the imported add)
+        assert_eq!(calls_count, 1, 
+            "Expected exactly 1 Calls edge from process() to utils.add() (for the direct call), but got {}. \
+            The db.add() method call should NOT create an edge to the imported add() function.",
+            calls_count);
     }
 }

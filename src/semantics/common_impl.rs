@@ -12,7 +12,9 @@ use super::common::{
     async_ops::{AsyncOperation, AsyncOperationType, AsyncRuntime},
     db::{DbLibrary, DbOperation, DbOperationType},
     error_context::{ErrorContext, ErrorContextType},
-    functions::{FunctionCall, FunctionDecorator, FunctionDef, FunctionKind, FunctionParam, Visibility},
+    functions::{
+        FunctionCall, FunctionDecorator, FunctionDef, FunctionKind, FunctionParam, Visibility,
+    },
     http::{HttpCall, HttpClientLibrary, HttpMethod},
     imports::{Import, ImportSource, ImportStyle, ImportedItem},
     route_patterns::{RouteFramework, RoutePattern},
@@ -24,10 +26,12 @@ use super::python::model::{
     ImportCategory as PyImportCategory, ImportStyle as PyImportStyle, PyCallSite, PyFileSemantics,
     PyFunction, PyImport,
 };
-use super::rust::model::{RustCallSite, RustFileSemantics, RustFunction, RustUse, Visibility as RustVisibility};
+use super::rust::model::{
+    RustCallSite, RustFileSemantics, RustFunction, RustUse, Visibility as RustVisibility,
+};
 use super::typescript::model::{
-    TsAsyncOperation, TsAsyncOperationType, TsCallSite, TsFileSemantics,
-    TsFunction, TsImport, TsMethod,
+    TsAsyncOperation, TsAsyncOperationType, TsCallSite, TsFileSemantics, TsFunction, TsImport,
+    TsMethod,
 };
 
 // =============================================================================
@@ -180,17 +184,23 @@ impl CommonSemantics for PyFileSemantics {
                 n if n.contains("rate") || n.contains("throttle") => AnnotationType::RateLimit,
                 n if n.contains("timeout") => AnnotationType::Timeout,
                 n if n.contains("feature") || n.contains("flag") => AnnotationType::FeatureFlag,
-                n if n.contains("auth") || n.contains("permission") => AnnotationType::Auth { library: String::new() },
-                n if n.contains("valid") => AnnotationType::Validation { library: String::new() },
+                n if n.contains("auth") || n.contains("permission") => AnnotationType::Auth {
+                    library: String::new(),
+                },
+                n if n.contains("valid") => AnnotationType::Validation {
+                    library: String::new(),
+                },
                 _ => AnnotationType::Other(decorator.name.clone()),
             };
 
-            annotations.push(Annotation::new(
-                decorator.name.clone(),
-                annotation_type,
-                decorator.function_name.clone().unwrap_or_default(),
-                &self.path,
-            ).with_parameters(decorator.parameters.clone())
+            annotations.push(
+                Annotation::new(
+                    decorator.name.clone(),
+                    annotation_type,
+                    decorator.function_name.clone().unwrap_or_default(),
+                    &self.path,
+                )
+                .with_parameters(decorator.parameters.clone())
                 .with_location(
                     CommonLocation {
                         file_id: self.file_id,
@@ -201,7 +211,8 @@ impl CommonSemantics for PyFileSemantics {
                     },
                     decorator.start_byte,
                     decorator.end_byte,
-                ));
+                ),
+            );
         }
 
         annotations
@@ -218,26 +229,23 @@ impl CommonSemantics for PyFileSemantics {
                 let has_validation = route.handler_name.to_lowercase().contains("validate")
                     || route.handler_name.to_lowercase().contains("body");
 
-                routes.push(RoutePattern::new(
-                    &route.http_method,
-                    &route.path,
-                    RouteFramework::FastApi,
-                ).with_handler(
-                    route.handler_name.clone(),
-                    &self.path,
-                ).with_auth(has_auth)
-                    .with_validation(has_validation)
-                    .with_location(
-                        CommonLocation {
-                            file_id: self.file_id,
-                            line: route.decorator_location.range.start_line + 1,
-                            column: route.decorator_location.range.start_col + 1,
-                            start_byte: 0,
-                            end_byte: 0,
-                        },
-                        0,
-                        0,
-                    ));
+                routes.push(
+                    RoutePattern::new(&route.http_method, &route.path, RouteFramework::FastApi)
+                        .with_handler(route.handler_name.clone(), &self.path)
+                        .with_auth(has_auth)
+                        .with_validation(has_validation)
+                        .with_location(
+                            CommonLocation {
+                                file_id: self.file_id,
+                                line: route.decorator_location.range.start_line + 1,
+                                column: route.decorator_location.range.start_col + 1,
+                                start_byte: 0,
+                                end_byte: 0,
+                            },
+                            0,
+                            0,
+                        ),
+                );
             }
         }
 
@@ -260,37 +268,41 @@ impl CommonSemantics for PyFileSemantics {
             }
 
             if func.is_async {
-                contexts.push(ErrorContext::new(
-                    ErrorContextType::TryCatch,
-                ).with_location(
-                    CommonLocation {
-                        file_id: self.file_id,
-                        line: func.location.range.start_line + 1,
-                        column: func.location.range.start_col + 1,
-                        start_byte: func.start_byte,
-                        end_byte: func.end_byte,
-                    },
-                    func.start_byte,
-                    func.end_byte,
-                ).with_enclosing_function(func.name.clone()));
+                contexts.push(
+                    ErrorContext::new(ErrorContextType::TryCatch)
+                        .with_location(
+                            CommonLocation {
+                                file_id: self.file_id,
+                                line: func.location.range.start_line + 1,
+                                column: func.location.range.start_col + 1,
+                                start_byte: func.start_byte,
+                                end_byte: func.end_byte,
+                            },
+                            func.start_byte,
+                            func.end_byte,
+                        )
+                        .with_enclosing_function(func.name.clone()),
+                );
             }
         }
 
         for except in &self.bare_excepts {
-            contexts.push(ErrorContext::new(
-                ErrorContextType::BareExcept,
-            ).swallowing_error(true)
-                .with_location(
-                    CommonLocation {
-                        file_id: self.file_id,
-                        line: except.location.range.start_line + 1,
-                        column: except.location.range.start_col + 1,
-                        start_byte: except.start_byte,
-                        end_byte: except.end_byte,
-                    },
-                    except.start_byte,
-                    except.end_byte,
-                ).with_enclosing_function(except.function_name.clone().unwrap_or_default()));
+            contexts.push(
+                ErrorContext::new(ErrorContextType::BareExcept)
+                    .swallowing_error(true)
+                    .with_location(
+                        CommonLocation {
+                            file_id: self.file_id,
+                            line: except.location.range.start_line + 1,
+                            column: except.location.range.start_col + 1,
+                            start_byte: except.start_byte,
+                            end_byte: except.end_byte,
+                        },
+                        except.start_byte,
+                        except.end_byte,
+                    )
+                    .with_enclosing_function(except.function_name.clone().unwrap_or_default()),
+            );
         }
 
         contexts
@@ -609,7 +621,9 @@ impl CommonSemantics for GoFileSemantics {
                 operation_type: AsyncOperationType::TaskSpawn,
                 has_error_handling: g.has_recover,
                 error_handling: if g.has_recover {
-                    Some(crate::semantics::common::async_ops::ErrorHandling::Other("recover".to_string()))
+                    Some(crate::semantics::common::async_ops::ErrorHandling::Other(
+                        "recover".to_string(),
+                    ))
                 } else {
                     None
                 },
@@ -708,18 +722,21 @@ impl CommonSemantics for GoFileSemantics {
 
         // Convert mutex operations to LockAcquire/LockRelease operations
         for mutex in &self.mutex_operations {
-            let operation_type = if mutex.operation_type == "Lock" || mutex.operation_type == "RLock" {
-                AsyncOperationType::LockAcquire
-            } else {
-                AsyncOperationType::LockRelease
-            };
+            let operation_type =
+                if mutex.operation_type == "Lock" || mutex.operation_type == "RLock" {
+                    AsyncOperationType::LockAcquire
+                } else {
+                    AsyncOperationType::LockRelease
+                };
 
             operations.push(AsyncOperation {
                 runtime: AsyncRuntime::Goroutine,
                 operation_type,
                 has_error_handling: mutex.uses_defer_unlock,
                 error_handling: if mutex.uses_defer_unlock {
-                    Some(crate::semantics::common::async_ops::ErrorHandling::Other("defer".to_string()))
+                    Some(crate::semantics::common::async_ops::ErrorHandling::Other(
+                        "defer".to_string(),
+                    ))
                 } else {
                     None
                 },
@@ -755,7 +772,11 @@ impl CommonSemantics for GoFileSemantics {
                 timeout_value: None,
                 has_cancellation: defer_stmt.is_resource_cleanup,
                 cancellation_handling: if defer_stmt.is_resource_cleanup {
-                    Some(crate::semantics::common::async_ops::CancellationHandling::Other("defer_cleanup".to_string()))
+                    Some(
+                        crate::semantics::common::async_ops::CancellationHandling::Other(
+                            "defer_cleanup".to_string(),
+                        ),
+                    )
                 } else {
                     None
                 },
@@ -811,7 +832,9 @@ impl CommonSemantics for GoFileSemantics {
                 GoAnnotationType::Yaml => AnnotationType::Other("yaml".to_string()),
                 GoAnnotationType::Xml => AnnotationType::Other("xml".to_string()),
                 GoAnnotationType::Protobuf => AnnotationType::Other("protobuf".to_string()),
-                GoAnnotationType::Validation => AnnotationType::Validation { library: "go-validate".to_string() },
+                GoAnnotationType::Validation => AnnotationType::Validation {
+                    library: "go-validate".to_string(),
+                },
                 GoAnnotationType::Orm => AnnotationType::Other("orm".to_string()),
                 GoAnnotationType::Sql => AnnotationType::Other("sql".to_string()),
                 GoAnnotationType::Generate => AnnotationType::Other("go:generate".to_string()),
@@ -822,26 +845,31 @@ impl CommonSemantics for GoFileSemantics {
                 GoAnnotationType::Other(name) => AnnotationType::Other(name.clone()),
             };
 
-            let target_function = ann.target_field.clone()
+            let target_function = ann
+                .target_field
+                .clone()
                 .or(ann.target_type.clone())
                 .unwrap_or_default();
 
-            annotations.push(Annotation::new(
-                ann.name.clone(),
-                annotation_type,
-                target_function,
-                &self.path,
-            ).with_location(
-                CommonLocation {
-                    file_id: self.file_id,
-                    line: ann.location.range.start_line + 1,
-                    column: ann.location.range.start_col + 1,
-                    start_byte: ann.start_byte,
-                    end_byte: ann.end_byte,
-                },
-                ann.start_byte,
-                ann.end_byte,
-            ));
+            annotations.push(
+                Annotation::new(
+                    ann.name.clone(),
+                    annotation_type,
+                    target_function,
+                    &self.path,
+                )
+                .with_location(
+                    CommonLocation {
+                        file_id: self.file_id,
+                        line: ann.location.range.start_line + 1,
+                        column: ann.location.range.start_col + 1,
+                        start_byte: ann.start_byte,
+                        end_byte: ann.end_byte,
+                    },
+                    ann.start_byte,
+                    ann.end_byte,
+                ),
+            );
         }
 
         annotations
@@ -861,29 +889,37 @@ impl CommonSemantics for GoFileSemantics {
                     super::go::frameworks::GoHttpFramework::NetHttp => RouteFramework::HttpLibrary,
                 };
 
-                let has_auth = route.handler_name.as_ref()
-                    .map(|name| name.to_lowercase().contains("auth") || name.to_lowercase().contains("protected"))
+                let has_auth = route
+                    .handler_name
+                    .as_ref()
+                    .map(|name| {
+                        name.to_lowercase().contains("auth")
+                            || name.to_lowercase().contains("protected")
+                    })
                     .unwrap_or(false);
 
-                routes.push(RoutePattern::new(
-                    &route.http_method,
-                    &route.path,
-                    framework_type,
-                ).with_handler(
-                    route.handler_name.clone().unwrap_or_else(|| "unknown".to_string()),
-                    &self.path,
-                ).with_auth(has_auth)
-                    .with_location(
-                        CommonLocation {
-                            file_id: self.file_id,
-                            line: route.location.range.start_line + 1,
-                            column: route.location.range.start_col + 1,
-                            start_byte: route.start_byte,
-                            end_byte: route.end_byte,
-                        },
-                        route.start_byte,
-                        route.end_byte,
-                    ));
+                routes.push(
+                    RoutePattern::new(&route.http_method, &route.path, framework_type)
+                        .with_handler(
+                            route
+                                .handler_name
+                                .clone()
+                                .unwrap_or_else(|| "unknown".to_string()),
+                            &self.path,
+                        )
+                        .with_auth(has_auth)
+                        .with_location(
+                            CommonLocation {
+                                file_id: self.file_id,
+                                line: route.location.range.start_line + 1,
+                                column: route.location.range.start_col + 1,
+                                start_byte: route.start_byte,
+                                end_byte: route.end_byte,
+                            },
+                            route.start_byte,
+                            route.end_byte,
+                        ),
+                );
             }
         }
 
@@ -901,20 +937,22 @@ impl CommonSemantics for GoFileSemantics {
         let mut contexts = Vec::new();
 
         for recover in &self.defer_recovers {
-            contexts.push(ErrorContext::new(
-                ErrorContextType::DeferRecover,
-            ).with_logging(recover.has_logging)
-                .with_location(
-                    CommonLocation {
-                        file_id: self.file_id,
-                        line: recover.location.range.start_line + 1,
-                        column: recover.location.range.start_col + 1,
-                        start_byte: recover.start_byte,
-                        end_byte: recover.end_byte,
-                    },
-                    recover.start_byte,
-                    recover.end_byte,
-                ).with_enclosing_function(recover.function_name.clone().unwrap_or_default()));
+            contexts.push(
+                ErrorContext::new(ErrorContextType::DeferRecover)
+                    .with_logging(recover.has_logging)
+                    .with_location(
+                        CommonLocation {
+                            file_id: self.file_id,
+                            line: recover.location.range.start_line + 1,
+                            column: recover.location.range.start_col + 1,
+                            start_byte: recover.start_byte,
+                            end_byte: recover.end_byte,
+                        },
+                        recover.start_byte,
+                        recover.end_byte,
+                    )
+                    .with_enclosing_function(recover.function_name.clone().unwrap_or_default()),
+            );
         }
 
         contexts
@@ -1059,14 +1097,15 @@ fn convert_go_method(
         go_method.receiver_type.clone()
     };
 
-    let params: Vec<FunctionParam> = std::iter::once(FunctionParam::new("self").with_type(&receiver))
-        .chain(
-            go_method
-                .params
-                .iter()
-                .map(|p| FunctionParam::new(&p.name).with_type(&p.param_type)),
-        )
-        .collect();
+    let params: Vec<FunctionParam> =
+        std::iter::once(FunctionParam::new("self").with_type(&receiver))
+            .chain(
+                go_method
+                    .params
+                    .iter()
+                    .map(|p| FunctionParam::new(&p.name).with_type(&p.param_type)),
+            )
+            .collect();
 
     let return_type = if go_method.return_types.is_empty() {
         None
@@ -1077,7 +1116,9 @@ fn convert_go_method(
     // Filter calls that are within this method's byte range
     let calls: Vec<FunctionCall> = all_calls
         .iter()
-        .filter(|call| call.start_byte >= go_method.start_byte && call.end_byte <= go_method.end_byte)
+        .filter(|call| {
+            call.start_byte >= go_method.start_byte && call.end_byte <= go_method.end_byte
+        })
         .map(|call| convert_go_call_site(call))
         .collect();
 
@@ -1230,16 +1271,15 @@ impl CommonSemantics for RustFileSemantics {
             .iter()
             .filter_map(|func| convert_rust_function(func, self.file_id, &self.calls))
             .collect();
-        let impl_methods: Vec<FunctionDef> = self
-            .impls
-            .iter()
-            .flat_map(|impl_block| {
-                impl_block
-                    .methods
-                    .iter()
-                    .filter_map(|method| convert_rust_function(method, self.file_id, &self.calls))
-            })
-            .collect();
+        let impl_methods: Vec<FunctionDef> =
+            self.impls
+                .iter()
+                .flat_map(|impl_block| {
+                    impl_block.methods.iter().filter_map(|method| {
+                        convert_rust_function(method, self.file_id, &self.calls)
+                    })
+                })
+                .collect();
         funcs.into_iter().chain(impl_methods).collect()
     }
 
@@ -1257,13 +1297,11 @@ impl CommonSemantics for RustFileSemantics {
 
             for attr in &func.attributes {
                 let annotation_type = classify_rust_attribute(attr);
-                annotations.push(Annotation::new(
-                    attr.clone(),
-                    annotation_type,
-                    &func.name,
-                    &self.path,
-                ).with_location(location.clone(), func.start_byte, func.end_byte)
-                    .with_enclosing_function(func.name.clone()));
+                annotations.push(
+                    Annotation::new(attr.clone(), annotation_type, &func.name, &self.path)
+                        .with_location(location.clone(), func.start_byte, func.end_byte)
+                        .with_enclosing_function(func.name.clone()),
+                );
             }
         }
 
@@ -1279,13 +1317,11 @@ impl CommonSemantics for RustFileSemantics {
 
                 for attr in &method.attributes {
                     let annotation_type = classify_rust_attribute(attr);
-                    annotations.push(Annotation::new(
-                        attr.clone(),
-                        annotation_type,
-                        &method.name,
-                        &self.path,
-                    ).with_location(location.clone(), method.start_byte, method.end_byte)
-                        .with_enclosing_function(method.name.clone()));
+                    annotations.push(
+                        Annotation::new(attr.clone(), annotation_type, &method.name, &self.path)
+                            .with_location(location.clone(), method.start_byte, method.end_byte)
+                            .with_enclosing_function(method.name.clone()),
+                    );
                 }
             }
         }
@@ -1301,25 +1337,22 @@ impl CommonSemantics for RustFileSemantics {
                 let has_auth = route.handler_name.to_lowercase().contains("auth")
                     || route.handler_name.to_lowercase().contains("protected");
 
-                routes.push(RoutePattern::new(
-                    &route.method,
-                    &route.path,
-                    RouteFramework::Axum,
-                ).with_handler(
-                    route.handler_name.clone(),
-                    &self.path,
-                ).with_auth(has_auth)
-                    .with_location(
-                        CommonLocation {
-                            file_id: self.file_id,
-                            line: route.location.range.start_line + 1,
-                            column: route.location.range.start_col + 1,
-                            start_byte: 0,
-                            end_byte: 0,
-                        },
-                        0,
-                        0,
-                    ));
+                routes.push(
+                    RoutePattern::new(&route.method, &route.path, RouteFramework::Axum)
+                        .with_handler(route.handler_name.clone(), &self.path)
+                        .with_auth(has_auth)
+                        .with_location(
+                            CommonLocation {
+                                file_id: self.file_id,
+                                line: route.location.range.start_line + 1,
+                                column: route.location.range.start_col + 1,
+                                start_byte: 0,
+                                end_byte: 0,
+                            },
+                            0,
+                            0,
+                        ),
+                );
             }
         }
 
@@ -1337,36 +1370,40 @@ impl CommonSemantics for RustFileSemantics {
         let mut contexts = Vec::new();
 
         for unwrap in &self.unwrap_calls {
-            contexts.push(ErrorContext::new(
-                ErrorContextType::Unwrap,
-            ).with_location(
-                CommonLocation {
-                    file_id: self.file_id,
-                    line: unwrap.location.range.start_line + 1,
-                    column: unwrap.location.range.start_col + 1,
-                    start_byte: unwrap.start_byte,
-                    end_byte: unwrap.end_byte,
-                },
-                unwrap.start_byte,
-                unwrap.end_byte,
-            ).with_enclosing_function(unwrap.function_name.clone().unwrap_or_default()));
+            contexts.push(
+                ErrorContext::new(ErrorContextType::Unwrap)
+                    .with_location(
+                        CommonLocation {
+                            file_id: self.file_id,
+                            line: unwrap.location.range.start_line + 1,
+                            column: unwrap.location.range.start_col + 1,
+                            start_byte: unwrap.start_byte,
+                            end_byte: unwrap.end_byte,
+                        },
+                        unwrap.start_byte,
+                        unwrap.end_byte,
+                    )
+                    .with_enclosing_function(unwrap.function_name.clone().unwrap_or_default()),
+            );
         }
 
         for expect in &self.expect_calls {
-            contexts.push(ErrorContext::new(
-                ErrorContextType::Expect,
-            ).with_logging(expect.has_meaningful_message)
-                .with_location(
-                    CommonLocation {
-                        file_id: self.file_id,
-                        line: expect.location.range.start_line + 1,
-                        column: expect.location.range.start_col + 1,
-                        start_byte: expect.start_byte,
-                        end_byte: expect.end_byte,
-                    },
-                    expect.start_byte,
-                    expect.end_byte,
-                ).with_enclosing_function(expect.function_name.clone().unwrap_or_default()));
+            contexts.push(
+                ErrorContext::new(ErrorContextType::Expect)
+                    .with_logging(expect.has_meaningful_message)
+                    .with_location(
+                        CommonLocation {
+                            file_id: self.file_id,
+                            line: expect.location.range.start_line + 1,
+                            column: expect.location.range.start_col + 1,
+                            start_byte: expect.start_byte,
+                            end_byte: expect.end_byte,
+                        },
+                        expect.start_byte,
+                        expect.end_byte,
+                    )
+                    .with_enclosing_function(expect.function_name.clone().unwrap_or_default()),
+            );
         }
 
         contexts
@@ -1442,7 +1479,10 @@ fn convert_rust_function(
     // Filter calls that are within this function's byte range
     let calls: Vec<FunctionCall> = all_calls
         .iter()
-        .filter(|call| call.function_call.location.start_byte >= rust_func.start_byte && call.function_call.location.end_byte <= rust_func.end_byte)
+        .filter(|call| {
+            call.function_call.location.start_byte >= rust_func.start_byte
+                && call.function_call.location.end_byte <= rust_func.end_byte
+        })
         .map(|call| convert_rust_call_site(call))
         .collect();
 
@@ -1658,10 +1698,9 @@ impl CommonSemantics for TsFileSemantics {
             .classes
             .iter()
             .flat_map(|class| {
-                class
-                    .methods
-                    .iter()
-                    .filter_map(|method| convert_ts_method(method, self.file_id, &self.calls, &class.name))
+                class.methods.iter().filter_map(|method| {
+                    convert_ts_method(method, self.file_id, &self.calls, &class.name)
+                })
             })
             .collect();
         funcs.into_iter().chain(class_methods).collect()
@@ -1679,84 +1718,108 @@ impl CommonSemantics for TsFileSemantics {
                     n if n.contains("rate") || n.contains("throttle") => AnnotationType::RateLimit,
                     n if n.contains("timeout") => AnnotationType::Timeout,
                     n if n.contains("feature") || n.contains("flag") => AnnotationType::FeatureFlag,
-                    n if n.contains("auth") || n.contains("permission") || n.contains("guard") => AnnotationType::Auth { library: String::new() },
-                    n if n.contains("valid") => AnnotationType::Validation { library: String::new() },
+                    n if n.contains("auth") || n.contains("permission") || n.contains("guard") => {
+                        AnnotationType::Auth {
+                            library: String::new(),
+                        }
+                    }
+                    n if n.contains("valid") => AnnotationType::Validation {
+                        library: String::new(),
+                    },
                     _ => AnnotationType::Other(decorator.clone()),
                 };
 
-                annotations.push(Annotation::new(
-                    decorator.clone(),
-                    annotation_type,
-                    &func.name,
-                    &self.path,
-                ).with_location(
-                    CommonLocation {
-                        file_id: self.file_id,
-                        line: func.location.range.start_line + 1,
-                        column: func.location.range.start_col + 1,
-                        start_byte: func.start_byte,
-                        end_byte: func.end_byte,
-                    },
-                    func.start_byte,
-                    func.end_byte,
-                ).with_enclosing_function(func.name.clone()));
+                annotations.push(
+                    Annotation::new(decorator.clone(), annotation_type, &func.name, &self.path)
+                        .with_location(
+                            CommonLocation {
+                                file_id: self.file_id,
+                                line: func.location.range.start_line + 1,
+                                column: func.location.range.start_col + 1,
+                                start_byte: func.start_byte,
+                                end_byte: func.end_byte,
+                            },
+                            func.start_byte,
+                            func.end_byte,
+                        )
+                        .with_enclosing_function(func.name.clone()),
+                );
             }
         }
 
         for class in &self.classes {
-                for decorator in &class.decorators {
-                    let annotation_type = match decorator.to_lowercase().as_str() {
-                        n if n.contains("log") => AnnotationType::Logging,
-                        n if n.contains("controller") || n.contains("service") || n.contains("injectable") => AnnotationType::Controller,
-                        n if n.contains("auth") || n.contains("guard") => AnnotationType::Auth { library: String::new() },
-                        _ => AnnotationType::Other(decorator.clone()),
-                    };
+            for decorator in &class.decorators {
+                let annotation_type = match decorator.to_lowercase().as_str() {
+                    n if n.contains("log") => AnnotationType::Logging,
+                    n if n.contains("controller")
+                        || n.contains("service")
+                        || n.contains("injectable") =>
+                    {
+                        AnnotationType::Controller
+                    }
+                    n if n.contains("auth") || n.contains("guard") => AnnotationType::Auth {
+                        library: String::new(),
+                    },
+                    _ => AnnotationType::Other(decorator.clone()),
+                };
 
-                    annotations.push(Annotation::new(
-                        decorator.clone(),
-                        annotation_type,
-                        &class.name,
-                        &self.path,
-                    ).with_location(
-                        CommonLocation {
-                            file_id: self.file_id,
-                            line: class.location.range.start_line + 1,
-                            column: class.location.range.start_col + 1,
-                            start_byte: 0,
-                            end_byte: 0,
-                        },
-                        0,
-                        0,
-                    ).with_enclosing_class(class.name.clone()));
-                }
+                annotations.push(
+                    Annotation::new(decorator.clone(), annotation_type, &class.name, &self.path)
+                        .with_location(
+                            CommonLocation {
+                                file_id: self.file_id,
+                                line: class.location.range.start_line + 1,
+                                column: class.location.range.start_col + 1,
+                                start_byte: 0,
+                                end_byte: 0,
+                            },
+                            0,
+                            0,
+                        )
+                        .with_enclosing_class(class.name.clone()),
+                );
+            }
 
             for method in &class.methods {
                 for decorator in &method.decorators {
                     let annotation_type = match decorator.to_lowercase().as_str() {
                         n if n.contains("log") => AnnotationType::Logging,
                         n if n.contains("retry") => AnnotationType::Retry,
-                        n if n.contains("get") || n.contains("post") || n.contains("put") || n.contains("delete") || n.contains("patch") => AnnotationType::Route,
-                        n if n.contains("auth") || n.contains("guard") => AnnotationType::Auth { library: String::new() },
+                        n if n.contains("get")
+                            || n.contains("post")
+                            || n.contains("put")
+                            || n.contains("delete")
+                            || n.contains("patch") =>
+                        {
+                            AnnotationType::Route
+                        }
+                        n if n.contains("auth") || n.contains("guard") => AnnotationType::Auth {
+                            library: String::new(),
+                        },
                         _ => AnnotationType::Other(decorator.clone()),
                     };
 
-                    annotations.push(Annotation::new(
-                        decorator.clone(),
-                        annotation_type,
-                        &method.name,
-                        &self.path,
-                    ).with_location(
-                        CommonLocation {
-                            file_id: self.file_id,
-                            line: method.location.range.start_line + 1,
-                            column: method.location.range.start_col + 1,
-                            start_byte: method.start_byte,
-                            end_byte: method.end_byte,
-                        },
-                        method.start_byte,
-                        method.end_byte,
-                    ).with_enclosing_function(method.name.clone())
-                        .with_enclosing_class(class.name.clone()));
+                    annotations.push(
+                        Annotation::new(
+                            decorator.clone(),
+                            annotation_type,
+                            &method.name,
+                            &self.path,
+                        )
+                        .with_location(
+                            CommonLocation {
+                                file_id: self.file_id,
+                                line: method.location.range.start_line + 1,
+                                column: method.location.range.start_col + 1,
+                                start_byte: method.start_byte,
+                                end_byte: method.end_byte,
+                            },
+                            method.start_byte,
+                            method.end_byte,
+                        )
+                        .with_enclosing_function(method.name.clone())
+                        .with_enclosing_class(class.name.clone()),
+                    );
                 }
             }
         }
@@ -1769,30 +1832,38 @@ impl CommonSemantics for TsFileSemantics {
 
         if let Some(ref express) = self.express {
             for route in &express.routes {
-                let has_auth = route.handler_name.as_ref()
-                    .map(|name| name.to_lowercase().contains("auth") || name.to_lowercase().contains("protected"))
+                let has_auth = route
+                    .handler_name
+                    .as_ref()
+                    .map(|name| {
+                        name.to_lowercase().contains("auth")
+                            || name.to_lowercase().contains("protected")
+                    })
                     .unwrap_or(false);
 
                 if let Some(ref path) = route.path {
-                    routes.push(RoutePattern::new(
-                        &route.method,
-                        path,
-                        RouteFramework::Express,
-                    ).with_handler(
-                        route.handler_name.clone().unwrap_or_else(|| "unknown".to_string()),
-                        &self.path,
-                    ).with_auth(has_auth)
-                        .with_location(
-                            CommonLocation {
-                                file_id: self.file_id,
-                                line: route.location.range.start_line + 1,
-                                column: route.location.range.start_col + 1,
-                                start_byte: 0,
-                                end_byte: 0,
-                            },
-                            0,
-                            0,
-                        ));
+                    routes.push(
+                        RoutePattern::new(&route.method, path, RouteFramework::Express)
+                            .with_handler(
+                                route
+                                    .handler_name
+                                    .clone()
+                                    .unwrap_or_else(|| "unknown".to_string()),
+                                &self.path,
+                            )
+                            .with_auth(has_auth)
+                            .with_location(
+                                CommonLocation {
+                                    file_id: self.file_id,
+                                    line: route.location.range.start_line + 1,
+                                    column: route.location.range.start_col + 1,
+                                    start_byte: 0,
+                                    end_byte: 0,
+                                },
+                                0,
+                                0,
+                            ),
+                    );
                 }
             }
         }
@@ -1811,22 +1882,27 @@ impl CommonSemantics for TsFileSemantics {
         let mut contexts = Vec::new();
 
         for try_catch in &self.try_catches {
-            contexts.push(ErrorContext::new(
-                ErrorContextType::TryCatch,
-            ).with_logging(try_catch.has_logging)
-                .with_reraise(try_catch.has_reraise)
-                .swallowing_error(try_catch.catch_text.contains("catch") && try_catch.catch_text.lines().count() <= 2)
-                .with_location(
-                    CommonLocation {
-                        file_id: self.file_id,
-                        line: try_catch.location.range.start_line + 1,
-                        column: try_catch.location.range.start_col + 1,
-                        start_byte: try_catch.start_byte,
-                        end_byte: try_catch.end_byte,
-                    },
-                    try_catch.start_byte,
-                    try_catch.end_byte,
-                ).with_enclosing_function(try_catch.function_name.clone().unwrap_or_default()));
+            contexts.push(
+                ErrorContext::new(ErrorContextType::TryCatch)
+                    .with_logging(try_catch.has_logging)
+                    .with_reraise(try_catch.has_reraise)
+                    .swallowing_error(
+                        try_catch.catch_text.contains("catch")
+                            && try_catch.catch_text.lines().count() <= 2,
+                    )
+                    .with_location(
+                        CommonLocation {
+                            file_id: self.file_id,
+                            line: try_catch.location.range.start_line + 1,
+                            column: try_catch.location.range.start_col + 1,
+                            start_byte: try_catch.start_byte,
+                            end_byte: try_catch.end_byte,
+                        },
+                        try_catch.start_byte,
+                        try_catch.end_byte,
+                    )
+                    .with_enclosing_function(try_catch.function_name.clone().unwrap_or_default()),
+            );
         }
 
         contexts
@@ -1991,7 +2067,10 @@ fn convert_ts_function(
     // Filter calls that are within this function's byte range
     let calls: Vec<FunctionCall> = all_calls
         .iter()
-        .filter(|call| call.function_call.location.start_byte >= ts_func.start_byte && call.function_call.location.end_byte <= ts_func.end_byte)
+        .filter(|call| {
+            call.function_call.location.start_byte >= ts_func.start_byte
+                && call.function_call.location.end_byte <= ts_func.end_byte
+        })
         .map(|call| convert_ts_call_site(call))
         .collect();
 
@@ -2073,7 +2152,10 @@ fn convert_ts_method(
     // Filter calls that are within this method's byte range
     let calls: Vec<FunctionCall> = all_calls
         .iter()
-        .filter(|call| call.function_call.location.start_byte >= method.start_byte && call.function_call.location.end_byte <= method.end_byte)
+        .filter(|call| {
+            call.function_call.location.start_byte >= method.start_byte
+                && call.function_call.location.end_byte <= method.end_byte
+        })
         .map(|call| convert_ts_call_site(call))
         .collect();
 
@@ -2423,7 +2505,10 @@ fn my_func() {
         assert_eq!(functions.len(), 1);
 
         let func = &functions[0];
-        assert!(func.start_byte > 0, "RustFunction should have start_byte > 0");
+        assert!(
+            func.start_byte > 0,
+            "RustFunction should have start_byte > 0"
+        );
         assert!(func.end_byte > func.start_byte);
     }
 
@@ -2646,7 +2731,10 @@ def protected_auth():
         let public_route = routes.iter().find(|r| r.path == "/public").unwrap();
         assert!(!public_route.has_auth);
 
-        let protected_route = routes.iter().find(|r| r.path == "/protected/auth-required").unwrap();
+        let protected_route = routes
+            .iter()
+            .find(|r| r.path == "/protected/auth-required")
+            .unwrap();
         assert!(protected_route.has_auth);
     }
 
@@ -2667,7 +2755,9 @@ def risky_function():
         let contexts = sem.error_contexts();
         assert!(!contexts.is_empty());
 
-        let bare_except = contexts.iter().find(|c| matches!(c.context_type, ErrorContextType::BareExcept));
+        let bare_except = contexts
+            .iter()
+            .find(|c| matches!(c.context_type, ErrorContextType::BareExcept));
         assert!(bare_except.is_some());
         assert!(bare_except.unwrap().swallows_error);
     }
@@ -2726,7 +2816,9 @@ fn example() {
         let contexts = sem.error_contexts();
         assert!(!contexts.is_empty());
 
-        let unwrap_ctx = contexts.iter().find(|c| matches!(c.context_type, ErrorContextType::Unwrap));
+        let unwrap_ctx = contexts
+            .iter()
+            .find(|c| matches!(c.context_type, ErrorContextType::Unwrap));
         assert!(unwrap_ctx.is_some());
     }
 
@@ -2782,7 +2874,10 @@ class UserController {
         let annotations = sem.annotations();
         assert!(!annotations.is_empty());
 
-        let method_anns: Vec<_> = annotations.iter().filter(|a| a.enclosing_function.is_some()).collect();
+        let method_anns: Vec<_> = annotations
+            .iter()
+            .filter(|a| a.enclosing_function.is_some())
+            .collect();
         assert!(!method_anns.is_empty());
     }
 
@@ -2798,7 +2893,8 @@ def process():
 "#,
         );
         let annotations = sem.annotations();
-        let logging_anns: Vec<_> = annotations.iter()
+        let logging_anns: Vec<_> = annotations
+            .iter()
             .filter(|a| matches!(a.annotation_type, AnnotationType::Logging))
             .collect();
         assert!(!logging_anns.is_empty(), "Expected logging annotation");
@@ -2816,7 +2912,8 @@ def fetch_data():
 "#,
         );
         let annotations = sem.annotations();
-        let retry_anns: Vec<_> = annotations.iter()
+        let retry_anns: Vec<_> = annotations
+            .iter()
             .filter(|a| matches!(a.annotation_type, AnnotationType::Retry))
             .collect();
         assert!(!retry_anns.is_empty(), "Expected retry annotation");
@@ -2838,11 +2935,18 @@ func handle() {
 "#,
         );
         let contexts = sem.error_contexts();
-        let recover_contexts: Vec<_> = contexts.iter()
+        let recover_contexts: Vec<_> = contexts
+            .iter()
             .filter(|c| matches!(c.context_type, ErrorContextType::DeferRecover))
             .collect();
-        assert!(!recover_contexts.is_empty(), "Expected defer_recover context");
-        assert!(recover_contexts[0].has_logging, "Expected logging in recover");
+        assert!(
+            !recover_contexts.is_empty(),
+            "Expected defer_recover context"
+        );
+        assert!(
+            recover_contexts[0].has_logging,
+            "Expected logging in recover"
+        );
     }
 
     #[test]
@@ -2860,7 +2964,8 @@ async function handler() {
 "#,
         );
         let contexts = sem.error_contexts();
-        let try_catch_contexts: Vec<_> = contexts.iter()
+        let try_catch_contexts: Vec<_> = contexts
+            .iter()
             .filter(|c| matches!(c.context_type, ErrorContextType::TryCatch))
             .collect();
         assert!(!try_catch_contexts.is_empty(), "Expected try-catch context");
@@ -2877,7 +2982,8 @@ fn process() {}
 "#,
         );
         let annotations = sem.annotations();
-        let logging_anns: Vec<_> = annotations.iter()
+        let logging_anns: Vec<_> = annotations
+            .iter()
             .filter(|a| matches!(a.annotation_type, AnnotationType::Logging))
             .collect();
         assert!(!logging_anns.is_empty(), "Expected logging annotation");
@@ -2892,10 +2998,10 @@ fn fetch() -> Result<T, E> {}
 "#,
         );
         let annotations = sem.annotations();
-        let retry_anns: Vec<_> = annotations.iter()
+        let retry_anns: Vec<_> = annotations
+            .iter()
             .filter(|a| matches!(a.annotation_type, AnnotationType::Retry))
             .collect();
         assert!(!retry_anns.is_empty(), "Expected retry annotation");
     }
 }
-

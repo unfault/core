@@ -101,7 +101,12 @@ impl Annotation {
     }
 
     /// Set location
-    pub fn with_location(mut self, location: CommonLocation, start_byte: usize, end_byte: usize) -> Self {
+    pub fn with_location(
+        mut self,
+        location: CommonLocation,
+        start_byte: usize,
+        end_byte: usize,
+    ) -> Self {
         self.location = location;
         self.start_byte = start_byte;
         self.end_byte = end_byte;
@@ -162,9 +167,7 @@ impl FunctionAnnotations {
 
     /// Check if any annotation matches a pattern
     pub fn has_annotation_matching(&self, pattern: &str) -> bool {
-        self.annotations.iter().any(|a| {
-            a.name.contains(pattern)
-        })
+        self.annotations.iter().any(|a| a.name.contains(pattern))
     }
 }
 
@@ -174,12 +177,7 @@ mod tests {
 
     #[test]
     fn annotation_new() {
-        let ann = Annotation::new(
-            "retry",
-            AnnotationType::Retry,
-            "fetch_data",
-            "utils.py",
-        );
+        let ann = Annotation::new("retry", AnnotationType::Retry, "fetch_data", "utils.py");
 
         assert_eq!(ann.name, "retry");
         assert!(matches!(ann.annotation_type, AnnotationType::Retry));
@@ -188,12 +186,8 @@ mod tests {
 
     #[test]
     fn annotation_with_parameters() {
-        let ann = Annotation::new(
-            "route",
-            AnnotationType::Route,
-            "get_users",
-            "api.py",
-        ).with_parameters(vec!["path=/users".to_string(), "method=GET".to_string()]);
+        let ann = Annotation::new("route", AnnotationType::Route, "get_users", "api.py")
+            .with_parameters(vec!["path=/users".to_string(), "method=GET".to_string()]);
 
         assert_eq!(ann.parameters.len(), 2);
     }
@@ -205,7 +199,8 @@ mod tests {
             AnnotationType::Route,
             "getUser",
             "user_controller.ts",
-        ).with_enclosing_class("UserController");
+        )
+        .with_enclosing_class("UserController");
 
         assert_eq!(ann.enclosing_class, Some("UserController".to_string()));
     }

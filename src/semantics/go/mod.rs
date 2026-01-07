@@ -4,7 +4,7 @@ pub mod frameworks;
 pub mod http;
 pub mod model;
 
-pub use frameworks::{extract_go_routes, GoFrameworkSummary, GoHttpFramework, GoRoute};
+pub use frameworks::{GoFrameworkSummary, GoHttpFramework, GoRoute, extract_go_routes};
 pub use model::GoFileSemantics;
 
 use anyhow::Result;

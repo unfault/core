@@ -1,10 +1,10 @@
 use serde::{Deserialize, Serialize};
 
 use crate::parse::ast::{AstLocation, FileId, ParsedFile};
-use crate::types::context::Language;
-use crate::semantics::common::calls::FunctionCall;
-use crate::semantics::common::db::{DbOperation, DbLibrary, DbOperationType};
 use crate::semantics::common::CommonLocation;
+use crate::semantics::common::calls::FunctionCall;
+use crate::semantics::common::db::{DbLibrary, DbOperation, DbOperationType};
+use crate::types::context::Language;
 
 use super::http::HttpCallSite;
 
@@ -624,7 +624,9 @@ fn walk_nodes_with_context(
                                 let var_name = parsed.text_for_node(&name_node);
                                 if let Some(value_node) = child.child_by_field_name("value") {
                                     if value_node.kind() == "arrow_function" {
-                                        if let Some(func) = build_arrow_function(parsed, &value_node, &var_name) {
+                                        if let Some(func) =
+                                            build_arrow_function(parsed, &value_node, &var_name)
+                                        {
                                             sem.functions.push(func);
                                         }
                                     }
@@ -635,7 +637,11 @@ fn walk_nodes_with_context(
                 }
                 if let Some(var) = build_variable(parsed, &node) {
                     if var.kind != VariableKind::Const {
-                        let keyword = if var.kind == VariableKind::Let { "let" } else { "var" };
+                        let keyword = if var.kind == VariableKind::Let {
+                            "let"
+                        } else {
+                            "var"
+                        };
                         let keyword_start = node.start_byte();
                         let keyword_end = keyword_start + keyword.len();
 
@@ -914,7 +920,11 @@ fn build_function(parsed: &ParsedFile, node: &tree_sitter::Node) -> Option<TsFun
     })
 }
 
-fn build_arrow_function(parsed: &ParsedFile, node: &tree_sitter::Node, name: &str) -> Option<TsFunction> {
+fn build_arrow_function(
+    parsed: &ParsedFile,
+    node: &tree_sitter::Node,
+    name: &str,
+) -> Option<TsFunction> {
     let location = parsed.location_for_node(node);
     let text = parsed.text_for_node(node);
 
@@ -1415,7 +1425,9 @@ fn check_catch_clause(
     }
 
     let catch_body = node.child_by_field_name("body");
-    let catch_body_text = catch_body.map(|b| parsed.text_for_node(&b)).unwrap_or_default();
+    let catch_body_text = catch_body
+        .map(|b| parsed.text_for_node(&b))
+        .unwrap_or_default();
     let has_logging = catch_body_text.contains("console.error")
         || catch_body_text.contains("console.warn")
         || catch_body_text.contains("logger")
@@ -1426,7 +1438,9 @@ fn check_catch_clause(
 
     let catch_text = text.lines().next().unwrap_or(&text).to_string();
     let has_reraise = text.contains("throw")
-        && text.lines().any(|line| line.trim_start().starts_with("throw"));
+        && text
+            .lines()
+            .any(|line| line.trim_start().starts_with("throw"));
 
     sem.try_catches.push(TryCatchBlock {
         line: range.start_point.row as u32 + 1,
@@ -1455,13 +1469,14 @@ fn detect_async_operation_from_call(
         "Promise.all" | "Promise.allSettled" | "Promise.race" | "Promise.any" => {
             TsAsyncOperationType::PromiseCombinator
         }
-        "setTimeout" | "setInterval" | "setImmediate" => {
-            TsAsyncOperationType::Timeout
-        }
+        "setTimeout" | "setInterval" | "setImmediate" => TsAsyncOperationType::Timeout,
         "AbortController" => TsAsyncOperationType::Cancellation,
         _ => {
             // Check for promise method chains
-            if callee.contains(".then(") || callee.contains(".catch(") || callee.contains(".finally(") {
+            if callee.contains(".then(")
+                || callee.contains(".catch(")
+                || callee.contains(".finally(")
+            {
                 TsAsyncOperationType::PromiseChain
             } else {
                 return None;
@@ -1554,10 +1569,7 @@ fn has_try_catch_around(node: &tree_sitter::Node) -> bool {
 }
 
 /// Extract timeout value from call arguments.
-fn extract_timeout_from_args(
-    parsed: &ParsedFile,
-    node: &tree_sitter::Node,
-) -> (bool, Option<f64>) {
+fn extract_timeout_from_args(parsed: &ParsedFile, node: &tree_sitter::Node) -> (bool, Option<f64>) {
     if let Some(args_node) = node.child_by_field_name("arguments") {
         let text = parsed.text_for_node(&args_node);
 
@@ -1565,7 +1577,11 @@ fn extract_timeout_from_args(
         if let Some(timeout_idx) = text.find("timeout") {
             // Simple heuristic: look for a number near "timeout"
             let before_timeout = &text[..timeout_idx.saturating_sub(50)];
-            if let Some(number_start) = before_timeout.chars().rev().position(|c| c.is_ascii_digit() || c == '.') {
+            if let Some(number_start) = before_timeout
+                .chars()
+                .rev()
+                .position(|c| c.is_ascii_digit() || c == '.')
+            {
                 let start = timeout_idx - number_start;
                 let number: String = text[start..]
                     .chars()
@@ -1594,7 +1610,9 @@ fn detect_db_operation_from_call(
     let (library, operation_type) = match callee.as_str() {
         // Prisma patterns (case-insensitive) - check first since they use prisma prefix
         s if s.to_lowercase().starts_with("prisma") => {
-            let op_type = if s.to_lowercase().contains("find") || s.to_lowercase().contains("findmany") {
+            let op_type = if s.to_lowercase().contains("find")
+                || s.to_lowercase().contains("findmany")
+            {
                 DbOperationType::Select
             } else if s.to_lowercase().contains("create") || s.to_lowercase().contains("upsert") {
                 DbOperationType::Insert
@@ -1614,7 +1632,10 @@ fn detect_db_operation_from_call(
 
         // Knex patterns - check for knex at start
         s if s.to_lowercase().starts_with("knex") => {
-            let op_type = if s.to_lowercase().contains(".select") || s.to_lowercase().contains(".from") || s.to_lowercase().contains(".where") {
+            let op_type = if s.to_lowercase().contains(".select")
+                || s.to_lowercase().contains(".from")
+                || s.to_lowercase().contains(".where")
+            {
                 DbOperationType::Select
             } else if s.to_lowercase().contains(".insert") {
                 DbOperationType::Insert
@@ -1631,37 +1652,76 @@ fn detect_db_operation_from_call(
         }
 
         // Drizzle ORM patterns - check before generic patterns
-        s if s.to_lowercase().contains("db.query") || s.to_lowercase().contains("drizzle.query") => (DbLibrary::DrizzleOrm, DbOperationType::Select),
-        s if (s.to_lowercase().contains("db.insert") || s.to_lowercase().contains("drizzle.insert")) && s.to_lowercase().contains(".values") => (DbLibrary::DrizzleOrm, DbOperationType::Insert),
-        s if (s.to_lowercase().contains("db.update") || s.to_lowercase().contains("drizzle.update")) => (DbLibrary::DrizzleOrm, DbOperationType::Update),
-        s if (s.to_lowercase().contains("db.delete") || s.to_lowercase().contains("drizzle.delete")) => (DbLibrary::DrizzleOrm, DbOperationType::Delete),
+        s if s.to_lowercase().contains("db.query")
+            || s.to_lowercase().contains("drizzle.query") =>
+        {
+            (DbLibrary::DrizzleOrm, DbOperationType::Select)
+        }
+        s if (s.to_lowercase().contains("db.insert")
+            || s.to_lowercase().contains("drizzle.insert"))
+            && s.to_lowercase().contains(".values") =>
+        {
+            (DbLibrary::DrizzleOrm, DbOperationType::Insert)
+        }
+        s if (s.to_lowercase().contains("db.update")
+            || s.to_lowercase().contains("drizzle.update")) =>
+        {
+            (DbLibrary::DrizzleOrm, DbOperationType::Update)
+        }
+        s if (s.to_lowercase().contains("db.delete")
+            || s.to_lowercase().contains("drizzle.delete")) =>
+        {
+            (DbLibrary::DrizzleOrm, DbOperationType::Delete)
+        }
 
         // TypeORM patterns - check before Sequelize since patterns can overlap
-        s if s.to_lowercase().contains("createquerybuilder") => (DbLibrary::TypeOrm, DbOperationType::RawSql),
-        s if s.to_lowercase().contains("entitymanager") && s.to_lowercase().contains("find") => (DbLibrary::TypeOrm, DbOperationType::Select),
-        s if s.to_lowercase().contains("repository") || s.to_lowercase().contains("userrepo") || s.to_lowercase().contains("entitymanager") => {
-            let op_type = if s.to_lowercase().contains("findone") || s.to_lowercase().contains(".find(") {
-                DbOperationType::Select
-            } else if s.to_lowercase().contains(".save") {
-                DbOperationType::Insert
-            } else if s.to_lowercase().contains(".update") {
-                DbOperationType::Update
-            } else if s.to_lowercase().contains(".delete") {
-                DbOperationType::Delete
-            } else {
-                return None;
-            };
+        s if s.to_lowercase().contains("createquerybuilder") => {
+            (DbLibrary::TypeOrm, DbOperationType::RawSql)
+        }
+        s if s.to_lowercase().contains("entitymanager") && s.to_lowercase().contains("find") => {
+            (DbLibrary::TypeOrm, DbOperationType::Select)
+        }
+        s if s.to_lowercase().contains("repository")
+            || s.to_lowercase().contains("userrepo")
+            || s.to_lowercase().contains("entitymanager") =>
+        {
+            let op_type =
+                if s.to_lowercase().contains("findone") || s.to_lowercase().contains(".find(") {
+                    DbOperationType::Select
+                } else if s.to_lowercase().contains(".save") {
+                    DbOperationType::Insert
+                } else if s.to_lowercase().contains(".update") {
+                    DbOperationType::Update
+                } else if s.to_lowercase().contains(".delete") {
+                    DbOperationType::Delete
+                } else {
+                    return None;
+                };
             (DbLibrary::TypeOrm, op_type)
         }
 
         // Sequelize patterns - Model can be any name (User, Product, etc.)
-        s if s.to_lowercase().contains("findall") || s.to_lowercase().contains("find_many") => (DbLibrary::Sequelize, DbOperationType::Select),
-        s if s.to_lowercase().contains("findone") || s.to_lowercase().contains("find_one") => (DbLibrary::Sequelize, DbOperationType::Select),
-        s if s.to_lowercase().contains("model") && s.to_lowercase().contains("find") => (DbLibrary::Sequelize, DbOperationType::Select),
-        s if s.to_lowercase().contains("model") && s.to_lowercase().contains("create") => (DbLibrary::Sequelize, DbOperationType::Insert),
-        s if s.to_lowercase().contains("model") && s.to_lowercase().contains("update") => (DbLibrary::Sequelize, DbOperationType::Update),
-        s if s.to_lowercase().contains("model") && s.to_lowercase().contains("destroy") => (DbLibrary::Sequelize, DbOperationType::Delete),
-        s if s.to_lowercase().contains("sequelize") && s.to_lowercase().contains("query") => (DbLibrary::Sequelize, DbOperationType::RawSql),
+        s if s.to_lowercase().contains("findall") || s.to_lowercase().contains("find_many") => {
+            (DbLibrary::Sequelize, DbOperationType::Select)
+        }
+        s if s.to_lowercase().contains("findone") || s.to_lowercase().contains("find_one") => {
+            (DbLibrary::Sequelize, DbOperationType::Select)
+        }
+        s if s.to_lowercase().contains("model") && s.to_lowercase().contains("find") => {
+            (DbLibrary::Sequelize, DbOperationType::Select)
+        }
+        s if s.to_lowercase().contains("model") && s.to_lowercase().contains("create") => {
+            (DbLibrary::Sequelize, DbOperationType::Insert)
+        }
+        s if s.to_lowercase().contains("model") && s.to_lowercase().contains("update") => {
+            (DbLibrary::Sequelize, DbOperationType::Update)
+        }
+        s if s.to_lowercase().contains("model") && s.to_lowercase().contains("destroy") => {
+            (DbLibrary::Sequelize, DbOperationType::Delete)
+        }
+        s if s.to_lowercase().contains("sequelize") && s.to_lowercase().contains("query") => {
+            (DbLibrary::Sequelize, DbOperationType::RawSql)
+        }
 
         _ => return None,
     };
@@ -1776,7 +1836,11 @@ class MyClass {
     fn collects_calls() {
         let sem = parse_and_build_semantics("fetch('https://api.example.com');");
         assert!(!sem.calls.is_empty());
-        assert!(sem.calls.iter().any(|c| c.function_call.callee_expr == "fetch"));
+        assert!(
+            sem.calls
+                .iter()
+                .any(|c| c.function_call.callee_expr == "fetch")
+        );
     }
 
     #[test]

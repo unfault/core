@@ -142,11 +142,19 @@ fn detect_framework(source: &str) -> Option<RustFrameworkType> {
 }
 
 /// Walk AST to find route registrations.
-fn walk_for_routes(node: tree_sitter::Node, parsed: &ParsedFile, summary: &mut RustFrameworkSummary) {
+fn walk_for_routes(
+    node: tree_sitter::Node,
+    parsed: &ParsedFile,
+    summary: &mut RustFrameworkSummary,
+) {
     let framework = match &summary.framework {
         Some(f) => f.clone(),
         None => return,
     };
+
+    if super::is_inline_test_subtree_root(parsed, &node) {
+        return;
+    }
 
     match node.kind() {
         // Look for function items with Rocket-style attributes
@@ -158,39 +166,37 @@ fn walk_for_routes(node: tree_sitter::Node, parsed: &ParsedFile, summary: &mut R
             }
         }
         // Look for method calls for route registration
-        "call_expression" => {
-            match framework {
-                RustFrameworkType::Axum => {
-                    if let Some(route) = extract_axum_route(parsed, &node) {
-                        summary.routes.push(route);
-                    }
-                    if let Some(middleware) = extract_axum_layer(parsed, &node) {
-                        summary.middleware.push(middleware);
-                    }
+        "call_expression" => match framework {
+            RustFrameworkType::Axum => {
+                if let Some(route) = extract_axum_route(parsed, &node) {
+                    summary.routes.push(route);
                 }
-                RustFrameworkType::ActixWeb => {
-                    if let Some(route) = extract_actix_route(parsed, &node) {
-                        summary.routes.push(route);
-                    }
+                if let Some(middleware) = extract_axum_layer(parsed, &node) {
+                    summary.middleware.push(middleware);
                 }
-                RustFrameworkType::Warp => {
-                    if let Some(route) = extract_warp_route(parsed, &node) {
-                        summary.routes.push(route);
-                    }
-                }
-                RustFrameworkType::Poem => {
-                    if let Some(route) = extract_poem_route(parsed, &node) {
-                        summary.routes.push(route);
-                    }
-                }
-                RustFrameworkType::Tide => {
-                    if let Some(route) = extract_tide_route(parsed, &node) {
-                        summary.routes.push(route);
-                    }
-                }
-                _ => {}
             }
-        }
+            RustFrameworkType::ActixWeb => {
+                if let Some(route) = extract_actix_route(parsed, &node) {
+                    summary.routes.push(route);
+                }
+            }
+            RustFrameworkType::Warp => {
+                if let Some(route) = extract_warp_route(parsed, &node) {
+                    summary.routes.push(route);
+                }
+            }
+            RustFrameworkType::Poem => {
+                if let Some(route) = extract_poem_route(parsed, &node) {
+                    summary.routes.push(route);
+                }
+            }
+            RustFrameworkType::Tide => {
+                if let Some(route) = extract_tide_route(parsed, &node) {
+                    summary.routes.push(route);
+                }
+            }
+            _ => {}
+        },
         // Look for attribute items for Actix-web and Rocket macros
         "attribute_item" => {
             // Handled at function level
@@ -238,7 +244,9 @@ fn extract_axum_route(parsed: &ParsedFile, node: &tree_sitter::Node) -> Option<R
 
 /// Extract Axum method and handler from route definition.
 fn extract_axum_method_handler(text: &str) -> Option<(String, String)> {
-    let methods = ["get", "post", "put", "delete", "patch", "head", "options", "trace"];
+    let methods = [
+        "get", "post", "put", "delete", "patch", "head", "options", "trace",
+    ];
 
     for method in methods {
         let pattern = format!("{}(", method);
@@ -265,8 +273,7 @@ fn extract_axum_layer(parsed: &ParsedFile, node: &tree_sitter::Node) -> Option<R
     }
 
     // Extract layer name
-    let name = extract_string_arg(&text, ".layer(")
-        .or_else(|| extract_type_from_layer(&text))?;
+    let name = extract_string_arg(&text, ".layer(").or_else(|| extract_type_from_layer(&text))?;
 
     Some(RustMiddlewareInfo {
         name,
@@ -299,7 +306,10 @@ fn extract_type_from_layer(text: &str) -> Option<String> {
 }
 
 /// Extract Actix-web route from method call like `.route("/path", web::get().to(handler))`.
-fn extract_actix_route(parsed: &ParsedFile, node: &tree_sitter::Node) -> Option<RustFrameworkRoute> {
+fn extract_actix_route(
+    parsed: &ParsedFile,
+    node: &tree_sitter::Node,
+) -> Option<RustFrameworkRoute> {
     let text = parsed.text_for_node(node);
 
     // Match patterns like:
@@ -359,7 +369,10 @@ fn extract_actix_method_handler(text: &str) -> Option<(String, String)> {
 }
 
 /// Extract Rocket route from function with attribute like `#[get("/path")]`.
-fn extract_rocket_route(parsed: &ParsedFile, node: &tree_sitter::Node) -> Option<RustFrameworkRoute> {
+fn extract_rocket_route(
+    parsed: &ParsedFile,
+    node: &tree_sitter::Node,
+) -> Option<RustFrameworkRoute> {
     // Look for preceding attribute
     let mut prev = node.prev_sibling();
     while let Some(p) = prev {
@@ -367,7 +380,15 @@ fn extract_rocket_route(parsed: &ParsedFile, node: &tree_sitter::Node) -> Option
             let attr_text = parsed.text_for_node(&p);
 
             // Check for Rocket route macros
-            let route_macros = ["#[get(", "#[post(", "#[put(", "#[delete(", "#[patch(", "#[head(", "#[options("];
+            let route_macros = [
+                "#[get(",
+                "#[post(",
+                "#[put(",
+                "#[delete(",
+                "#[patch(",
+                "#[head(",
+                "#[options(",
+            ];
 
             for macro_pattern in route_macros {
                 if attr_text.starts_with(macro_pattern) {
@@ -423,8 +444,7 @@ fn extract_warp_route(parsed: &ParsedFile, node: &tree_sitter::Node) -> Option<R
 
     // Try to extract path
     let path = if text.contains("warp::path(") {
-        extract_string_arg(&text, "warp::path(")
-            .map(|p| format!("/{}", p))
+        extract_string_arg(&text, "warp::path(").map(|p| format!("/{}", p))
     } else if text.contains("warp::path!") {
         // warp::path!("users" / "all") style
         extract_warp_path_macro(&text)

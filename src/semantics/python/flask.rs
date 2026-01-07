@@ -190,7 +190,9 @@ fn extract_flask_route(file: &ParsedFile, decorated_def: Node) -> Option<FlaskRo
     let is_async = fn_text.trim_start().starts_with("async def");
 
     for decorator in &decorators {
-        if let Some((app_var_name, http_method, path)) = extract_flask_route_decorator(file, *decorator) {
+        if let Some((app_var_name, http_method, path)) =
+            extract_flask_route_decorator(file, *decorator)
+        {
             let handler_name = func_def
                 .child_by_field_name("name")
                 .map(|n| n.utf8_text(source_bytes).ok())
@@ -222,7 +224,10 @@ fn extract_flask_route(file: &ParsedFile, decorated_def: Node) -> Option<FlaskRo
     None
 }
 
-fn extract_flask_route_decorator(file: &ParsedFile, decorator: Node) -> Option<(String, String, String)> {
+fn extract_flask_route_decorator(
+    file: &ParsedFile,
+    decorator: Node,
+) -> Option<(String, String, String)> {
     let source_bytes = file.source.as_bytes();
 
     let mut cursor = decorator.walk();
@@ -274,7 +279,10 @@ fn collect_flask_error_handlers(file: &ParsedFile, node: Node, out: &mut Vec<Fla
     }
 }
 
-fn extract_flask_error_handler(file: &ParsedFile, decorated_def: Node) -> Option<FlaskErrorHandler> {
+fn extract_flask_error_handler(
+    file: &ParsedFile,
+    decorated_def: Node,
+) -> Option<FlaskErrorHandler> {
     let source_bytes = file.source.as_bytes();
 
     let mut decorators = Vec::new();
@@ -292,7 +300,9 @@ fn extract_flask_error_handler(file: &ParsedFile, decorated_def: Node) -> Option
     let func_def = func_def?;
 
     for decorator in &decorators {
-        if let Some((app_var_name, error_code)) = extract_flask_errorhandler_decorator(file, *decorator) {
+        if let Some((app_var_name, error_code)) =
+            extract_flask_errorhandler_decorator(file, *decorator)
+        {
             let handler_name = func_def
                 .child_by_field_name("name")
                 .map(|n| n.utf8_text(source_bytes).ok())
@@ -314,7 +324,10 @@ fn extract_flask_error_handler(file: &ParsedFile, decorated_def: Node) -> Option
     None
 }
 
-fn extract_flask_errorhandler_decorator(file: &ParsedFile, decorator: Node) -> Option<(String, u32)> {
+fn extract_flask_errorhandler_decorator(
+    file: &ParsedFile,
+    decorator: Node,
+) -> Option<(String, u32)> {
     let source_bytes = file.source.as_bytes();
 
     let mut cursor = decorator.walk();

@@ -88,6 +88,10 @@ fn collect_http_calls(
 ) {
     let ctx = ctx.unwrap_or_default();
 
+    if super::is_inline_test_subtree_root(file, &node) {
+        return;
+    }
+
     if node.kind() == "function_item" {
         let fn_text = file.text_for_node(&node);
         let is_async = fn_text.contains("async fn");
@@ -118,6 +122,10 @@ fn walk_http_calls(
     ctx: &HttpCallContext,
     has_await: bool,
 ) {
+    if super::is_inline_test_subtree_root(file, &node) {
+        return;
+    }
+
     if node.kind() == "call_expression" {
         if let Some(call) = extract_http_call(file, &node, ctx, has_await) {
             out.push(call);
@@ -492,8 +500,7 @@ mod tests {
 
     #[test]
     fn detects_reqwest_blocking() {
-        let calls =
-            parse_and_summarize_http("reqwest::blocking::get(\"https://example.com\")");
+        let calls = parse_and_summarize_http("reqwest::blocking::get(\"https://example.com\")");
         assert_eq!(calls.len(), 1);
         assert!(matches!(
             calls[0].client_kind,

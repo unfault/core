@@ -515,7 +515,10 @@ class MyService:
             .filter(|op| matches!(op.operation_type, model::AsyncOperationType::TaskSpawn))
             .collect();
         assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].enclosing_function, Some("async_method".to_string()));
+        assert_eq!(
+            tasks[0].enclosing_function,
+            Some("async_method".to_string())
+        );
     }
 
     #[test]

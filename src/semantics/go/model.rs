@@ -1,11 +1,11 @@
 use serde::{Deserialize, Serialize};
 
 use crate::parse::ast::{AstLocation, FileId, ParsedFile};
+use crate::semantics::common::db::{DbLibrary, DbOperation, DbOperationType};
+use crate::semantics::common::{CommonLocation, calls::FunctionCall};
 use crate::types::context::Language;
-use crate::semantics::common::{calls::FunctionCall, CommonLocation};
-use crate::semantics::common::db::{DbOperation, DbLibrary, DbOperationType};
 
-use super::frameworks::{extract_go_routes, GoFrameworkSummary};
+use super::frameworks::{GoFrameworkSummary, extract_go_routes};
 use super::http::HttpCallSite;
 
 /// Information about an unchecked error in Go code.
@@ -470,13 +470,13 @@ impl GoFileSemantics {
     /// Run framework-specific analysis (Gin, Echo, net/http, etc.).
     pub fn analyze_frameworks(&mut self, parsed: &ParsedFile) -> anyhow::Result<()> {
         self.http_calls = super::http::summarize_http_clients(parsed);
-        
+
         // Extract Go HTTP framework routes (Gin, Echo, Fiber, Chi)
         let framework_summary = extract_go_routes(parsed);
         if framework_summary.has_framework() {
             self.go_framework = Some(framework_summary);
         }
-        
+
         collect_error_handling(parsed, self);
         collect_concurrency(parsed, self);
         collect_context_usage(parsed, self);
@@ -536,8 +536,12 @@ fn walk_nodes_with_context(
                 .child_by_field_name("name")
                 .map(|n| parsed.text_for_node(&n));
             let receiver = node.child_by_field_name("receiver");
-            let receiver_type = receiver.map(|r| extract_receiver_type(parsed, &r).0).unwrap_or_default();
-            let qualified = func_name.as_ref().map(|n| format!("{}.{}", receiver_type, n));
+            let receiver_type = receiver
+                .map(|r| extract_receiver_type(parsed, &r).0)
+                .unwrap_or_default();
+            let qualified = func_name
+                .as_ref()
+                .map(|n| format!("{}.{}", receiver_type, n));
             TraversalContext {
                 current_function: func_name,
                 current_qualified_name: qualified,
@@ -1054,17 +1058,41 @@ fn detect_db_operation_from_call(
     let callee_expr = parsed.text_for_node(&func_node);
 
     let (library, operation_type) = match callee_expr.as_str() {
-        s if s.to_lowercase().contains("queryx") || s.to_lowercase().contains("queryrowx") => (DbLibrary::Sqlx, DbOperationType::Select),
+        s if s.to_lowercase().contains("queryx") || s.to_lowercase().contains("queryrowx") => {
+            (DbLibrary::Sqlx, DbOperationType::Select)
+        }
         s if s.to_lowercase().contains("mustexec") => (DbLibrary::Sqlx, DbOperationType::Update),
-        s if s.to_lowercase().contains("sql.open") => (DbLibrary::DatabaseSql, DbOperationType::Connect),
-        s if s.to_lowercase().contains("query") && !s.to_lowercase().contains("queryx") && !s.to_lowercase().contains("queryrowx") => (DbLibrary::DatabaseSql, DbOperationType::Select),
-        s if s.to_lowercase().contains("exec") && !s.to_lowercase().contains("mustexec") => (DbLibrary::DatabaseSql, DbOperationType::Update),
-        s if s.to_lowercase().contains("begin") => (DbLibrary::DatabaseSql, DbOperationType::TransactionBegin),
-        s if s.to_lowercase().contains("commit") && s.to_lowercase().contains("tx") => (DbLibrary::DatabaseSql, DbOperationType::TransactionCommit),
-        s if s.to_lowercase().contains("rollback") && s.to_lowercase().contains("tx") => (DbLibrary::DatabaseSql, DbOperationType::TransactionRollback),
-        s if s.to_lowercase().contains("gorm") && s.to_lowercase().contains("open") => (DbLibrary::Gorm, DbOperationType::Connect),
+        s if s.to_lowercase().contains("sql.open") => {
+            (DbLibrary::DatabaseSql, DbOperationType::Connect)
+        }
+        s if s.to_lowercase().contains("query")
+            && !s.to_lowercase().contains("queryx")
+            && !s.to_lowercase().contains("queryrowx") =>
+        {
+            (DbLibrary::DatabaseSql, DbOperationType::Select)
+        }
+        s if s.to_lowercase().contains("exec") && !s.to_lowercase().contains("mustexec") => {
+            (DbLibrary::DatabaseSql, DbOperationType::Update)
+        }
+        s if s.to_lowercase().contains("begin") => {
+            (DbLibrary::DatabaseSql, DbOperationType::TransactionBegin)
+        }
+        s if s.to_lowercase().contains("commit") && s.to_lowercase().contains("tx") => {
+            (DbLibrary::DatabaseSql, DbOperationType::TransactionCommit)
+        }
+        s if s.to_lowercase().contains("rollback") && s.to_lowercase().contains("tx") => {
+            (DbLibrary::DatabaseSql, DbOperationType::TransactionRollback)
+        }
+        s if s.to_lowercase().contains("gorm") && s.to_lowercase().contains("open") => {
+            (DbLibrary::Gorm, DbOperationType::Connect)
+        }
         s if s.to_lowercase().contains(".find") => (DbLibrary::Gorm, DbOperationType::Select),
-        s if s.to_lowercase().contains(".first") || s.to_lowercase().contains(".last") || s.to_lowercase().contains(".take") => (DbLibrary::Gorm, DbOperationType::Select),
+        s if s.to_lowercase().contains(".first")
+            || s.to_lowercase().contains(".last")
+            || s.to_lowercase().contains(".take") =>
+        {
+            (DbLibrary::Gorm, DbOperationType::Select)
+        }
         s if s.to_lowercase().contains(".create") => (DbLibrary::Gorm, DbOperationType::Insert),
         s if s.to_lowercase().contains(".save") => (DbLibrary::Gorm, DbOperationType::Update),
         s if s.to_lowercase().contains(".update") => (DbLibrary::Gorm, DbOperationType::Update),
@@ -1118,7 +1146,11 @@ fn build_callsite(
     };
 
     let callee_parts: Vec<String> = callee_expr.split('.').map(String::from).collect();
-    let is_import_call = callee_parts.len() > 1 && callee_parts[0].chars().next().is_some_and(|c| c.is_lowercase());
+    let is_import_call = callee_parts.len() > 1
+        && callee_parts[0]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_lowercase());
     let import_alias = if is_import_call {
         Some(callee_parts[0].clone())
     } else {
@@ -1126,7 +1158,7 @@ fn build_callsite(
     };
 
     let location = parsed.location_for_node(node);
-    
+
     let function_call = FunctionCall {
         callee_expr: callee_expr.clone(),
         callee_parts,
@@ -1277,11 +1309,11 @@ fn detect_channel_close(
 ) -> Option<ChannelOp> {
     let func_node = node.child_by_field_name("function")?;
     let callee = parsed.text_for_node(&func_node);
-    
+
     if callee != "close" {
         return None;
     }
-    
+
     let text = parsed.text_for_node(node);
     let range = node.range();
 
@@ -1316,11 +1348,11 @@ fn detect_channel_receive_unary(
 
     let operator_node = node.child_by_field_name("operator")?;
     let operator = parsed.text_for_node(&operator_node);
-    
+
     if operator != "<-" {
         return None;
     }
-    
+
     let text = parsed.text_for_node(node);
     let range = node.range();
 
@@ -1353,7 +1385,8 @@ fn build_select_statement(
 
     let has_default = text.contains("default:");
     let has_send_cases = text.contains("case ") && text.contains(" <- ");
-    let has_receive_cases = text.contains("case ") && (text.contains(" <- ") || text.contains(":="));
+    let has_receive_cases =
+        text.contains("case ") && (text.contains(" <- ") || text.contains(":="));
     let is_cancellation_pattern = text.contains("ctx.Done()") || text.contains("ctx.Done");
 
     Some(SelectStatement {
@@ -1675,7 +1708,8 @@ fn check_for_defer_unlock_in_scope(node: tree_sitter::Node, parsed: &ParsedFile)
     while let Some(parent) = ancestor {
         if parent.kind() == "function_declaration" || parent.kind() == "method_declaration" {
             let text = parsed.text_for_node(&parent);
-            return text.contains("defer ") && (text.contains(".Unlock()") || text.contains(".RUnlock()"));
+            return text.contains("defer ")
+                && (text.contains(".Unlock()") || text.contains(".RUnlock()"));
         }
         ancestor = parent.parent();
     }
@@ -1721,7 +1755,11 @@ fn collect_annotations(parsed: &ParsedFile, sem: &mut GoFileSemantics) {
     collect_directive_annotations(parsed, root, sem);
 }
 
-fn collect_struct_tag_annotations(parsed: &ParsedFile, node: tree_sitter::Node, sem: &mut GoFileSemantics) {
+fn collect_struct_tag_annotations(
+    parsed: &ParsedFile,
+    node: tree_sitter::Node,
+    sem: &mut GoFileSemantics,
+) {
     if node.kind() == "struct_type" {
         let parent = node.parent();
         if let Some(type_spec) = parent {
@@ -1741,7 +1779,12 @@ fn collect_struct_tag_annotations(parsed: &ParsedFile, node: tree_sitter::Node, 
     }
 }
 
-fn collect_tags_for_struct(parsed: &ParsedFile, struct_node: &tree_sitter::Node, type_name: &str, sem: &mut GoFileSemantics) {
+fn collect_tags_for_struct(
+    parsed: &ParsedFile,
+    struct_node: &tree_sitter::Node,
+    type_name: &str,
+    sem: &mut GoFileSemantics,
+) {
     for i in 0..struct_node.child_count() {
         if let Some(child) = struct_node.child(i) {
             let field_decls: Vec<tree_sitter::Node> = if child.kind() == "field_declaration_list" {
@@ -1784,34 +1827,55 @@ fn collect_tags_for_struct(parsed: &ParsedFile, struct_node: &tree_sitter::Node,
                             end_col: range.end_point.column as u32,
                         },
                     };
-                    parse_and_add_tag(parsed, &tag_str, &field_name, type_name, range, location, sem);
+                    parse_and_add_tag(
+                        parsed,
+                        &tag_str,
+                        &field_name,
+                        type_name,
+                        range,
+                        location,
+                        sem,
+                    );
                 }
             }
         }
     }
 }
 
-fn parse_and_add_tag(_parsed: &ParsedFile, tag: &str, field_name: &str, type_name: &str, range: tree_sitter::Range, location: AstLocation, sem: &mut GoFileSemantics) {
-    let tag_content = if (tag.starts_with('`') && tag.ends_with('`')) ||
-                         (tag.starts_with('"') && tag.ends_with('"')) {
-        &tag[1..tag.len()-1]
+fn parse_and_add_tag(
+    _parsed: &ParsedFile,
+    tag: &str,
+    field_name: &str,
+    type_name: &str,
+    range: tree_sitter::Range,
+    location: AstLocation,
+    sem: &mut GoFileSemantics,
+) {
+    let tag_content = if (tag.starts_with('`') && tag.ends_with('`'))
+        || (tag.starts_with('"') && tag.ends_with('"'))
+    {
+        &tag[1..tag.len() - 1]
     } else {
         tag
     };
 
     let re = regex::Regex::new(r#"(\w+):"([^"]*)""#).unwrap();
-    
+
     for cap in re.captures_iter(tag_content) {
         let key = cap.get(1).unwrap().as_str();
         let value = cap.get(2).unwrap().as_str();
-        
+
         let annotation_type = determine_annotation_type(key);
 
         sem.annotations.push(GoAnnotation {
             name: key.to_string(),
             value: value.to_string(),
             annotation_type,
-            target_field: if field_name.is_empty() { None } else { Some(field_name.to_string()) },
+            target_field: if field_name.is_empty() {
+                None
+            } else {
+                Some(field_name.to_string())
+            },
             target_type: Some(type_name.to_string()),
             line: range.start_point.row as u32 + 1,
             column: range.start_point.column as u32 + 1,
@@ -1835,7 +1899,11 @@ fn determine_annotation_type(key: &str) -> GoAnnotationType {
     }
 }
 
-fn collect_directive_annotations(parsed: &ParsedFile, node: tree_sitter::Node, sem: &mut GoFileSemantics) {
+fn collect_directive_annotations(
+    parsed: &ParsedFile,
+    node: tree_sitter::Node,
+    sem: &mut GoFileSemantics,
+) {
     if node.kind() == "comment" {
         let text = parsed.text_for_node(&node);
         let range = node.range();
@@ -1903,14 +1971,20 @@ fn parse_go_directive(comment: &str) -> Option<(String, String)> {
         return Some(("+build".to_string(), parts.join(" ")));
     }
 
-    if content.starts_with("nolint") || content.starts_with("lint-ignore") || content.starts_with("exported") {
+    if content.starts_with("nolint")
+        || content.starts_with("lint-ignore")
+        || content.starts_with("exported")
+    {
         let parts: Vec<&str> = content.splitn(2, ' ').collect();
         if parts.len() >= 2 {
             return Some((parts[0].to_string(), parts[1].trim().to_string()));
         }
         let colon_parts: Vec<&str> = content.splitn(2, ':').collect();
         if colon_parts.len() >= 2 {
-            return Some((colon_parts[0].to_string(), colon_parts[1].trim().to_string()));
+            return Some((
+                colon_parts[0].to_string(),
+                colon_parts[1].trim().to_string(),
+            ));
         }
         return Some((content.to_string(), String::new()));
     }
@@ -1933,7 +2007,8 @@ mod tests {
         };
         let parsed = parse_go_file(FileId(1), &sf).expect("parsing should succeed");
         let mut sem = GoFileSemantics::from_parsed(&parsed);
-        sem.analyze_frameworks(&parsed).expect("analysis should succeed");
+        sem.analyze_frameworks(&parsed)
+            .expect("analysis should succeed");
         sem
     }
 
@@ -1986,9 +2061,21 @@ func main() {
 "#;
         let sem = parse_and_build_semantics(src);
         assert_eq!(sem.channel_ops.len(), 3);
-        assert!(sem.channel_ops.iter().any(|op| matches!(op.kind, ChannelOpKind::Send)));
-        assert!(sem.channel_ops.iter().any(|op| matches!(op.kind, ChannelOpKind::Receive)));
-        assert!(sem.channel_ops.iter().any(|op| matches!(op.kind, ChannelOpKind::Close)));
+        assert!(
+            sem.channel_ops
+                .iter()
+                .any(|op| matches!(op.kind, ChannelOpKind::Send))
+        );
+        assert!(
+            sem.channel_ops
+                .iter()
+                .any(|op| matches!(op.kind, ChannelOpKind::Receive))
+        );
+        assert!(
+            sem.channel_ops
+                .iter()
+                .any(|op| matches!(op.kind, ChannelOpKind::Close))
+        );
     }
 
     #[test]

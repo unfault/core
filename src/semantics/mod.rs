@@ -455,7 +455,10 @@ fn my_func() {
         assert_eq!(functions.len(), 1);
 
         let func = &functions[0];
-        assert!(func.start_byte > 0, "RustFunction should have start_byte > 0");
+        assert!(
+            func.start_byte > 0,
+            "RustFunction should have start_byte > 0"
+        );
         assert!(func.end_byte > func.start_byte);
     }
 

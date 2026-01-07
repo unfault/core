@@ -107,7 +107,12 @@ impl RoutePattern {
     }
 
     /// Set location
-    pub fn with_location(mut self, location: CommonLocation, start_byte: usize, end_byte: usize) -> Self {
+    pub fn with_location(
+        mut self,
+        location: CommonLocation,
+        start_byte: usize,
+        end_byte: usize,
+    ) -> Self {
         self.location = location;
         self.start_byte = start_byte;
         self.end_byte = end_byte;
@@ -116,9 +121,7 @@ impl RoutePattern {
 
     /// Check if this is a REST-like route (has path parameters)
     pub fn has_path_parameters(&self) -> bool {
-        self.path.contains(':')
-            || self.path.contains('{')
-            || self.path.contains('<')
+        self.path.contains(':') || self.path.contains('{') || self.path.contains('<')
     }
 
     /// Extract path parameter names
@@ -156,7 +159,9 @@ impl RoutePattern {
             self.method.to_uppercase(),
             self.path,
             param_str,
-            self.handler_name.clone().unwrap_or_else(|| "anonymous".to_string())
+            self.handler_name
+                .clone()
+                .unwrap_or_else(|| "anonymous".to_string())
         )
     }
 }
@@ -213,7 +218,7 @@ pub enum RouteFramework {
     Slim,
 
     // Generic
-    HttpLibrary, // net/http, http module, etc.
+    HttpLibrary,   // net/http, http module, etc.
     Other(String), // Other/custom frameworks
 }
 

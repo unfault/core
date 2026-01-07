@@ -2,7 +2,7 @@
 
 use crate::parse::ast::ParsedFile;
 
-use super::model::{FastifyFileSummary, FastifyRoute, FastifyMiddleware};
+use super::model::{FastifyFileSummary, FastifyMiddleware, FastifyRoute};
 
 pub fn summarize_fastify(parsed: &ParsedFile) -> Option<FastifyFileSummary> {
     let mut summary = FastifyFileSummary {
@@ -176,7 +176,8 @@ fn extract_middleware_name(
                 middleware_name = "helmet".to_string();
             } else if text.contains("fastify.json") || text.contains("bodyParser.json") {
                 middleware_name = "json".to_string();
-            } else if text.contains("fastify.urlencoded") || text.contains("bodyParser.urlencoded") {
+            } else if text.contains("fastify.urlencoded") || text.contains("bodyParser.urlencoded")
+            {
                 middleware_name = "urlencoded".to_string();
             } else if text.contains("fastify.static") {
                 middleware_name = "static".to_string();
@@ -200,7 +201,10 @@ fn extract_middleware_name(
     }
 }
 
-fn extract_register_name(parsed: &ParsedFile, node: &tree_sitter::Node) -> Option<FastifyMiddleware> {
+fn extract_register_name(
+    parsed: &ParsedFile,
+    node: &tree_sitter::Node,
+) -> Option<FastifyMiddleware> {
     let location = parsed.location_for_node(node);
 
     if let Some(args_node) = node.child_by_field_name("arguments") {
@@ -212,11 +216,21 @@ fn extract_register_name(parsed: &ParsedFile, node: &tree_sitter::Node) -> Optio
                 "cors".to_string()
             } else if text_lower.contains("helmet") {
                 "helmet".to_string()
-            } else if text_lower.contains("fastify-jwt") || text_lower.contains("@fastify/jwt") || text_lower.contains("jwt") {
+            } else if text_lower.contains("fastify-jwt")
+                || text_lower.contains("@fastify/jwt")
+                || text_lower.contains("jwt")
+            {
                 "fastify-jwt".to_string()
-            } else if text_lower.contains("fastify-cookie") || text_lower.contains("@fastify/cookie") || text_lower.contains("cookie") {
+            } else if text_lower.contains("fastify-cookie")
+                || text_lower.contains("@fastify/cookie")
+                || text_lower.contains("cookie")
+            {
                 "fastify-cookie".to_string()
-            } else if text_lower.contains("fastify-rate-limit") || text_lower.contains("@fastify/rate-limit") || text_lower.contains("rate-limit") || text_lower.contains("ratelimit") {
+            } else if text_lower.contains("fastify-rate-limit")
+                || text_lower.contains("@fastify/rate-limit")
+                || text_lower.contains("rate-limit")
+                || text_lower.contains("ratelimit")
+            {
                 "fastify-rate-limit".to_string()
             } else if first_arg.kind() == "identifier" {
                 text
@@ -431,7 +445,12 @@ const app = fastify();
 app.use(helmet());
 "#;
         let summary = parse_and_summarize(src).unwrap();
-        assert!(summary.middlewares.iter().any(|m| m.middleware_name == "helmet"));
+        assert!(
+            summary
+                .middlewares
+                .iter()
+                .any(|m| m.middleware_name == "helmet")
+        );
     }
 
     #[test]
@@ -445,7 +464,12 @@ const app = fastify();
 app.register(fastifyCookie, { secret: 'my-secret' });
 "#;
         let summary = parse_and_summarize(src).unwrap();
-        assert!(summary.middlewares.iter().any(|m| m.middleware_name.contains("cookie")));
+        assert!(
+            summary
+                .middlewares
+                .iter()
+                .any(|m| m.middleware_name.contains("cookie"))
+        );
     }
 
     #[test]
@@ -459,9 +483,11 @@ const app = fastify();
 app.register(fastifyRateLimit, { max: 100 });
 "#;
         let summary = parse_and_summarize(src).unwrap();
-        assert!(summary
-            .middlewares
-            .iter()
-            .any(|m| m.middleware_name.contains("rate-limit")));
+        assert!(
+            summary
+                .middlewares
+                .iter()
+                .any(|m| m.middleware_name.contains("rate-limit"))
+        );
     }
 }

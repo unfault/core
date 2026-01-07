@@ -24,7 +24,6 @@ use petgraph::visit::EdgeRef;
 use serde::{Deserialize, Serialize};
 
 use crate::parse::ast::FileId;
-use crate::semantics::{Import, SourceSemantics};
 use crate::semantics::common::CommonSemantics;
 use crate::semantics::go::frameworks::GoFrameworkSummary;
 use crate::semantics::go::model::GoFileSemantics;
@@ -33,6 +32,7 @@ use crate::semantics::python::model::PyFileSemantics;
 use crate::semantics::rust::frameworks::RustFrameworkSummary;
 use crate::semantics::rust::model::RustFileSemantics;
 use crate::semantics::typescript::model::{ExpressFileSummary, TsFileSemantics};
+use crate::semantics::{Import, SourceSemantics};
 use crate::types::context::Language;
 
 /// Category of external modules for better organization
@@ -523,7 +523,8 @@ impl CodeGraph {
                     );
                 }
                 GraphNode::Function { file_id, name, .. } => {
-                    self.function_nodes.insert((*file_id, name.clone()), node_idx);
+                    self.function_nodes
+                        .insert((*file_id, name.clone()), node_idx);
                 }
                 GraphNode::Class { file_id, name, .. } => {
                     self.class_nodes.insert((*file_id, name.clone()), node_idx);
@@ -554,7 +555,8 @@ impl CodeGraph {
 
         // Add module-style path (dots instead of slashes, no extension)
         // e.g., "src/auth/middleware.py" -> "src.auth.middleware"
-        if let Some(without_ext) = path.strip_suffix(".py")
+        if let Some(without_ext) = path
+            .strip_suffix(".py")
             .or_else(|| path.strip_suffix(".ts"))
             .or_else(|| path.strip_suffix(".tsx"))
             .or_else(|| path.strip_suffix(".js"))
@@ -562,7 +564,9 @@ impl CodeGraph {
             .or_else(|| path.strip_suffix(".rs"))
         {
             let module_path = without_ext.replace('/', ".");
-            module_to_file.entry(module_path.clone()).or_insert(node_idx);
+            module_to_file
+                .entry(module_path.clone())
+                .or_insert(node_idx);
 
             // Also add partial module paths
             let mod_parts: Vec<&str> = module_path.split('.').collect();
@@ -628,7 +632,7 @@ pub fn build_code_graph(sem_entries: &[(FileId, Arc<SourceSemantics>)]) -> CodeG
 
         cg.file_nodes.insert(*file_id, node_index);
         cg.path_to_file.insert(path.clone(), node_index);
-        
+
         // Build suffix and module indexes for fast import resolution
         CodeGraph::add_path_to_indexes(
             &path,
@@ -735,10 +739,7 @@ pub fn build_code_graph(sem_entries: &[(FileId, Arc<SourceSemantics>)]) -> CodeG
 /// 2. Find the source file of that import
 /// 3. Look for the function in that file
 /// 4. Add a Calls edge if found
-fn add_cross_file_call_edges(
-    cg: &mut CodeGraph,
-    sem_entries: &[(FileId, Arc<SourceSemantics>)],
-) {
+fn add_cross_file_call_edges(cg: &mut CodeGraph, sem_entries: &[(FileId, Arc<SourceSemantics>)]) {
     // Build a lookup: file_id -> (file_path, Vec<Import>)
     let imports_by_file: HashMap<FileId, (String, Vec<Import>)> = sem_entries
         .iter()
@@ -785,7 +786,7 @@ fn add_cross_file_call_edges(
                 let was_resolved_intra_file = {
                     let callee_key = (*file_id, call.callee.clone());
                     let callee_exists_in_file = cg.function_nodes.contains_key(&callee_key);
-                    
+
                     if let Some(ref receiver) = call.receiver {
                         // Method call - only resolved intra-file if self/this
                         callee_exists_in_file && (receiver == "self" || receiver == "this")
@@ -794,15 +795,20 @@ fn add_cross_file_call_edges(
                         callee_exists_in_file
                     }
                 };
-                
+
                 if was_resolved_intra_file {
                     continue;
                 }
 
                 // Try to resolve through imports (with file path context for relative imports)
-                if let Some(callee_node) =
-                    resolve_call_through_imports(cg, &call.callee, &call.callee_expr, call.receiver.as_deref(), imports, file_path)
-                {
+                if let Some(callee_node) = resolve_call_through_imports(
+                    cg,
+                    &call.callee,
+                    &call.callee_expr,
+                    call.receiver.as_deref(),
+                    imports,
+                    file_path,
+                ) {
                     cg.graph
                         .add_edge(caller_node, callee_node, GraphEdgeKind::Calls);
                 }
@@ -843,7 +849,11 @@ fn resolve_call_through_imports(
             // Check if the callee is a directly imported item
             if import.imports_item(callee) {
                 // Find the source file for this import, with context for relative imports
-                if let Some(source_file_idx) = find_import_source_file_with_context(cg, &import.module_path, importing_file_path) {
+                if let Some(source_file_idx) = find_import_source_file_with_context(
+                    cg,
+                    &import.module_path,
+                    importing_file_path,
+                ) {
                     // Get the file_id from the source file node
                     if let GraphNode::File { file_id, .. } = &cg.graph[source_file_idx] {
                         // Look for the function in that file
@@ -876,7 +886,11 @@ fn resolve_call_through_imports(
                     || import.local_module_name() == Some(module_alias);
 
                 if matches_alias {
-                    if let Some(source_file_idx) = find_import_source_file_with_context(cg, &import.module_path, importing_file_path) {
+                    if let Some(source_file_idx) = find_import_source_file_with_context(
+                        cg,
+                        &import.module_path,
+                        importing_file_path,
+                    ) {
                         if let GraphNode::File { file_id, .. } = &cg.graph[source_file_idx] {
                             let callee_key = (*file_id, func_name.to_string());
                             if let Some(&func_node) = cg.function_nodes.get(&callee_key) {
@@ -901,7 +915,11 @@ fn resolve_call_through_imports(
 /// * `cg` - The code graph containing file nodes
 /// * `module_path` - The module path from the import (e.g., ".utils", "pkg.models")
 /// * `importing_file_path` - The path of the file doing the import (for relative resolution)
-fn find_import_source_file_with_context(cg: &CodeGraph, module_path: &str, importing_file_path: &str) -> Option<NodeIndex> {
+fn find_import_source_file_with_context(
+    cg: &CodeGraph,
+    module_path: &str,
+    importing_file_path: &str,
+) -> Option<NodeIndex> {
     // Handle relative imports
     if module_path.starts_with('.') {
         // Use the same resolution logic as add_import_edges
@@ -913,7 +931,7 @@ fn find_import_source_file_with_context(cg: &CodeGraph, module_path: &str, impor
         }
         return None;
     }
-    
+
     // For absolute imports, delegate to the existing function
     find_import_source_file(cg, module_path)
 }
@@ -929,7 +947,7 @@ fn find_import_source_file(cg: &CodeGraph, module_path: &str) -> Option<NodeInde
     if module_path.starts_with('.') {
         return None;
     }
-    
+
     // Try various path patterns for absolute imports
     let module_as_file = module_path.replace('.', "/");
     let possible_paths = [
@@ -966,7 +984,7 @@ fn add_import_edges(
         SourceSemantics::Rust(rs) => rs.path.clone(),
         SourceSemantics::Typescript(ts) => ts.path.clone(),
     };
-    
+
     // Get imports via CommonSemantics trait
     let imports = match sem.as_ref() {
         SourceSemantics::Python(py) => py.imports(),
@@ -985,7 +1003,7 @@ fn add_import_edges(
         // 1. Exact module path (e.g., "reliably_app.task" -> "reliably_app/task.py")
         // 2. Module path as directory init (e.g., "reliably_app" -> "reliably_app/__init__.py")
         // 3. Relative imports (e.g., ".utils" resolved relative to the importing file's directory)
-        
+
         let possible_paths = if import.module_path.starts_with('.') {
             // Handle relative imports (Python-style: from .utils import foo)
             // The module path starts with one or more dots indicating relative level
@@ -1050,7 +1068,7 @@ fn resolve_relative_import(importing_file: &str, module_path: &str) -> Vec<Strin
     // Count leading dots to determine relative level
     let dots = module_path.chars().take_while(|&c| c == '.').count();
     let remaining = &module_path[dots..];
-    
+
     // Get the directory of the importing file
     let importing_dir = if let Some(last_slash) = importing_file.rfind('/') {
         &importing_file[..last_slash]
@@ -1058,7 +1076,7 @@ fn resolve_relative_import(importing_file: &str, module_path: &str) -> Vec<Strin
         // File is in root directory
         ""
     };
-    
+
     // Go up `dots - 1` directories (one dot = same directory, two dots = parent, etc.)
     let mut base_dir = importing_dir.to_string();
     for _ in 0..(dots.saturating_sub(1)) {
@@ -1069,10 +1087,10 @@ fn resolve_relative_import(importing_file: &str, module_path: &str) -> Vec<Strin
             break;
         }
     }
-    
+
     // Convert remaining module path to file path
     let module_as_path = remaining.replace('.', "/");
-    
+
     // Build the resolved path
     let resolved_base = if base_dir.is_empty() {
         module_as_path
@@ -1082,7 +1100,7 @@ fn resolve_relative_import(importing_file: &str, module_path: &str) -> Vec<Strin
     } else {
         format!("{}/{}", base_dir, module_as_path)
     };
-    
+
     // Return possible file paths
     vec![
         format!("{}.py", resolved_base),
@@ -1119,7 +1137,11 @@ fn add_function_nodes(
         SourceSemantics::Python(py) => {
             // Skip FastAPI route handlers
             if let Some(fastapi) = &py.fastapi {
-                fastapi.routes.iter().map(|r| r.handler_name.as_str()).collect()
+                fastapi
+                    .routes
+                    .iter()
+                    .map(|r| r.handler_name.as_str())
+                    .collect()
             } else {
                 std::collections::HashSet::new()
             }
@@ -1127,7 +1149,9 @@ fn add_function_nodes(
         SourceSemantics::Typescript(ts) => {
             // Skip Express route handlers
             if let Some(express) = &ts.express {
-                express.routes.iter()
+                express
+                    .routes
+                    .iter()
                     .filter_map(|r| r.handler_name.as_deref())
                     .collect()
             } else {
@@ -1137,7 +1161,9 @@ fn add_function_nodes(
         SourceSemantics::Go(go) => {
             // Skip Go framework route handlers (Gin, Echo, Fiber, Chi)
             if let Some(framework) = &go.go_framework {
-                framework.routes.iter()
+                framework
+                    .routes
+                    .iter()
                     .filter_map(|r| r.handler_name.as_deref())
                     .collect()
             } else {
@@ -1390,7 +1416,10 @@ fn add_express_nodes(
         };
 
         // Skip if this function was already added by add_function_nodes
-        if cg.function_nodes.contains_key(&(file_id, handler_name.clone())) {
+        if cg
+            .function_nodes
+            .contains_key(&(file_id, handler_name.clone()))
+        {
             // Update the existing node with HTTP metadata instead of creating a new one
             // For now, we skip - but ideally we'd update the existing node
             // This is a limitation we can fix later by refactoring
@@ -1440,7 +1469,10 @@ fn add_go_framework_nodes(
         };
 
         // Skip if this function was already added by add_function_nodes
-        if cg.function_nodes.contains_key(&(file_id, handler_name.clone())) {
+        if cg
+            .function_nodes
+            .contains_key(&(file_id, handler_name.clone()))
+        {
             // We could update the existing node, but for simplicity we skip
             continue;
         }
@@ -1481,7 +1513,10 @@ fn add_rust_framework_nodes(
         let handler_name = route.handler_name.clone();
 
         // Skip if this function was already added by add_function_nodes
-        if cg.function_nodes.contains_key(&(file_id, handler_name.clone())) {
+        if cg
+            .function_nodes
+            .contains_key(&(file_id, handler_name.clone()))
+        {
             // We could update the existing node, but for simplicity we skip
             continue;
         }
@@ -2254,8 +2289,14 @@ def bar():
         // Verify lookups are restored
         assert!(cg.file_nodes.contains_key(&file_id));
         assert!(cg.path_to_file.contains_key("test.py"));
-        assert!(cg.function_nodes.contains_key(&(file_id, "my_func".to_string())));
-        assert!(cg.class_nodes.contains_key(&(file_id, "MyClass".to_string())));
+        assert!(
+            cg.function_nodes
+                .contains_key(&(file_id, "my_func".to_string()))
+        );
+        assert!(
+            cg.class_nodes
+                .contains_key(&(file_id, "MyClass".to_string()))
+        );
         assert!(cg.external_modules.contains_key("requests"));
     }
 
@@ -2359,8 +2400,14 @@ def main():
         let cg = build_code_graph(&sem_entries);
 
         // Both functions should exist
-        assert!(cg.function_nodes.contains_key(&(helper_id, "helper_func".to_string())));
-        assert!(cg.function_nodes.contains_key(&(main_id, "main".to_string())));
+        assert!(
+            cg.function_nodes
+                .contains_key(&(helper_id, "helper_func".to_string()))
+        );
+        assert!(
+            cg.function_nodes
+                .contains_key(&(main_id, "main".to_string()))
+        );
 
         // Check that there's an import edge from main.py to helpers.py
         let stats = cg.stats();
@@ -2394,7 +2441,10 @@ def main():
     use crate::parse::typescript::parse_typescript_file;
     use crate::semantics::typescript::model::TsFileSemantics;
 
-    fn parse_typescript_and_build_semantics(path: &str, source: &str) -> (FileId, Arc<SourceSemantics>) {
+    fn parse_typescript_and_build_semantics(
+        path: &str,
+        source: &str,
+    ) -> (FileId, Arc<SourceSemantics>) {
         let sf = SourceFile {
             path: path.to_string(),
             language: Language::Typescript,
@@ -2440,7 +2490,13 @@ app.post('/users', createUser);
         let get_users_key = (file_id, "getUsers".to_string());
         assert!(cg.function_nodes.contains_key(&get_users_key));
         let get_users_idx = cg.function_nodes[&get_users_key];
-        if let GraphNode::Function { http_method, http_path, is_handler, .. } = &cg.graph[get_users_idx] {
+        if let GraphNode::Function {
+            http_method,
+            http_path,
+            is_handler,
+            ..
+        } = &cg.graph[get_users_idx]
+        {
             assert_eq!(*http_method, Some("GET".to_string()));
             assert_eq!(*http_path, Some("/users".to_string()));
             assert!(*is_handler);
@@ -2452,7 +2508,13 @@ app.post('/users', createUser);
         let create_user_key = (file_id, "createUser".to_string());
         assert!(cg.function_nodes.contains_key(&create_user_key));
         let create_user_idx = cg.function_nodes[&create_user_key];
-        if let GraphNode::Function { http_method, http_path, is_handler, .. } = &cg.graph[create_user_idx] {
+        if let GraphNode::Function {
+            http_method,
+            http_path,
+            is_handler,
+            ..
+        } = &cg.graph[create_user_idx]
+        {
             assert_eq!(*http_method, Some("POST".to_string()));
             assert_eq!(*http_path, Some("/users".to_string()));
             assert!(*is_handler);
@@ -2468,7 +2530,7 @@ app.post('/users', createUser);
         // from .utils import foo -> should resolve to utils.py in same directory
         let paths = resolve_relative_import("app.py", ".utils");
         assert!(paths.contains(&"utils.py".to_string()));
-        
+
         let paths = resolve_relative_import("pkg/app.py", ".utils");
         assert!(paths.contains(&"pkg/utils.py".to_string()));
     }
@@ -2531,8 +2593,12 @@ def main():
 
         // Should have import edge from app.py to utils.py
         let stats = cg.stats();
-        assert!(stats.import_edge_count >= 1, "Expected at least 1 import edge, got {}", stats.import_edge_count);
-        
+        assert!(
+            stats.import_edge_count >= 1,
+            "Expected at least 1 import edge, got {}",
+            stats.import_edge_count
+        );
+
         // Verify the edge is ImportsFrom with correct items
         let app_file_idx = cg.file_nodes.get(&app_id).expect("app file should exist");
         let mut found_import_edge = false;
@@ -2543,7 +2609,10 @@ def main():
                 }
             }
         }
-        assert!(found_import_edge, "Expected ImportsFrom edge with 'add' item");
+        assert!(
+            found_import_edge,
+            "Expected ImportsFrom edge with 'add' item"
+        );
     }
 
     #[test]
@@ -2566,7 +2635,10 @@ from ..utils import helper
 
         // Should have import edge from app.py to utils.py
         let stats = cg.stats();
-        assert!(stats.import_edge_count >= 1, "Expected at least 1 import edge for ..utils");
+        assert!(
+            stats.import_edge_count >= 1,
+            "Expected at least 1 import edge for ..utils"
+        );
     }
 
     #[test]
@@ -2585,7 +2657,7 @@ from ..utils import helper
     fn cross_file_call_edge_with_relative_import() {
         // This is the exact scenario from the bug report:
         // utils.py defines add(), app.py imports via `from .utils import add` and calls it
-        
+
         // utils.py defines the add function
         let utils_src = r#"
 def add(a, b):
@@ -2607,19 +2679,33 @@ def main():
         let cg = build_code_graph(&sem_entries);
 
         // Verify both functions exist
-        assert!(cg.function_nodes.contains_key(&(utils_id, "add".to_string())));
-        assert!(cg.function_nodes.contains_key(&(app_id, "main".to_string())));
+        assert!(
+            cg.function_nodes
+                .contains_key(&(utils_id, "add".to_string()))
+        );
+        assert!(
+            cg.function_nodes
+                .contains_key(&(app_id, "main".to_string()))
+        );
 
         // Key assertion: There should be a Calls edge from main() to add()
         let stats = cg.stats();
-        assert!(stats.calls_edge_count >= 1,
+        assert!(
+            stats.calls_edge_count >= 1,
             "Expected at least 1 Calls edge for cross-file call via relative import, got {}",
-            stats.calls_edge_count);
+            stats.calls_edge_count
+        );
 
         // Verify the specific edge exists: main -> add
-        let main_func_idx = cg.function_nodes.get(&(app_id, "main".to_string())).expect("main function should exist");
-        let add_func_idx = cg.function_nodes.get(&(utils_id, "add".to_string())).expect("add function should exist");
-        
+        let main_func_idx = cg
+            .function_nodes
+            .get(&(app_id, "main".to_string()))
+            .expect("main function should exist");
+        let add_func_idx = cg
+            .function_nodes
+            .get(&(utils_id, "add".to_string()))
+            .expect("add function should exist");
+
         let mut found_calls_edge = false;
         for edge in cg.graph.edges(*main_func_idx) {
             if matches!(edge.weight(), GraphEdgeKind::Calls) {
@@ -2644,7 +2730,10 @@ def main():
 
         // With context, relative import should succeed
         let result = find_import_source_file_with_context(&cg, ".utils", "app.py");
-        assert!(result.is_some(), "Expected to find utils.py via relative import from app.py");
+        assert!(
+            result.is_some(),
+            "Expected to find utils.py via relative import from app.py"
+        );
     }
 
     #[test]
@@ -2652,7 +2741,7 @@ def main():
         // This test verifies that db.add() does NOT create a Calls edge to a local add() function.
         // This was a bug where we incorrectly matched on just the function name "add",
         // ignoring that the call was actually a method call on an object "db".
-        
+
         let src = r#"
 def add(a, b):
     return a + b
@@ -2670,12 +2759,24 @@ def process(db):
         let cg = build_code_graph(&sem_entries);
 
         // Verify both functions exist
-        assert!(cg.function_nodes.contains_key(&(file_id, "add".to_string())));
-        assert!(cg.function_nodes.contains_key(&(file_id, "process".to_string())));
+        assert!(
+            cg.function_nodes
+                .contains_key(&(file_id, "add".to_string()))
+        );
+        assert!(
+            cg.function_nodes
+                .contains_key(&(file_id, "process".to_string()))
+        );
 
         // Get the function nodes
-        let add_func_idx = cg.function_nodes.get(&(file_id, "add".to_string())).expect("add function should exist");
-        let process_func_idx = cg.function_nodes.get(&(file_id, "process".to_string())).expect("process function should exist");
+        let add_func_idx = cg
+            .function_nodes
+            .get(&(file_id, "add".to_string()))
+            .expect("add function should exist");
+        let process_func_idx = cg
+            .function_nodes
+            .get(&(file_id, "process".to_string()))
+            .expect("process function should exist");
 
         // Count Calls edges from process() to add()
         let mut calls_count = 0;
@@ -2689,16 +2790,18 @@ def process(db):
 
         // Should have exactly 1 Calls edge (for the direct add(1, 2) call),
         // NOT 2 (which would happen if db.add() also matched)
-        assert_eq!(calls_count, 1, 
+        assert_eq!(
+            calls_count, 1,
             "Expected exactly 1 Calls edge from process() to add() (for the direct call), but got {}. \
             The db.add() method call should NOT create an edge to the local add() function.",
-            calls_count);
+            calls_count
+        );
     }
 
     #[test]
     fn method_call_does_not_match_imported_function_with_same_name() {
         // This test verifies that db.add() does NOT create a Calls edge to an imported add() function.
-        
+
         // utils.py defines add()
         let utils_src = r#"
 def add(a, b):
@@ -2724,8 +2827,14 @@ def process(db):
         let cg = build_code_graph(&sem_entries);
 
         // Get the function nodes
-        let add_func_idx = cg.function_nodes.get(&(utils_id, "add".to_string())).expect("add function should exist in utils.py");
-        let process_func_idx = cg.function_nodes.get(&(app_id, "process".to_string())).expect("process function should exist in app.py");
+        let add_func_idx = cg
+            .function_nodes
+            .get(&(utils_id, "add".to_string()))
+            .expect("add function should exist in utils.py");
+        let process_func_idx = cg
+            .function_nodes
+            .get(&(app_id, "process".to_string()))
+            .expect("process function should exist in app.py");
 
         // Count Calls edges from process() to add()
         let mut calls_count = 0;
@@ -2739,9 +2848,11 @@ def process(db):
 
         // Should have exactly 1 Calls edge (for the direct add(1, 2) call),
         // NOT 2 (which would happen if db.add() also matched the imported add)
-        assert_eq!(calls_count, 1, 
+        assert_eq!(
+            calls_count, 1,
             "Expected exactly 1 Calls edge from process() to utils.add() (for the direct call), but got {}. \
             The db.add() method call should NOT create an edge to the imported add() function.",
-            calls_count);
+            calls_count
+        );
     }
 }

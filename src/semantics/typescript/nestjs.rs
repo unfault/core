@@ -3,8 +3,8 @@
 use crate::parse::ast::ParsedFile;
 
 use super::model::{
-    NestJSController, NestJSFileSummary, NestJSGuard, NestJSInterceptor, NestJSModule,
-    NestJSRoute, NestJSService,
+    NestJSController, NestJSFileSummary, NestJSGuard, NestJSInterceptor, NestJSModule, NestJSRoute,
+    NestJSService,
 };
 
 pub fn summarize_nestjs(parsed: &ParsedFile) -> Option<NestJSFileSummary> {
@@ -33,11 +33,7 @@ pub fn summarize_nestjs(parsed: &ParsedFile) -> Option<NestJSFileSummary> {
     Some(summary)
 }
 
-fn walk_for_nestjs(
-    node: tree_sitter::Node,
-    parsed: &ParsedFile,
-    summary: &mut NestJSFileSummary,
-) {
+fn walk_for_nestjs(node: tree_sitter::Node, parsed: &ParsedFile, summary: &mut NestJSFileSummary) {
     match node.kind() {
         "class_declaration" => {
             analyze_nestjs_class(parsed, &node, summary);
@@ -71,7 +67,9 @@ fn analyze_nestjs_class(
 
     let decorators = extract_decorators(parsed, node);
 
-    let has_controller = decorators.iter().any(|d| d.contains("@Controller") || d.contains("@RestController"));
+    let has_controller = decorators
+        .iter()
+        .any(|d| d.contains("@Controller") || d.contains("@RestController"));
     let has_injectable = decorators.iter().any(|d| d.contains("@Injectable"));
     let has_module = decorators.iter().any(|d| d.contains("@Module"));
     let has_guards = decorators.iter().any(|d| d.contains("@UseGuards"));
@@ -131,7 +129,10 @@ fn analyze_nestjs_method_decorators(
     let location = parsed.location_for_node(node);
 
     let name_node = node.child_by_field_name("name");
-    let method_name = name_node.as_ref().map(|n| parsed.text_for_node(n)).unwrap_or_default();
+    let method_name = name_node
+        .as_ref()
+        .map(|n| parsed.text_for_node(n))
+        .unwrap_or_default();
 
     let decorators = extract_method_decorators(parsed, node);
 

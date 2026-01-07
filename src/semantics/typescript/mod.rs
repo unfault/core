@@ -343,14 +343,24 @@ async function main() {
         let promises: Vec<_> = sem
             .async_operations
             .iter()
-            .filter(|op| matches!(op.operation_type, model::TsAsyncOperationType::PromiseConstructor))
+            .filter(|op| {
+                matches!(
+                    op.operation_type,
+                    model::TsAsyncOperationType::PromiseConstructor
+                )
+            })
             .collect();
         assert_eq!(promises.len(), 1);
 
         let combinators: Vec<_> = sem
             .async_operations
             .iter()
-            .filter(|op| matches!(op.operation_type, model::TsAsyncOperationType::PromiseCombinator))
+            .filter(|op| {
+                matches!(
+                    op.operation_type,
+                    model::TsAsyncOperationType::PromiseCombinator
+                )
+            })
             .collect();
         assert_eq!(combinators.len(), 1);
     }
@@ -385,7 +395,12 @@ async function main() {
         let combinators: Vec<_> = sem
             .async_operations
             .iter()
-            .filter(|op| matches!(op.operation_type, model::TsAsyncOperationType::PromiseCombinator))
+            .filter(|op| {
+                matches!(
+                    op.operation_type,
+                    model::TsAsyncOperationType::PromiseCombinator
+                )
+            })
             .collect();
         assert_eq!(combinators.len(), 1);
         assert!(combinators[0].operation_text.contains("Promise.all"));
@@ -403,7 +418,12 @@ async function main() {
         let combinators: Vec<_> = sem
             .async_operations
             .iter()
-            .filter(|op| matches!(op.operation_type, model::TsAsyncOperationType::PromiseCombinator))
+            .filter(|op| {
+                matches!(
+                    op.operation_type,
+                    model::TsAsyncOperationType::PromiseCombinator
+                )
+            })
             .collect();
         assert_eq!(combinators.len(), 1);
     }
@@ -420,7 +440,12 @@ async function main() {
         let combinators: Vec<_> = sem
             .async_operations
             .iter()
-            .filter(|op| matches!(op.operation_type, model::TsAsyncOperationType::PromiseCombinator))
+            .filter(|op| {
+                matches!(
+                    op.operation_type,
+                    model::TsAsyncOperationType::PromiseCombinator
+                )
+            })
             .collect();
         assert_eq!(combinators.len(), 1);
     }
@@ -437,7 +462,12 @@ async function main() {
         let combinators: Vec<_> = sem
             .async_operations
             .iter()
-            .filter(|op| matches!(op.operation_type, model::TsAsyncOperationType::PromiseCombinator))
+            .filter(|op| {
+                matches!(
+                    op.operation_type,
+                    model::TsAsyncOperationType::PromiseCombinator
+                )
+            })
             .collect();
         assert_eq!(combinators.len(), 1);
     }
@@ -624,14 +654,24 @@ async function main() {
         let promises: Vec<_> = sem
             .async_operations
             .iter()
-            .filter(|op| matches!(op.operation_type, model::TsAsyncOperationType::PromiseConstructor))
+            .filter(|op| {
+                matches!(
+                    op.operation_type,
+                    model::TsAsyncOperationType::PromiseConstructor
+                )
+            })
             .collect();
         assert_eq!(promises.len(), 2);
 
         let combinators: Vec<_> = sem
             .async_operations
             .iter()
-            .filter(|op| matches!(op.operation_type, model::TsAsyncOperationType::PromiseCombinator))
+            .filter(|op| {
+                matches!(
+                    op.operation_type,
+                    model::TsAsyncOperationType::PromiseCombinator
+                )
+            })
             .collect();
         assert_eq!(combinators.len(), 1);
 
@@ -658,7 +698,12 @@ async function main() {
         let promises: Vec<_> = sem
             .async_operations
             .iter()
-            .filter(|op| matches!(op.operation_type, model::TsAsyncOperationType::PromiseConstructor))
+            .filter(|op| {
+                matches!(
+                    op.operation_type,
+                    model::TsAsyncOperationType::PromiseConstructor
+                )
+            })
             .collect();
         assert_eq!(promises.len(), 1);
     }

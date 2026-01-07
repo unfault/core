@@ -88,7 +88,9 @@ fn detect_asyncio_call(
     let callee = parsed.text_for_node(&func_node);
 
     let operation_type = match callee.as_str() {
-        "asyncio.create_task" | "asyncio.ensure_future" | "asyncio.Task" => AsyncOperationType::TaskSpawn,
+        "asyncio.create_task" | "asyncio.ensure_future" | "asyncio.Task" => {
+            AsyncOperationType::TaskSpawn
+        }
         "asyncio.gather" | "asyncio.wait" | "asyncio.wait_for" => AsyncOperationType::TaskGather,
         "asyncio.Queue.get" | "asyncio.Queue.put" => {
             if callee.ends_with(".get") {
@@ -174,10 +176,14 @@ fn extract_timeout_from_call(
     if callee == "asyncio.wait_for" {
         if let Some(timeout_start) = args_text.find("timeout") {
             let before = &args_text[..timeout_start].trim_end();
-            if let Some(digit_start) = before.rfind(|c: char| c.is_ascii_digit() || c == '-' || c == '+') {
+            if let Some(digit_start) =
+                before.rfind(|c: char| c.is_ascii_digit() || c == '-' || c == '+')
+            {
                 let number: String = args_text[digit_start..]
                     .chars()
-                    .take_while(|c: &char| c.is_ascii_digit() || *c == '.' || *c == '-' || *c == '+')
+                    .take_while(|c: &char| {
+                        c.is_ascii_digit() || *c == '.' || *c == '-' || *c == '+'
+                    })
                     .collect();
                 if let Ok(seconds) = number.parse::<f64>() {
                     return (true, Some(seconds));
@@ -225,8 +231,15 @@ async def main():
 "#;
         let summary = parse_and_summarize(src);
         assert_eq!(summary.task_spawns.len(), 1);
-        assert_eq!(summary.task_spawns[0].operation_type, AsyncOperationType::TaskSpawn);
-        assert!(summary.task_spawns[0].operation_text.contains("asyncio.create_task"));
+        assert_eq!(
+            summary.task_spawns[0].operation_type,
+            AsyncOperationType::TaskSpawn
+        );
+        assert!(
+            summary.task_spawns[0]
+                .operation_text
+                .contains("asyncio.create_task")
+        );
     }
 
     #[test]
@@ -239,7 +252,10 @@ async def main():
 "#;
         let summary = parse_and_summarize(src);
         assert_eq!(summary.gathers.len(), 1);
-        assert_eq!(summary.gathers[0].operation_type, AsyncOperationType::TaskGather);
+        assert_eq!(
+            summary.gathers[0].operation_type,
+            AsyncOperationType::TaskGather
+        );
     }
 
     #[test]
@@ -375,6 +391,9 @@ class MyClass:
         let summary = parse_and_summarize(src);
         let sleep = summary.sleeps.first();
         assert!(sleep.is_some());
-        assert_eq!(sleep.unwrap().enclosing_function, Some("async_method".to_string()));
+        assert_eq!(
+            sleep.unwrap().enclosing_function,
+            Some("async_method".to_string())
+        );
     }
 }

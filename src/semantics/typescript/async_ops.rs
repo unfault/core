@@ -103,7 +103,10 @@ fn detect_ts_async_call(
         "setTimeout" | "setInterval" | "setImmediate" => TsAsyncOperationType::Timeout,
         "AbortController" => TsAsyncOperationType::Cancellation,
         _ => {
-            if callee.contains(".then(") || callee.contains(".catch(") || callee.contains(".finally(") {
+            if callee.contains(".then(")
+                || callee.contains(".catch(")
+                || callee.contains(".finally(")
+            {
                 TsAsyncOperationType::PromiseChain
             } else {
                 return None;
@@ -198,7 +201,11 @@ fn extract_timeout_from_args(parsed: &ParsedFile, node: &tree_sitter::Node) -> (
 
         if let Some(timeout_idx) = text.find("timeout") {
             let before_timeout = &text[..timeout_idx.saturating_sub(50)];
-            if let Some(number_start) = before_timeout.chars().rev().position(|c| c.is_ascii_digit() || c == '.') {
+            if let Some(number_start) = before_timeout
+                .chars()
+                .rev()
+                .position(|c| c.is_ascii_digit() || c == '.')
+            {
                 let start = timeout_idx - number_start;
                 let number: String = text[start..]
                     .chars()
@@ -277,7 +284,10 @@ async function main() {
 "#;
         let summary = parse_and_summarize(src);
         assert_eq!(summary.awaits.len(), 1);
-        assert_eq!(summary.awaits[0].operation_type, TsAsyncOperationType::Await);
+        assert_eq!(
+            summary.awaits[0].operation_type,
+            TsAsyncOperationType::Await
+        );
     }
 
     #[test]
@@ -308,7 +318,10 @@ function main() {
 "#;
         let summary = parse_and_summarize(src);
         assert_eq!(summary.timeouts.len(), 1);
-        assert_eq!(summary.timeouts[0].operation_type, TsAsyncOperationType::Timeout);
+        assert_eq!(
+            summary.timeouts[0].operation_type,
+            TsAsyncOperationType::Timeout
+        );
     }
 
     #[test]

@@ -61,30 +61,26 @@ impl GoFrameworkSummary {
 pub fn extract_go_routes(parsed: &ParsedFile) -> GoFrameworkSummary {
     let mut summary = GoFrameworkSummary::default();
     let root = parsed.tree.root_node();
-    
+
     // First pass: detect which frameworks are imported
     detect_frameworks(parsed, root, &mut summary);
-    
+
     // Second pass: extract routes
     collect_routes(parsed, root, &mut summary);
-    
+
     summary
 }
 
 /// HTTP methods for method-style routing (Gin, Echo style).
-const HTTP_METHODS_UPPER: &[&str] = &[
-    "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS",
-];
+const HTTP_METHODS_UPPER: &[&str] = &["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"];
 
 /// HTTP methods for lowercase style (Fiber, Chi style).
-const HTTP_METHODS_LOWER: &[&str] = &[
-    "Get", "Post", "Put", "Delete", "Patch", "Head", "Options",
-];
+const HTTP_METHODS_LOWER: &[&str] = &["Get", "Post", "Put", "Delete", "Patch", "Head", "Options"];
 
 fn detect_frameworks(parsed: &ParsedFile, node: Node, summary: &mut GoFrameworkSummary) {
     if node.kind() == "import_declaration" || node.kind() == "import_spec" {
         let text = parsed.text_for_node(&node);
-        
+
         if text.contains("github.com/gin-gonic/gin") {
             if !summary.frameworks.contains(&GoHttpFramework::Gin) {
                 summary.frameworks.push(GoHttpFramework::Gin);
@@ -116,7 +112,7 @@ fn detect_frameworks(parsed: &ParsedFile, node: Node, summary: &mut GoFrameworkS
             }
         }
     }
-    
+
     // Recurse
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i) {
@@ -131,7 +127,7 @@ fn collect_routes(parsed: &ParsedFile, node: Node, summary: &mut GoFrameworkSumm
             summary.routes.push(route);
         }
     }
-    
+
     // Recurse
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i) {
@@ -140,14 +136,18 @@ fn collect_routes(parsed: &ParsedFile, node: Node, summary: &mut GoFrameworkSumm
     }
 }
 
-fn extract_route(parsed: &ParsedFile, call_node: Node, frameworks: &[GoHttpFramework]) -> Option<GoRoute> {
+fn extract_route(
+    parsed: &ParsedFile,
+    call_node: Node,
+    frameworks: &[GoHttpFramework],
+) -> Option<GoRoute> {
     let func = call_node.child_by_field_name("function")?;
-    
+
     // Check for selector expression: router.GET, e.POST, app.Get, etc.
     if func.kind() == "selector_expression" {
         let field = func.child_by_field_name("field")?;
         let method_name = parsed.text_for_node(&field);
-        
+
         // Determine HTTP method and framework
         let (http_method, framework) = if HTTP_METHODS_UPPER.contains(&method_name.as_str()) {
             // Gin or Echo style: .GET, .POST
@@ -174,13 +174,13 @@ fn extract_route(parsed: &ParsedFile, call_node: Node, frameworks: &[GoHttpFrame
         } else {
             return None;
         };
-        
+
         // Get arguments: first should be path, second should be handler(s)
         let args = call_node.child_by_field_name("arguments")?;
-        
+
         let mut path: Option<String> = None;
         let mut handler_name: Option<String> = None;
-        
+
         let mut arg_index = 0;
         for i in 0..args.child_count() {
             if let Some(arg) = args.child(i) {
@@ -188,7 +188,7 @@ fn extract_route(parsed: &ParsedFile, call_node: Node, frameworks: &[GoHttpFrame
                 if arg.kind() == "," || arg.kind() == "(" || arg.kind() == ")" {
                     continue;
                 }
-                
+
                 if arg_index == 0 {
                     // First argument is the path
                     let path_text = parsed.text_for_node(&arg);
@@ -201,9 +201,9 @@ fn extract_route(parsed: &ParsedFile, call_node: Node, frameworks: &[GoHttpFrame
                 arg_index += 1;
             }
         }
-        
+
         let route_path = path?;
-        
+
         Some(GoRoute {
             framework,
             http_method,
@@ -224,19 +224,19 @@ fn extract_route(parsed: &ParsedFile, call_node: Node, frameworks: &[GoHttpFrame
 fn extract_mux_route(parsed: &ParsedFile, call_node: Node) -> Option<GoRoute> {
     // Gorilla Mux pattern: r.HandleFunc("/path", handler).Methods("GET")
     // This is more complex - we need to look for the .Methods() chaining
-    
+
     let args = call_node.child_by_field_name("arguments")?;
-    
+
     let mut path: Option<String> = None;
     let mut handler_name: Option<String> = None;
-    
+
     let mut arg_index = 0;
     for i in 0..args.child_count() {
         if let Some(arg) = args.child(i) {
             if arg.kind() == "," || arg.kind() == "(" || arg.kind() == ")" {
                 continue;
             }
-            
+
             if arg_index == 0 {
                 let path_text = parsed.text_for_node(&arg);
                 path = Some(path_text.trim_matches('"').to_string());
@@ -247,12 +247,12 @@ fn extract_mux_route(parsed: &ParsedFile, call_node: Node) -> Option<GoRoute> {
             arg_index += 1;
         }
     }
-    
+
     let route_path = path?;
-    
+
     // Try to find .Methods() call by looking at parent
     let http_method = find_methods_chain(parsed, call_node).unwrap_or_else(|| "ANY".to_string());
-    
+
     Some(GoRoute {
         framework: GoHttpFramework::Mux,
         http_method,
@@ -267,27 +267,27 @@ fn extract_mux_route(parsed: &ParsedFile, call_node: Node) -> Option<GoRoute> {
 fn extract_net_http_route(parsed: &ParsedFile, call_node: Node) -> Option<GoRoute> {
     // net/http pattern: http.HandleFunc("/path", handler) or http.Handle("/path", handler)
     // The function is an identifier like "http.HandleFunc" or "http.Handle"
-    
+
     let func = call_node.child_by_field_name("function")?;
     let func_text = parsed.text_for_node(&func);
-    
+
     // Check if this is http.HandleFunc or http.Handle
     if !func_text.starts_with("http.HandleFunc(") && !func_text.starts_with("http.Handle(") {
         return None;
     }
-    
+
     let args = call_node.child_by_field_name("arguments")?;
-    
+
     let mut path: Option<String> = None;
     let mut handler_name: Option<String> = None;
-    
+
     let mut arg_index = 0;
     for i in 0..args.child_count() {
         if let Some(arg) = args.child(i) {
             if arg.kind() == "," || arg.kind() == "(" || arg.kind() == ")" {
                 continue;
             }
-            
+
             if arg_index == 0 {
                 let path_text = parsed.text_for_node(&arg);
                 path = Some(path_text.trim_matches('"').to_string());
@@ -298,9 +298,9 @@ fn extract_net_http_route(parsed: &ParsedFile, call_node: Node) -> Option<GoRout
             arg_index += 1;
         }
     }
-    
+
     let route_path = path?;
-    
+
     Some(GoRoute {
         framework: GoHttpFramework::NetHttp,
         http_method: "ANY".to_string(),
@@ -315,7 +315,7 @@ fn extract_net_http_route(parsed: &ParsedFile, call_node: Node) -> Option<GoRout
 fn find_methods_chain(parsed: &ParsedFile, node: Node) -> Option<String> {
     // Look for .Methods("GET") call in the chain
     let full_text = parsed.text_for_node(&node);
-    
+
     // Check if this is part of a chain that includes .Methods()
     let mut current = node.parent();
     while let Some(parent) = current {
@@ -333,7 +333,7 @@ fn find_methods_chain(parsed: &ParsedFile, node: Node) -> Option<String> {
         }
         current = parent.parent();
     }
-    
+
     // Also check siblings in expression statement
     if full_text.contains(".Methods(") {
         if let Some(start) = full_text.find(".Methods(\"") {
@@ -343,19 +343,19 @@ fn find_methods_chain(parsed: &ParsedFile, node: Node) -> Option<String> {
             }
         }
     }
-    
+
     None
 }
 
 /// Extract handler name from various patterns.
 fn extract_handler_name(handler_text: &str) -> Option<String> {
     let trimmed = handler_text.trim();
-    
+
     // Direct function reference: getUsers, CreateUser
     if trimmed.chars().all(|c| c.is_alphanumeric() || c == '_') {
         return Some(trimmed.to_string());
     }
-    
+
     // Method reference: controller.GetUsers, h.HandleUsers
     if trimmed.contains('.') && !trimmed.contains('(') {
         let parts: Vec<&str> = trimmed.split('.').collect();
@@ -363,7 +363,7 @@ fn extract_handler_name(handler_text: &str) -> Option<String> {
             return Some(parts[1].to_string());
         }
     }
-    
+
     None
 }
 
@@ -373,7 +373,7 @@ mod tests {
     use crate::parse::ast::FileId;
     use crate::parse::go::parse_go_file;
     use crate::types::context::{Language, SourceFile};
-    
+
     fn parse_and_extract(source: &str) -> GoFrameworkSummary {
         let sf = SourceFile {
             path: "test.go".to_string(),
@@ -383,7 +383,7 @@ mod tests {
         let parsed = parse_go_file(FileId(1), &sf).expect("parsing should succeed");
         extract_go_routes(&parsed)
     }
-    
+
     #[test]
     fn detects_gin_routes() {
         let src = r#"
@@ -402,12 +402,12 @@ func main() {
         let summary = parse_and_extract(src);
         assert!(summary.frameworks.contains(&GoHttpFramework::Gin));
         assert_eq!(summary.routes.len(), 4);
-        
+
         assert_eq!(summary.routes[0].http_method, "GET");
         assert_eq!(summary.routes[0].path, "/users");
         assert_eq!(summary.routes[0].handler_name, Some("getUsers".to_string()));
     }
-    
+
     #[test]
     fn detects_echo_routes() {
         let src = r#"
@@ -425,7 +425,7 @@ func main() {
         assert!(summary.frameworks.contains(&GoHttpFramework::Echo));
         assert_eq!(summary.routes.len(), 2);
     }
-    
+
     #[test]
     fn detects_fiber_routes() {
         let src = r#"
@@ -444,7 +444,7 @@ func main() {
         assert_eq!(summary.routes.len(), 2);
         assert_eq!(summary.routes[0].http_method, "GET");
     }
-    
+
     #[test]
     fn detects_chi_routes() {
         let src = r#"
@@ -462,7 +462,7 @@ func main() {
         assert!(summary.frameworks.contains(&GoHttpFramework::Chi));
         assert_eq!(summary.routes.len(), 2);
     }
-    
+
     #[test]
     fn handles_method_handlers() {
         let src = r#"

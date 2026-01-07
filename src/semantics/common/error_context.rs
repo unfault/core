@@ -139,7 +139,12 @@ impl ErrorContext {
     }
 
     /// Set location
-    pub fn with_location(mut self, location: CommonLocation, start_byte: usize, end_byte: usize) -> Self {
+    pub fn with_location(
+        mut self,
+        location: CommonLocation,
+        start_byte: usize,
+        end_byte: usize,
+    ) -> Self {
         self.location = location;
         self.start_byte = start_byte;
         self.end_byte = end_byte;
@@ -220,8 +225,7 @@ mod tests {
 
     #[test]
     fn error_context_swallowing() {
-        let ctx = ErrorContext::new(ErrorContextType::BareCatch)
-            .swallowing_error(true);
+        let ctx = ErrorContext::new(ErrorContextType::BareCatch).swallowing_error(true);
 
         assert!(ctx.swallows_error);
     }
@@ -238,9 +242,11 @@ mod tests {
 
     #[test]
     fn error_context_with_function() {
-        let ctx = ErrorContext::new(ErrorContextType::SpecificCatch(vec!["IOException".to_string()]))
-            .with_error_variable("e")
-            .with_enclosing_function("readFile");
+        let ctx = ErrorContext::new(ErrorContextType::SpecificCatch(vec![
+            "IOException".to_string(),
+        ]))
+        .with_error_variable("e")
+        .with_enclosing_function("readFile");
 
         assert_eq!(ctx.error_variable, Some("e".to_string()));
         assert_eq!(ctx.enclosing_function, Some("readFile".to_string()));

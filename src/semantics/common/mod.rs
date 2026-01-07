@@ -132,7 +132,9 @@ pub trait CommonSemantics: Send + Sync {
                 annotations::AnnotationType::Route => annotation_type == "route",
                 annotations::AnnotationType::Controller => annotation_type == "controller",
                 annotations::AnnotationType::Injectable => annotation_type == "injectable",
-                annotations::AnnotationType::CustomDecorator => annotation_type == "custom_decorator",
+                annotations::AnnotationType::CustomDecorator => {
+                    annotation_type == "custom_decorator"
+                }
                 annotations::AnnotationType::Interceptor => annotation_type == "interceptor",
                 annotations::AnnotationType::Other(name) => name.contains(annotation_type),
             })

@@ -65,6 +65,8 @@ pub struct FastApiRoute {
     pub body_end_byte: usize,
     /// Handler parameter types (for detecting Pydantic-typed body parameters)
     pub handler_params: Vec<RouteParam>,
+    /// Dependency injection targets used by the handler (e.g. Depends(validators.valid_plan))
+    pub dependency_injections: Vec<String>,
 }
 
 /// A parameter in a route handler function.
@@ -506,6 +508,7 @@ fn extract_fastapi_route(file: &ParsedFile, decorated_def: Node) -> Option<FastA
 
             // Extract handler parameters with their type annotations
             let handler_params = extract_handler_params(file, &func_def);
+            let dependency_injections = extract_dependency_injections(file, &func_def);
 
             return Some(FastApiRoute {
                 http_method,
@@ -518,11 +521,86 @@ fn extract_fastapi_route(file: &ParsedFile, decorated_def: Node) -> Option<FastA
                 body_start_byte: body.start_byte(),
                 body_end_byte: body.end_byte(),
                 handler_params,
+                dependency_injections,
             });
         }
     }
 
     None
+}
+
+/// Extract dependency injection targets from a route handler function.
+///
+/// v1 supports patterns like:
+/// - `plan: Plan = Depends(validators.valid_plan)`
+/// - `plan = Depends(validators.valid_plan)`
+/// - `plan: Annotated[Plan, Depends(validators.valid_plan)]`
+fn extract_dependency_injections(file: &ParsedFile, func_def: &Node) -> Vec<String> {
+    let mut out = Vec::new();
+
+    let params_node = match func_def.child_by_field_name("parameters") {
+        Some(n) => n,
+        None => return out,
+    };
+
+    let child_count = params_node.named_child_count();
+    for i in 0..child_count {
+        let Some(param_node) = params_node.named_child(i) else {
+            continue;
+        };
+
+        // Defaults like `x = Depends(foo)` and `x: T = Depends(foo)`.
+        if matches!(
+            param_node.kind(),
+            "default_parameter" | "typed_default_parameter"
+        ) {
+            let mut cursor = param_node.walk();
+            for child in param_node.children(&mut cursor) {
+                if child.kind() != "call" {
+                    continue;
+                }
+
+                let Some(func) = child.child_by_field_name("function") else {
+                    continue;
+                };
+                let callee_expr = file.text_for_node(&func);
+                if callee_expr != "Depends" && !callee_expr.ends_with(".Depends") {
+                    continue;
+                }
+
+                let Some(args) = child.child_by_field_name("arguments") else {
+                    continue;
+                };
+                if let Some(dep) = extract_first_identifier_or_attribute(file, args) {
+                    out.push(dep);
+                }
+            }
+        }
+
+        // Annotated[...] type annotations.
+        if param_node.kind() == "typed_parameter" {
+            let text = file.text_for_node(&param_node);
+            if let Some(idx) = text.find("Depends(") {
+                let rest = &text[idx + "Depends(".len()..];
+                if let Some(end) = rest.find(')') {
+                    let raw = rest[..end].trim().trim_end_matches(',').trim();
+                    if !raw.is_empty()
+                        && raw
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == ':')
+                    {
+                        out.push(raw.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // Dedupe in encounter order.
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|d| seen.insert(d.clone()));
+
+    out
 }
 
 /// Extract parameters from a route handler function.
@@ -1732,6 +1810,52 @@ def create_item(item: ItemCreate, notify: bool = True):
 
         assert_eq!(params[1].name, "notify");
         assert_eq!(params[1].type_annotation, Some("bool".to_string()));
+    }
+
+    #[test]
+    fn extracts_dependency_injections_from_depends_defaults() {
+        let src = r#"
+from fastapi import FastAPI, Depends
+import validators
+
+app = FastAPI()
+
+@app.get("/plan")
+async def get_plan(plan: Plan = Depends(validators.valid_plan), notify: bool = True):
+    return {"ok": True}
+"#;
+        let summary = parse_and_summarize_fastapi(src);
+        assert!(summary.is_some());
+        let summary = summary.unwrap();
+
+        assert_eq!(summary.routes.len(), 1);
+        assert_eq!(
+            summary.routes[0].dependency_injections,
+            vec!["validators.valid_plan"]
+        );
+    }
+
+    #[test]
+    fn extracts_dependency_injections_from_annotated_type() {
+        let src = r#"
+from fastapi import FastAPI
+from typing import Annotated
+
+app = FastAPI()
+
+@app.get("/plan")
+async def get_plan(plan: Annotated[Plan, Depends(validators.valid_plan)]):
+    return {"ok": True}
+"#;
+        let summary = parse_and_summarize_fastapi(src);
+        assert!(summary.is_some());
+        let summary = summary.unwrap();
+
+        assert_eq!(summary.routes.len(), 1);
+        assert_eq!(
+            summary.routes[0].dependency_injections,
+            vec!["validators.valid_plan"]
+        );
     }
 
     #[test]

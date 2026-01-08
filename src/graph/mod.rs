@@ -201,6 +201,11 @@ pub enum GraphEdgeKind {
     /// File or Function uses an external library
     UsesLibrary,
 
+    /// Dependency injection / framework wiring (e.g. FastAPI Depends)
+    ///
+    /// Direction: consumer -> provider
+    DependencyInjection,
+
     // === FastAPI-specific edges (for backward compatibility) ===
     /// A FastAPI app "owns" a route.
     FastApiAppOwnsRoute,
@@ -1349,29 +1354,76 @@ fn add_fastapi_nodes(
                 .add_edge(*app_node, route_node, GraphEdgeKind::FastApiAppOwnsRoute);
         }
 
-        // Also create a function node for the route handler with HTTP metadata
-        let qualified_name = route.handler_name.clone();
-        let func_node = cg.graph.add_node(GraphNode::Function {
-            file_id,
-            name: route.handler_name.clone(),
-            qualified_name,
-            is_async: route.is_async,
-            is_handler: true,
-            http_method: Some(route.http_method.clone()),
-            http_path: Some(route.path.clone()),
-        });
+        // Ensure we have a function node for the route handler with HTTP metadata.
+        let func_key = (file_id, route.handler_name.clone());
+        let func_node = if let Some(&existing) = cg.function_nodes.get(&func_key) {
+            // Update existing function node with HTTP metadata.
+            if let GraphNode::Function {
+                is_handler,
+                http_method,
+                http_path,
+                ..
+            } = &mut cg.graph[existing]
+            {
+                *is_handler = true;
+                if http_method.is_none() {
+                    *http_method = Some(route.http_method.clone());
+                }
+                if http_path.is_none() {
+                    *http_path = Some(route.path.clone());
+                }
+            }
+            existing
+        } else {
+            let qualified_name = route.handler_name.clone();
+            let node = cg.graph.add_node(GraphNode::Function {
+                file_id,
+                name: route.handler_name.clone(),
+                qualified_name,
+                is_async: route.is_async,
+                is_handler: true,
+                http_method: Some(route.http_method.clone()),
+                http_path: Some(route.path.clone()),
+            });
 
-        // File contains function
-        cg.graph
-            .add_edge(file_node, func_node, GraphEdgeKind::Contains);
+            // File contains function
+            cg.graph.add_edge(file_node, node, GraphEdgeKind::Contains);
+
+            // Store for lookup (needed for call resolution)
+            cg.function_nodes.insert(func_key, node);
+
+            node
+        };
 
         // Function is the route handler
         cg.graph
             .add_edge(func_node, route_node, GraphEdgeKind::Contains);
 
-        // Store for lookup (needed for call resolution)
-        cg.function_nodes
-            .insert((file_id, route.handler_name.clone()), func_node);
+        // Dependency injection edges: handler uses provider via Depends(...)
+        let imports = py.imports();
+        for dep_expr in &route.dependency_injections {
+            let dep_expr = dep_expr.as_str();
+            let (receiver, callee) = if let Some(idx) = dep_expr.rfind('.') {
+                (Some(&dep_expr[..idx]), &dep_expr[idx + 1..])
+            } else {
+                (None, dep_expr)
+            };
+
+            // Strategy: resolve like a call through imports.
+            if let Some(dep_node) =
+                resolve_call_through_imports(cg, callee, dep_expr, receiver, &imports, &py.path)
+            {
+                cg.graph
+                    .add_edge(func_node, dep_node, GraphEdgeKind::DependencyInjection);
+            } else {
+                // Fallback: intra-file resolution for simple names.
+                let dep_key = (file_id, callee.to_string());
+                if let Some(&dep_node) = cg.function_nodes.get(&dep_key) {
+                    cg.graph
+                        .add_edge(func_node, dep_node, GraphEdgeKind::DependencyInjection);
+                }
+            }
+        }
     }
 
     // Middlewares
@@ -1774,13 +1826,22 @@ mod tests {
         let edge = GraphEdgeKind::UsesLibrary;
         let debug_str = format!("{:?}", edge);
         assert!(debug_str.contains("UsesLibrary"));
+
+        let edge = GraphEdgeKind::DependencyInjection;
+        let debug_str = format!("{:?}", edge);
+        assert!(debug_str.contains("DependencyInjection"));
     }
 
     #[test]
     fn graph_edge_kind_eq() {
         assert_eq!(GraphEdgeKind::Contains, GraphEdgeKind::Contains);
         assert_eq!(GraphEdgeKind::Imports, GraphEdgeKind::Imports);
+        assert_eq!(
+            GraphEdgeKind::DependencyInjection,
+            GraphEdgeKind::DependencyInjection
+        );
         assert_ne!(GraphEdgeKind::Contains, GraphEdgeKind::Imports);
+        assert_ne!(GraphEdgeKind::DependencyInjection, GraphEdgeKind::Calls);
 
         let edge1 = GraphEdgeKind::ImportsFrom {
             items: vec!["A".to_string()],
@@ -1966,6 +2027,54 @@ async def create_user():
             }
         }
         assert_eq!(route_count, 2);
+    }
+
+    #[test]
+    fn build_code_graph_with_fastapi_dependency_injection_edges() {
+        let validators_src = r#"
+
+def valid_plan():
+    return True
+"#;
+
+        let routes_src = r#"
+from fastapi import FastAPI, Depends
+import validators
+
+app = FastAPI()
+
+@app.get("/plan")
+async def get_plan(plan: Plan = Depends(validators.valid_plan)):
+    return {"ok": True}
+"#;
+
+        let (validators_id, validators_sem) =
+            parse_python_with_id("validators.py", validators_src, 1);
+        let (routes_id, routes_sem) = parse_python_with_id("routes.py", routes_src, 2);
+
+        let sem_entries = vec![(validators_id, validators_sem), (routes_id, routes_sem)];
+        let cg = build_code_graph(&sem_entries);
+
+        let handler_node = *cg
+            .function_nodes
+            .get(&(routes_id, "get_plan".to_string()))
+            .expect("route handler function node should exist");
+        let provider_node = *cg
+            .function_nodes
+            .get(&(validators_id, "valid_plan".to_string()))
+            .expect("provider function node should exist");
+
+        let mut found_dep_edge = false;
+        for edge in cg.graph.edges(handler_node) {
+            if edge.target() == provider_node
+                && matches!(edge.weight(), GraphEdgeKind::DependencyInjection)
+            {
+                found_dep_edge = true;
+                break;
+            }
+        }
+
+        assert!(found_dep_edge);
     }
 
     #[test]

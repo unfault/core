@@ -647,7 +647,7 @@ pub fn build_code_graph(sem_entries: &[(FileId, Arc<SourceSemantics>)]) -> CodeG
         );
     }
 
-    // Second pass: add functions, classes, imports, and framework-specific nodes
+    // Second pass: add imports and functions for ALL files first
     for (file_id, sem) in sem_entries {
         let file_node = match cg.file_nodes.get(file_id) {
             Some(idx) => *idx,
@@ -659,8 +659,17 @@ pub fn build_code_graph(sem_entries: &[(FileId, Arc<SourceSemantics>)]) -> CodeG
 
         // Add functions (works for all languages via CommonSemantics)
         add_function_nodes(&mut cg, file_node, *file_id, sem);
+    }
 
-        // Language-specific additions
+    // Third pass: add framework-specific nodes (after all functions are registered)
+    // This is needed because framework nodes (like FastAPI DI edges) may reference
+    // functions in other files that must be registered first.
+    for (file_id, sem) in sem_entries {
+        let file_node = match cg.file_nodes.get(file_id) {
+            Some(idx) => *idx,
+            None => continue,
+        };
+
         match sem.as_ref() {
             SourceSemantics::Python(py) => {
                 if let Some(fastapi) = &py.fastapi {

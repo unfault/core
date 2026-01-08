@@ -538,9 +538,8 @@ fn extract_fastapi_route(file: &ParsedFile, decorated_def: Node) -> Option<FastA
 fn extract_dependency_injections(file: &ParsedFile, func_def: &Node) -> Vec<String> {
     let mut out = Vec::new();
 
-    let params_node = match func_def.child_by_field_name("parameters") {
-        Some(n) => n,
-        None => return out,
+    let Some(params_node) = func_def.child_by_field_name("parameters") else {
+        return out;
     };
 
     let child_count = params_node.named_child_count();
@@ -549,50 +548,22 @@ fn extract_dependency_injections(file: &ParsedFile, func_def: &Node) -> Vec<Stri
             continue;
         };
 
-        // Defaults like `x = Depends(foo)` and `x: T = Depends(foo)`.
-        if matches!(
-            param_node.kind(),
-            "default_parameter" | "typed_default_parameter"
-        ) {
-            let mut cursor = param_node.walk();
-            for child in param_node.children(&mut cursor) {
-                if child.kind() != "call" {
-                    continue;
-                }
-
-                let Some(func) = child.child_by_field_name("function") else {
-                    continue;
-                };
-                let callee_expr = file.text_for_node(&func);
-                if callee_expr != "Depends" && !callee_expr.ends_with(".Depends") {
-                    continue;
-                }
-
-                let Some(args) = child.child_by_field_name("arguments") else {
-                    continue;
-                };
-                if let Some(dep) = extract_first_identifier_or_attribute(file, args) {
-                    out.push(dep);
+        match param_node.kind() {
+            // Defaults like `x = Depends(foo)` and `x: T = Depends(foo)`.
+            "default_parameter" | "typed_default_parameter" => {
+                if let Some(value) = param_node.child_by_field_name("value") {
+                    collect_dependency_injections_from_node(file, value, &mut out);
+                } else {
+                    collect_dependency_injections_from_node(file, param_node, &mut out);
                 }
             }
-        }
-
-        // Annotated[...] type annotations.
-        if param_node.kind() == "typed_parameter" {
-            let text = file.text_for_node(&param_node);
-            if let Some(idx) = text.find("Depends(") {
-                let rest = &text[idx + "Depends(".len()..];
-                if let Some(end) = rest.find(')') {
-                    let raw = rest[..end].trim().trim_end_matches(',').trim();
-                    if !raw.is_empty()
-                        && raw
-                            .chars()
-                            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == ':')
-                    {
-                        out.push(raw.to_string());
-                    }
+            // Annotated[...] type annotations, e.g. Annotated[T, Depends(foo)].
+            "typed_parameter" => {
+                if let Some(typ) = param_node.child_by_field_name("type") {
+                    collect_dependency_injections_from_node(file, typ, &mut out);
                 }
             }
+            _ => {}
         }
     }
 
@@ -601,6 +572,64 @@ fn extract_dependency_injections(file: &ParsedFile, func_def: &Node) -> Vec<Stri
     out.retain(|d| seen.insert(d.clone()));
 
     out
+}
+
+fn collect_dependency_injections_from_node(file: &ParsedFile, node: Node, out: &mut Vec<String>) {
+    if node.kind() == "call" {
+        if let Some(dep) = extract_depends_target(file, node) {
+            out.push(dep);
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_dependency_injections_from_node(file, child, out);
+    }
+}
+
+fn extract_depends_target(file: &ParsedFile, call_node: Node) -> Option<String> {
+    let func = call_node.child_by_field_name("function")?;
+    let callee_expr = strip_ws(&file.text_for_node(&func));
+
+    // Accept `Depends(...)` and `<module>.Depends(...)`.
+    let is_depends = callee_expr.split('.').last() == Some("Depends");
+    if !is_depends {
+        return None;
+    }
+
+    let args = call_node.child_by_field_name("arguments")?;
+    let mut cursor = args.walk();
+    for child in args.named_children(&mut cursor) {
+        match child.kind() {
+            "identifier" | "attribute" => {
+                return normalize_dependency_target(&file.text_for_node(&child));
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn normalize_dependency_target(raw: &str) -> Option<String> {
+    let raw = strip_ws(raw).trim_end_matches(',').to_string();
+    if raw.is_empty() {
+        return None;
+    }
+
+    // We only support dotted identifiers here (import resolution expects this).
+    if !raw
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+    {
+        return None;
+    }
+
+    Some(raw)
+}
+
+fn strip_ws(s: &str) -> String {
+    s.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
 /// Extract parameters from a route handler function.
@@ -1838,15 +1867,16 @@ async def get_plan(plan: Plan = Depends(validators.valid_plan), notify: bool = T
     #[test]
     fn extracts_dependency_injections_from_annotated_type() {
         let src = r#"
-from fastapi import FastAPI
-from typing import Annotated
-
-app = FastAPI()
-
-@app.get("/plan")
-async def get_plan(plan: Annotated[Plan, Depends(validators.valid_plan)]):
-    return {"ok": True}
-"#;
+ from fastapi import FastAPI, Depends
+ from typing import Annotated
+ import validators
+ 
+ app = FastAPI()
+ 
+ @app.get("/plan")
+ async def get_plan(plan: Annotated[Plan, Depends(validators.valid_plan)]):
+     return {"ok": True}
+ "#;
         let summary = parse_and_summarize_fastapi(src);
         assert!(summary.is_some());
         let summary = summary.unwrap();
@@ -1856,6 +1886,33 @@ async def get_plan(plan: Annotated[Plan, Depends(validators.valid_plan)]):
             summary.routes[0].dependency_injections,
             vec!["validators.valid_plan"]
         );
+    }
+
+    #[test]
+    fn ignores_non_depends_calls_and_defaults() {
+        let src = r#"
+ from fastapi import FastAPI, Depends
+ import validators
+ 
+ app = FastAPI()
+ 
+ def not_a_dep(x):
+     return x
+ 
+ @app.get("/plan")
+ async def get_plan(
+     plan: Plan = validators.valid_plan(),
+     notify: bool = True,
+     maybe: Plan = not_a_dep(validators.valid_plan),
+ ):
+     return {"ok": True}
+ "#;
+        let summary = parse_and_summarize_fastapi(src);
+        assert!(summary.is_some());
+        let summary = summary.unwrap();
+
+        assert_eq!(summary.routes.len(), 1);
+        assert!(summary.routes[0].dependency_injections.is_empty());
     }
 
     #[test]

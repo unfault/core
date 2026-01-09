@@ -702,6 +702,25 @@ impl CodeGraph {
             .collect()
     }
 
+    /// Get route handler info for a function node.
+    ///
+    /// Returns (http_method, http_path, function_name) if the node is a route handler.
+    pub fn get_route_info(&self, idx: NodeIndex) -> Option<(Option<String>, String, String)> {
+        match &self.graph[idx] {
+            GraphNode::Function {
+                name,
+                http_method,
+                http_path: Some(path),
+                ..
+            } => Some((
+                http_method.clone(),
+                path.clone(),
+                name.clone(),
+            )),
+            _ => None,
+        }
+    }
+
     /// Add a path to suffix and module indexes for fast lookup
     fn add_path_to_indexes(
         path: &str,

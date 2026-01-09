@@ -35,6 +35,17 @@ use crate::semantics::typescript::model::{ExpressFileSummary, TsFileSemantics};
 use crate::semantics::{Import, SourceSemantics};
 use crate::types::context::Language;
 
+/// SLO provider source
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SloProvider {
+    /// Google Cloud Monitoring
+    Gcp,
+    /// Datadog
+    Datadog,
+    /// Dynatrace
+    Dynatrace,
+}
+
 /// Category of external modules for better organization
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ModuleCategory {
@@ -118,6 +129,30 @@ pub enum GraphNode {
         app_var_name: String,
         middleware_type: String,
     },
+
+    /// A Service Level Objective from an external monitoring provider
+    Slo {
+        /// Unique identifier from the provider (e.g., "projects/my-project/services/my-service/serviceLevelObjectives/abc123")
+        id: String,
+        /// Human-readable name
+        name: String,
+        /// The provider source (GCP, Datadog, Dynatrace)
+        provider: SloProvider,
+        /// URL path pattern this SLO monitors (e.g., "/api/users/*")
+        path_pattern: String,
+        /// HTTP method if specific (e.g., "GET"), None for all methods
+        http_method: Option<String>,
+        /// Target percentage (e.g., 99.9)
+        target_percent: f64,
+        /// Current evaluated percentage (e.g., 99.85), None if not yet evaluated
+        current_percent: Option<f64>,
+        /// Error budget remaining as percentage, None if not available
+        error_budget_remaining: Option<f64>,
+        /// Evaluation timeframe (e.g., "30d", "7d", "rolling_28d")
+        timeframe: String,
+        /// Direct link to SLO in provider dashboard
+        dashboard_url: Option<String>,
+    },
 }
 
 impl GraphNode {
@@ -131,6 +166,7 @@ impl GraphNode {
             GraphNode::FastApiRoute { file_id, .. } => Some(*file_id),
             GraphNode::FastApiMiddleware { file_id, .. } => Some(*file_id),
             GraphNode::ExternalModule { .. } => None,
+            GraphNode::Slo { .. } => None,
         }
     }
 
@@ -148,6 +184,9 @@ impl GraphNode {
             GraphNode::FastApiMiddleware {
                 middleware_type, ..
             } => middleware_type.clone(),
+            GraphNode::Slo {
+                name, provider, path_pattern, ..
+            } => format!("SLO({:?}:{}) [{}]", provider, name, path_pattern),
         }
     }
 
@@ -217,6 +256,12 @@ pub enum GraphEdgeKind {
     ///
     /// Direction: app -> function (the app "uses" the function as lifespan)
     FastApiAppLifespan,
+
+    /// An HTTP route handler is monitored by an SLO.
+    ///
+    /// Direction: function (route handler) -> SLO
+    /// Meaning: "this endpoint is monitored by this SLO"
+    MonitoredBy,
 }
 
 /// The main code graph structure.
@@ -246,6 +291,9 @@ pub struct CodeGraph {
     /// Quick lookup: (file_id, class_name) -> node index
     #[serde(skip)]
     pub class_nodes: HashMap<(FileId, String), NodeIndex>,
+    /// Quick lookup: slo_id -> node index
+    #[serde(skip)]
+    pub slo_nodes: HashMap<String, NodeIndex>,
 }
 
 impl CodeGraph {
@@ -259,6 +307,7 @@ impl CodeGraph {
             external_modules: HashMap::new(),
             function_nodes: HashMap::new(),
             class_nodes: HashMap::new(),
+            slo_nodes: HashMap::new(),
         }
     }
 
@@ -518,6 +567,7 @@ impl CodeGraph {
         self.external_modules.clear();
         self.function_nodes.clear();
         self.class_nodes.clear();
+        self.slo_nodes.clear();
 
         for node_idx in self.graph.node_indices() {
             match &self.graph[node_idx] {
@@ -542,9 +592,114 @@ impl CodeGraph {
                 GraphNode::ExternalModule { name, .. } => {
                     self.external_modules.insert(name.clone(), node_idx);
                 }
+                GraphNode::Slo { id, .. } => {
+                    self.slo_nodes.insert(id.clone(), node_idx);
+                }
                 _ => {}
             }
         }
+    }
+
+    /// Add an SLO node and create MonitoredBy edges to matching route handlers.
+    ///
+    /// Returns the NodeIndex of the new SLO node.
+    ///
+    /// # Arguments
+    ///
+    /// * `slo_id` - Unique identifier from the provider
+    /// * `name` - Human-readable name
+    /// * `provider` - The SLO provider (GCP, Datadog, Dynatrace)
+    /// * `path_pattern` - URL path pattern this SLO monitors
+    /// * `http_method` - HTTP method if specific, None for all methods
+    /// * `target_percent` - Target percentage (e.g., 99.9)
+    /// * `current_percent` - Current evaluated percentage
+    /// * `error_budget_remaining` - Error budget remaining as percentage
+    /// * `timeframe` - Evaluation timeframe (e.g., "30d")
+    /// * `dashboard_url` - Direct link to SLO in provider dashboard
+    /// * `matching_routes` - NodeIndexes of route handler functions to link
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_slo(
+        &mut self,
+        slo_id: String,
+        name: String,
+        provider: SloProvider,
+        path_pattern: String,
+        http_method: Option<String>,
+        target_percent: f64,
+        current_percent: Option<f64>,
+        error_budget_remaining: Option<f64>,
+        timeframe: String,
+        dashboard_url: Option<String>,
+        matching_routes: Vec<NodeIndex>,
+    ) -> NodeIndex {
+        let slo_idx = self.graph.add_node(GraphNode::Slo {
+            id: slo_id.clone(),
+            name,
+            provider,
+            path_pattern,
+            http_method,
+            target_percent,
+            current_percent,
+            error_budget_remaining,
+            timeframe,
+            dashboard_url,
+        });
+
+        // Create MonitoredBy edges from route handlers to this SLO
+        for route_idx in matching_routes {
+            self.graph
+                .add_edge(route_idx, slo_idx, GraphEdgeKind::MonitoredBy);
+        }
+
+        self.slo_nodes.insert(slo_id, slo_idx);
+        slo_idx
+    }
+
+    /// Get all SLOs monitoring a specific route handler.
+    ///
+    /// Returns references to all SLO nodes connected via MonitoredBy edges.
+    pub fn slos_for_route(&self, route_idx: NodeIndex) -> Vec<&GraphNode> {
+        self.graph
+            .edges_directed(route_idx, Direction::Outgoing)
+            .filter(|e| matches!(e.weight(), GraphEdgeKind::MonitoredBy))
+            .filter_map(|e| {
+                let target = e.target();
+                match &self.graph[target] {
+                    node @ GraphNode::Slo { .. } => Some(node),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    /// Get all route handlers that an SLO monitors.
+    ///
+    /// Returns NodeIndexes of Function nodes connected via MonitoredBy edges.
+    pub fn routes_for_slo(&self, slo_idx: NodeIndex) -> Vec<NodeIndex> {
+        self.graph
+            .edges_directed(slo_idx, Direction::Incoming)
+            .filter(|e| matches!(e.weight(), GraphEdgeKind::MonitoredBy))
+            .map(|e| e.source())
+            .collect()
+    }
+
+    /// Get all HTTP route handler nodes in the graph.
+    ///
+    /// Returns NodeIndexes of Function nodes where `is_handler` is true
+    /// and `http_path` is Some.
+    pub fn get_http_route_handlers(&self) -> Vec<(NodeIndex, &str, Option<&str>)> {
+        self.graph
+            .node_indices()
+            .filter_map(|idx| match &self.graph[idx] {
+                GraphNode::Function {
+                    is_handler: true,
+                    http_path: Some(path),
+                    http_method,
+                    ..
+                } => Some((idx, path.as_str(), http_method.as_deref())),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Add a path to suffix and module indexes for fast lookup

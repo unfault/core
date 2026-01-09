@@ -4,6 +4,12 @@ All notable changes to `unfault-core` will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.1.3] - 2026-01-09
+
+### Added
+- Added SLO nodes and route lookup helpers to support observability-aware workflows.
+- Extended FastAPI analysis with lifespan detection and improved dependency injection edge resolution.
+
 ## [0.1.1] - 2026-01-06
 
 ### Fixed
@@ -16,5 +22,6 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 - Framework summaries and route extraction (e.g., FastAPI, net/http, Express/NestJS/Fastify).
 - Common semantics extraction across languages (annotations, route patterns, error contexts).
 
+[0.1.3]: https://github.com/unfault/core/compare/v0.1.1...v0.1.3
 [0.1.1]: https://github.com/unfault/core/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/unfault/core/releases/tag/v0.1.0

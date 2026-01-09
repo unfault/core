@@ -185,7 +185,10 @@ impl GraphNode {
                 middleware_type, ..
             } => middleware_type.clone(),
             GraphNode::Slo {
-                name, provider, path_pattern, ..
+                name,
+                provider,
+                path_pattern,
+                ..
             } => format!("SLO({:?}:{}) [{}]", provider, name, path_pattern),
         }
     }
@@ -712,11 +715,7 @@ impl CodeGraph {
                 http_method,
                 http_path: Some(path),
                 ..
-            } => Some((
-                http_method.clone(),
-                path.clone(),
-                name.clone(),
-            )),
+            } => Some((http_method.clone(), path.clone(), name.clone())),
             _ => None,
         }
     }
@@ -1576,9 +1575,14 @@ fn add_fastapi_nodes(
             };
 
             // Resolve the lifespan function through imports
-            if let Some(lifespan_node) =
-                resolve_call_through_imports(cg, callee, lifespan_expr, receiver, &imports, &py.path)
-            {
+            if let Some(lifespan_node) = resolve_call_through_imports(
+                cg,
+                callee,
+                lifespan_expr,
+                receiver,
+                &imports,
+                &py.path,
+            ) {
                 cg.graph
                     .add_edge(app_node, lifespan_node, GraphEdgeKind::FastApiAppLifespan);
             } else {

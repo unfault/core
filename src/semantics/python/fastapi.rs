@@ -31,6 +31,8 @@ pub struct FastApiExceptionHandler {
 pub struct FastApiApp {
     pub var_name: String, // e.g. "app"
     pub location: AstLocation,
+    /// Function passed as `lifespan=` parameter (e.g., "run_background_tasks")
+    pub lifespan: Option<String>,
 }
 
 /// An `APIRouter()` instance, e.g. `router = APIRouter()`.
@@ -197,10 +199,51 @@ fn extract_fastapi_app(file: &ParsedFile, node: Node) -> Option<FastApiApp> {
     let app_var_name = file.text_for_node(&left);
     let location = file.location_for_node(&right);
 
+    // Extract lifespan= keyword argument if present
+    let lifespan = extract_keyword_arg(file, right, "lifespan");
+
     Some(FastApiApp {
         var_name: app_var_name,
         location,
+        lifespan,
     })
+}
+
+/// Extract the value of a keyword argument from a call node.
+///
+/// For example, given `FastAPI(title="My App", lifespan=run_tasks)` and keyword="lifespan",
+/// returns `Some("run_tasks")`.
+fn extract_keyword_arg(file: &ParsedFile, call_node: Node, keyword: &str) -> Option<String> {
+    let args = call_node.child_by_field_name("arguments")?;
+
+    let mut cursor = args.walk();
+    for child in args.named_children(&mut cursor) {
+        if child.kind() != "keyword_argument" {
+            continue;
+        }
+
+        // keyword_argument has: name (identifier) and value (expression)
+        let name_node = child.child_by_field_name("name")?;
+        let name = file.text_for_node(&name_node);
+
+        if name != keyword {
+            continue;
+        }
+
+        let value_node = child.child_by_field_name("value")?;
+        let value = file.text_for_node(&value_node);
+
+        // Only accept identifiers and attribute access (module.func)
+        // Skip complex expressions like lambdas or calls
+        match value_node.kind() {
+            "identifier" | "attribute" => {
+                return Some(value.trim().to_string());
+            }
+            _ => return None,
+        }
+    }
+
+    None
 }
 
 fn extract_middleware_site(file: &ParsedFile, node: Node) -> Option<FastApiMiddleware> {
@@ -1943,5 +1986,73 @@ def receive_data(data: dict):
         assert_eq!(route.location.range.start_line, 5);
         // end_line should be after the function body
         assert!(route.location.range.end_line > route.decorator_location.range.end_line);
+    }
+
+    #[test]
+    fn extracts_lifespan_from_fastapi_constructor() {
+        let src = r#"
+from fastapi import FastAPI
+
+app = FastAPI(lifespan=run_background_tasks)
+"#;
+        let summary = parse_and_summarize_fastapi(src);
+        assert!(summary.is_some());
+        let summary = summary.unwrap();
+
+        assert_eq!(summary.apps.len(), 1);
+        assert_eq!(summary.apps[0].var_name, "app");
+        assert_eq!(
+            summary.apps[0].lifespan,
+            Some("run_background_tasks".to_string())
+        );
+    }
+
+    #[test]
+    fn extracts_lifespan_with_module_prefix() {
+        let src = r#"
+from fastapi import FastAPI
+from background import run_tasks
+
+app = FastAPI(lifespan=background.run_tasks)
+"#;
+        let summary = parse_and_summarize_fastapi(src);
+        assert!(summary.is_some());
+        let summary = summary.unwrap();
+
+        assert_eq!(summary.apps.len(), 1);
+        assert_eq!(
+            summary.apps[0].lifespan,
+            Some("background.run_tasks".to_string())
+        );
+    }
+
+    #[test]
+    fn extracts_lifespan_with_other_args() {
+        let src = r#"
+from fastapi import FastAPI
+
+app = FastAPI(title="My App", lifespan=my_func, debug=True)
+"#;
+        let summary = parse_and_summarize_fastapi(src);
+        assert!(summary.is_some());
+        let summary = summary.unwrap();
+
+        assert_eq!(summary.apps.len(), 1);
+        assert_eq!(summary.apps[0].lifespan, Some("my_func".to_string()));
+    }
+
+    #[test]
+    fn no_lifespan_returns_none() {
+        let src = r#"
+from fastapi import FastAPI
+
+app = FastAPI(title="My App")
+"#;
+        let summary = parse_and_summarize_fastapi(src);
+        assert!(summary.is_some());
+        let summary = summary.unwrap();
+
+        assert_eq!(summary.apps.len(), 1);
+        assert_eq!(summary.apps[0].lifespan, None);
     }
 }

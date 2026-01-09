@@ -381,7 +381,16 @@ fn convert_python_import(py_import: &PyImport, file_id: FileId) -> Option<Import
     let items: Vec<ImportedItem> = py_import
         .names
         .iter()
-        .map(|name| ImportedItem::new(name.clone()))
+        .map(|name| {
+            // Python `from x import foo as bar`
+            if let Some(idx) = name.find(" as ") {
+                let original = name[..idx].trim();
+                let alias = name[idx + 4..].trim();
+                ImportedItem::new(original).with_alias(alias)
+            } else {
+                ImportedItem::new(name.clone())
+            }
+        })
         .collect();
 
     Some(Import {

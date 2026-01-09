@@ -212,6 +212,11 @@ pub enum GraphEdgeKind {
 
     /// A FastAPI app "has" a middleware attached.
     FastApiAppHasMiddleware,
+
+    /// A FastAPI app uses a function as its lifespan handler.
+    ///
+    /// Direction: app -> function (the app "uses" the function as lifespan)
+    FastApiAppLifespan,
 }
 
 /// The main code graph structure.
@@ -870,8 +875,17 @@ fn resolve_call_through_imports(
                 ) {
                     // Get the file_id from the source file node
                     if let GraphNode::File { file_id, .. } = &cg.graph[source_file_idx] {
-                        // Look for the function in that file
-                        let callee_key = (*file_id, callee.to_string());
+                        // If the import was renamed (`from foo import bar as baz`) we must use
+                        // the original name (`bar`) to find the definition in the source module.
+                        let mut resolved = callee;
+                        for item in &import.items {
+                            if item.local_name() == callee {
+                                resolved = &item.name;
+                                break;
+                            }
+                        }
+
+                        let callee_key = (*file_id, resolved.to_string());
                         if let Some(&func_node) = cg.function_nodes.get(&callee_key) {
                             return Some(func_node);
                         }
@@ -903,6 +917,41 @@ fn resolve_call_through_imports(
                     if let Some(source_file_idx) = find_import_source_file_with_context(
                         cg,
                         &import.module_path,
+                        importing_file_path,
+                    ) {
+                        if let GraphNode::File { file_id, .. } = &cg.graph[source_file_idx] {
+                            let callee_key = (*file_id, func_name.to_string());
+                            if let Some(&func_node) = cg.function_nodes.get(&callee_key) {
+                                return Some(func_node);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Strategy 3: Sub-module import pattern
+    // e.g., `from reliably_app.plan import validators` then call `validators.valid_plan()`
+    // The callee_expr would be "validators.valid_plan" and callee would be "valid_plan"
+    // We need to check if "validators" is an imported item that is itself a module.
+    if callee_expr.contains('.') {
+        let parts: Vec<&str> = callee_expr.split('.').collect();
+        if parts.len() >= 2 {
+            let submodule_name = parts[0];
+            let func_name = parts[parts.len() - 1];
+
+            for import in imports {
+                // Check if the submodule was imported as an item
+                if import.imports_item(submodule_name) {
+                    // Try to resolve the actual submodule file:
+                    // If module_path is "reliably_app.plan" and submodule_name is "validators",
+                    // the actual file is "reliably_app.plan.validators" (or reliably_app/plan/validators.py)
+                    let submodule_path = format!("{}.{}", import.module_path, submodule_name);
+
+                    if let Some(source_file_idx) = find_import_source_file_with_context(
+                        cg,
+                        &submodule_path,
                         importing_file_path,
                     ) {
                         if let GraphNode::File { file_id, .. } = &cg.graph[source_file_idx] {
@@ -1330,6 +1379,7 @@ fn add_fastapi_nodes(
     let mut app_nodes: HashMap<String, NodeIndex> = HashMap::new();
 
     // Apps
+    let imports = py.imports();
     for app in &fastapi.apps {
         let app_node = cg.graph.add_node(GraphNode::FastApiApp {
             file_id,
@@ -1341,6 +1391,31 @@ fn add_fastapi_nodes(
             .add_edge(file_node, app_node, GraphEdgeKind::Contains);
 
         app_nodes.insert(app.var_name.clone(), app_node);
+
+        // If the app has a lifespan handler, create an edge to the function
+        if let Some(ref lifespan_expr) = app.lifespan {
+            // Parse "module.func" or "func" pattern
+            let (receiver, callee) = if let Some(idx) = lifespan_expr.rfind('.') {
+                (Some(&lifespan_expr[..idx]), &lifespan_expr[idx + 1..])
+            } else {
+                (None, lifespan_expr.as_str())
+            };
+
+            // Resolve the lifespan function through imports
+            if let Some(lifespan_node) =
+                resolve_call_through_imports(cg, callee, lifespan_expr, receiver, &imports, &py.path)
+            {
+                cg.graph
+                    .add_edge(app_node, lifespan_node, GraphEdgeKind::FastApiAppLifespan);
+            } else {
+                // Fallback: try intra-file resolution
+                let lifespan_key = (file_id, callee.to_string());
+                if let Some(&lifespan_node) = cg.function_nodes.get(&lifespan_key) {
+                    cg.graph
+                        .add_edge(app_node, lifespan_node, GraphEdgeKind::FastApiAppLifespan);
+                }
+            }
+        }
     }
 
     // Routes
@@ -1409,7 +1484,6 @@ fn add_fastapi_nodes(
             .add_edge(func_node, route_node, GraphEdgeKind::Contains);
 
         // Dependency injection edges: handler uses provider via Depends(...)
-        let imports = py.imports();
         for dep_expr in &route.dependency_injections {
             let dep_expr = dep_expr.as_str();
             let (receiver, callee) = if let Some(idx) = dep_expr.rfind('.') {
@@ -2041,6 +2115,44 @@ async def create_user():
     #[test]
     fn build_code_graph_with_fastapi_dependency_injection_edges() {
         let validators_src = r#"
+ 
+ def valid_plan():
+     return True
+ "#;
+
+        let routes_src = r#"
+ from fastapi import FastAPI, Depends
+ import validators
+ 
+ app = FastAPI()
+ 
+ @app.get("/plan")
+ async def get_plan(plan: Plan = Depends(validators.valid_plan)):
+     return {"ok": True}
+ "#;
+
+        let (validators_id, validators_sem) =
+            parse_python_with_id("validators.py", validators_src, 1);
+        let (routes_id, routes_sem) = parse_python_with_id("routes.py", routes_src, 2);
+
+        let sem_entries = vec![(validators_id, validators_sem), (routes_id, routes_sem)];
+        let cg = build_code_graph(&sem_entries);
+
+        let handler_node = *cg
+            .function_nodes
+            .get(&(routes_id, "get_plan".to_string()))
+            .expect("route handler function node should exist");
+        let provider_node = *cg
+            .function_nodes
+            .get(&(validators_id, "valid_plan".to_string()))
+            .expect("provider function node should exist");
+
+        assert_has_di_edge(&cg, handler_node, provider_node);
+    }
+
+    #[test]
+    fn build_code_graph_with_fastapi_dependency_injection_edges_from_named_import_alias() {
+        let validators_src = r#"
 
 def valid_plan():
     return True
@@ -2048,12 +2160,12 @@ def valid_plan():
 
         let routes_src = r#"
 from fastapi import FastAPI, Depends
-import validators
+from validators import valid_plan as vp
 
 app = FastAPI()
 
 @app.get("/plan")
-async def get_plan(plan: Plan = Depends(validators.valid_plan)):
+async def get_plan(plan = Depends(vp)):
     return {"ok": True}
 "#;
 
@@ -2073,6 +2185,10 @@ async def get_plan(plan: Plan = Depends(validators.valid_plan)):
             .get(&(validators_id, "valid_plan".to_string()))
             .expect("provider function node should exist");
 
+        assert_has_di_edge(&cg, handler_node, provider_node);
+    }
+
+    fn assert_has_di_edge(cg: &CodeGraph, handler_node: NodeIndex, provider_node: NodeIndex) {
         let mut found_dep_edge = false;
         for edge in cg.graph.edges(handler_node) {
             if edge.target() == provider_node
@@ -2084,6 +2200,90 @@ async def get_plan(plan: Plan = Depends(validators.valid_plan)):
         }
 
         assert!(found_dep_edge);
+    }
+
+    #[test]
+    fn build_code_graph_with_fastapi_di_from_submodule_import() {
+        // Test the pattern: `from pkg import validators` then `Depends(validators.valid_plan)`
+        let validators_src = r#"
+def valid_plan():
+    return True
+"#;
+
+        let routes_src = r#"
+from fastapi import FastAPI, Depends
+from pkg import validators
+
+app = FastAPI()
+
+@app.get("/plan")
+async def get_plan(plan = Depends(validators.valid_plan)):
+    return {"ok": True}
+"#;
+
+        // Create a package structure: pkg/validators.py
+        let (validators_id, validators_sem) =
+            parse_python_with_id("pkg/validators.py", validators_src, 1);
+        let (routes_id, routes_sem) = parse_python_with_id("routes.py", routes_src, 2);
+
+        let sem_entries = vec![(validators_id, validators_sem), (routes_id, routes_sem)];
+        let cg = build_code_graph(&sem_entries);
+
+        let handler_node = *cg
+            .function_nodes
+            .get(&(routes_id, "get_plan".to_string()))
+            .expect("route handler function node should exist");
+        let provider_node = *cg
+            .function_nodes
+            .get(&(validators_id, "valid_plan".to_string()))
+            .expect("provider function node should exist");
+
+        assert_has_di_edge(&cg, handler_node, provider_node);
+    }
+
+    #[test]
+    fn build_code_graph_with_fastapi_lifespan_edge() {
+        // Test the pattern: FastAPI(lifespan=run_background_tasks)
+        let background_src = r#"
+async def run_background_tasks(app):
+    yield
+"#;
+
+        let main_src = r#"
+from fastapi import FastAPI
+from background import run_background_tasks
+
+app = FastAPI(lifespan=run_background_tasks)
+"#;
+
+        let (background_id, background_sem) =
+            parse_python_with_id("background.py", background_src, 1);
+        let (main_id, main_sem) = parse_python_with_id("main.py", main_src, 2);
+
+        let sem_entries = vec![(background_id, background_sem), (main_id, main_sem)];
+        let cg = build_code_graph(&sem_entries);
+
+        // Find the lifespan function node
+        let lifespan_node = *cg
+            .function_nodes
+            .get(&(background_id, "run_background_tasks".to_string()))
+            .expect("lifespan function node should exist");
+
+        // Find the FastAPI app node and verify it has a lifespan edge to the function
+        let mut found_lifespan_edge = false;
+        for edge in cg.graph.edge_references() {
+            if matches!(edge.weight(), GraphEdgeKind::FastApiAppLifespan)
+                && edge.target() == lifespan_node
+            {
+                found_lifespan_edge = true;
+                break;
+            }
+        }
+
+        assert!(
+            found_lifespan_edge,
+            "Expected FastApiAppLifespan edge from app to lifespan function"
+        );
     }
 
     #[test]

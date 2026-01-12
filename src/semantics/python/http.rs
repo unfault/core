@@ -148,6 +148,8 @@ fn detect_session_retry_config(file: &ParsedFile) -> bool {
 }
 
 fn collect_http_calls(file: &ParsedFile, root: Node, out: &mut Vec<HttpCallSite>) {
+    use std::collections::HashMap;
+
     // Pre-check if file has session-level retry config
     let has_session_retry = detect_session_retry_config(file);
 
@@ -159,6 +161,7 @@ fn collect_http_calls(file: &ParsedFile, root: Node, out: &mut Vec<HttpCallSite>
         enclosing_fn_is_async: &mut bool,
         enclosing_fn_retry: &mut Option<RetrySource>,
         has_session_retry: bool,
+        http_client_vars: &mut HashMap<String, HttpClientKind>,
     ) {
         // Detect decorated function definitions (for retry decorator detection)
         // In tree-sitter Python, decorated functions are:
@@ -183,6 +186,14 @@ fn collect_http_calls(file: &ParsedFile, root: Node, out: &mut Vec<HttpCallSite>
             // For non-decorated functions, retry is None (already set by decorated_definition if present)
         }
 
+        // Track HTTP client variable assignments:
+        // - `client = httpx.Client()` / `client = httpx.AsyncClient()`
+        // - `session = requests.Session()`
+        // - `async with httpx.AsyncClient() as client:` / `with requests.Session() as s:`
+        if let Some((var_name, client_kind)) = extract_http_client_assignment(file, node) {
+            http_client_vars.insert(var_name, client_kind);
+        }
+
         if node.kind() == "call" {
             // Check if this call is wrapped in asyncio.to_thread/run_in_executor
             let is_thread_offloaded = check_thread_offload(file, node);
@@ -193,6 +204,7 @@ fn collect_http_calls(file: &ParsedFile, root: Node, out: &mut Vec<HttpCallSite>
                 enclosing_fn_name.clone(),
                 *enclosing_fn_is_async,
                 is_thread_offloaded,
+                http_client_vars,
             ) {
                 // Set retry source based on context
                 if enclosing_fn_retry.is_some() {
@@ -214,6 +226,7 @@ fn collect_http_calls(file: &ParsedFile, root: Node, out: &mut Vec<HttpCallSite>
                 enclosing_fn_is_async,
                 enclosing_fn_retry,
                 has_session_retry,
+                http_client_vars,
             );
             child = c.next_sibling();
         }
@@ -233,6 +246,7 @@ fn collect_http_calls(file: &ParsedFile, root: Node, out: &mut Vec<HttpCallSite>
     let mut enclosing_fn_name: Option<String> = None;
     let mut enclosing_fn_is_async = false;
     let mut enclosing_fn_retry: Option<RetrySource> = None;
+    let mut http_client_vars: HashMap<String, HttpClientKind> = HashMap::new();
     walk(
         file,
         root,
@@ -241,6 +255,7 @@ fn collect_http_calls(file: &ParsedFile, root: Node, out: &mut Vec<HttpCallSite>
         &mut enclosing_fn_is_async,
         &mut enclosing_fn_retry,
         has_session_retry,
+        &mut http_client_vars,
     );
 }
 
@@ -294,16 +309,157 @@ fn check_thread_offload(file: &ParsedFile, call_node: Node) -> bool {
     false
 }
 
+/// Extract HTTP client variable assignments from AST nodes.
+///
+/// Detects patterns like:
+/// - `client = httpx.Client()` / `client = httpx.AsyncClient()`
+/// - `session = requests.Session()`
+/// - `async with httpx.AsyncClient() as client:`
+/// - `with requests.Session() as s:`
+///
+/// Returns the variable name and client kind if this node creates an HTTP client binding.
+fn extract_http_client_assignment(
+    file: &ParsedFile,
+    node: Node,
+) -> Option<(String, HttpClientKind)> {
+
+    // Pattern 1: Assignment like `client = httpx.Client()`
+    if node.kind() == "assignment" {
+        let left = node.child_by_field_name("left")?;
+        let right = node.child_by_field_name("right")?;
+
+        // Left side should be an identifier
+        if left.kind() != "identifier" {
+            return None;
+        }
+        let var_name = file.text_for_node(&left);
+
+        // Right side should be a call
+        if right.kind() != "call" {
+            return None;
+        }
+
+        let client_kind = detect_http_client_constructor(file, right)?;
+        return Some((var_name, client_kind));
+    }
+
+    // Pattern 2: With statement like `with httpx.Client() as client:`
+    // or `async with httpx.AsyncClient() as client:`
+    // Tree-sitter structure varies - we look for with_item children
+    if node.kind() == "with_statement" {
+        if let Some(result) = extract_with_statement_binding(file, node) {
+            return Some(result);
+        }
+    }
+
+    None
+}
+
+/// Extract HTTP client binding from a with statement.
+/// Handles both sync `with` and `async with` statements.
+fn extract_with_statement_binding(
+    file: &ParsedFile,
+    with_node: Node,
+) -> Option<(String, HttpClientKind)> {
+    // Walk through all descendants looking for with_item nodes
+    fn find_with_item_binding(
+        file: &ParsedFile,
+        node: Node,
+    ) -> Option<(String, HttpClientKind)> {
+        
+        if node.kind() == "with_item" {
+            // The with_item structure is:
+            // with_item
+            //   as_pattern
+            //     call (the httpx.AsyncClient())
+            //     as
+            //     as_pattern_target
+            //       identifier (client)
+            let mut call_node: Option<Node> = None;
+            let mut var_name: Option<String> = None;
+
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if child.kind() == "as_pattern" {
+                    // Inside as_pattern, find both the call and the target identifier
+                    let mut as_cursor = child.walk();
+                    for as_child in child.children(&mut as_cursor) {
+                        if as_child.kind() == "call" {
+                            call_node = Some(as_child);
+                        } else if as_child.kind() == "as_pattern_target" {
+                            let mut target_cursor = as_child.walk();
+                            for target_child in as_child.children(&mut target_cursor) {
+                                if target_child.kind() == "identifier" {
+                                    var_name = Some(file.text_for_node(&target_child));
+                                }
+                            }
+                        }
+                    }
+                } else if child.kind() == "call" {
+                    // Fallback: call might be direct child in some cases
+                    call_node = Some(child);
+                } else if child.kind() == "identifier" {
+                    // Fallback: identifier might be direct child
+                    var_name = Some(file.text_for_node(&child));
+                }
+            }
+
+            if let (Some(call), Some(name)) = (call_node, var_name) {
+                if let Some(client_kind) = detect_http_client_constructor(file, call) {
+                    return Some((name, client_kind));
+                }
+            }
+        }
+
+        // Recurse into children
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if let Some(result) = find_with_item_binding(file, child) {
+                return Some(result);
+            }
+        }
+
+        None
+    }
+
+    find_with_item_binding(file, with_node)
+}
+
+/// Check if a call node is constructing an HTTP client.
+///
+/// Matches: httpx.Client(), httpx.AsyncClient(), requests.Session(), aiohttp.ClientSession()
+fn detect_http_client_constructor(file: &ParsedFile, call_node: Node) -> Option<HttpClientKind> {
+    let func = call_node.child_by_field_name("function")?;
+
+    if func.kind() != "attribute" {
+        return None;
+    }
+
+    let object = func.child_by_field_name("object")?;
+    let attr = func.child_by_field_name("attribute")?;
+
+    let object_text = file.text_for_node(&object);
+    let attr_text = file.text_for_node(&attr);
+
+    match (object_text.as_str(), attr_text.as_str()) {
+        ("httpx", "Client" | "AsyncClient") => Some(HttpClientKind::Httpx),
+        ("requests", "Session") => Some(HttpClientKind::Requests),
+        ("aiohttp", "ClientSession") => Some(HttpClientKind::Aiohttp),
+        _ => None,
+    }
+}
+
 fn extract_http_call(
     file: &ParsedFile,
     call_node: Node,
     enclosing_fn_name: Option<String>,
     in_async_function: bool,
     is_thread_offloaded: bool,
+    http_client_vars: &std::collections::HashMap<String, HttpClientKind>,
 ) -> Option<HttpCallSite> {
     let func = call_node.child_by_field_name("function")?;
 
-    // Only handle attribute calls: `requests.get(...)`, `httpx.post(...)`
+    // Only handle attribute calls: `requests.get(...)`, `httpx.post(...)`, `client.get(...)`
     if func.kind() != "attribute" {
         return None;
     }
@@ -314,11 +470,15 @@ fn extract_http_call(
     let object_text = file.text_for_node(&object);
     let method_name = file.text_for_node(&attr);
 
+    // First, try to match module-level calls (requests.get, httpx.post)
     let client_kind = match object_text.as_str() {
-        "requests" => HttpClientKind::Requests,
-        "httpx" => HttpClientKind::Httpx,
-        _ => return None,
-    };
+        "requests" => Some(HttpClientKind::Requests),
+        "httpx" => Some(HttpClientKind::Httpx),
+        _ => {
+            // Check if the object is a known HTTP client variable
+            http_client_vars.get(&object_text).cloned()
+        }
+    }?;
 
     // Filter out non-HTTP method calls (e.g., httpx.URL(), httpx.Headers())
     // Only consider actual HTTP request methods
@@ -916,5 +1076,108 @@ def fetch():
             !calls[0].is_thread_offloaded,
             "Request in sync function should NOT be marked as thread offloaded"
         );
+    }
+
+    // ==================== HTTP Client Instance Detection ====================
+
+    #[test]
+    fn detects_httpx_async_client_with_statement() {
+        let src = r#"
+async def fetch_data():
+    async with httpx.AsyncClient() as client:
+        response = await client.get('https://example.com')
+        return response.json()
+"#;
+        let calls = parse_and_summarize_http(src);
+        assert_eq!(calls.len(), 1);
+        assert!(matches!(calls[0].client_kind, HttpClientKind::Httpx));
+        assert_eq!(calls[0].method_name, "get");
+        assert!(!calls[0].has_timeout);
+    }
+
+    #[test]
+    fn detects_httpx_client_with_timeout() {
+        let src = r#"
+async def fetch_data():
+    async with httpx.AsyncClient() as client:
+        response = await client.get('https://example.com', timeout=30)
+        return response.json()
+"#;
+        let calls = parse_and_summarize_http(src);
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].has_timeout);
+    }
+
+    #[test]
+    fn detects_requests_session_with_statement() {
+        let src = r#"
+def fetch_data():
+    with requests.Session() as session:
+        response = session.get('https://example.com')
+        return response.json()
+"#;
+        let calls = parse_and_summarize_http(src);
+        assert_eq!(calls.len(), 1);
+        assert!(matches!(calls[0].client_kind, HttpClientKind::Requests));
+        assert_eq!(calls[0].method_name, "get");
+    }
+
+    #[test]
+    fn detects_httpx_client_assignment() {
+        let src = r#"
+def fetch_data():
+    client = httpx.Client()
+    response = client.get('https://example.com')
+    return response.json()
+"#;
+        let calls = parse_and_summarize_http(src);
+        assert_eq!(calls.len(), 1);
+        assert!(matches!(calls[0].client_kind, HttpClientKind::Httpx));
+        assert_eq!(calls[0].method_name, "get");
+    }
+
+    #[test]
+    fn detects_requests_session_assignment() {
+        let src = r#"
+def fetch_data():
+    session = requests.Session()
+    response = session.post('https://example.com', json={})
+    return response.json()
+"#;
+        let calls = parse_and_summarize_http(src);
+        assert_eq!(calls.len(), 1);
+        assert!(matches!(calls[0].client_kind, HttpClientKind::Requests));
+        assert_eq!(calls[0].method_name, "post");
+    }
+
+    #[test]
+    fn detects_multiple_calls_on_client_instance() {
+        let src = r#"
+async def fetch_all():
+    async with httpx.AsyncClient() as client:
+        a = await client.get('https://example.com/a')
+        b = await client.post('https://example.com/b', json={})
+        return a, b
+"#;
+        let calls = parse_and_summarize_http(src);
+        assert_eq!(calls.len(), 2);
+        assert!(calls.iter().any(|c| c.method_name == "get"));
+        assert!(calls.iter().any(|c| c.method_name == "post"));
+    }
+
+    #[test]
+    fn detects_client_instance_with_http2() {
+        // Real-world pattern from reliably_app/assistant/tasks/experiment.py
+        let src = r#"
+async def fetch_starter():
+    async with httpx.AsyncClient(http2=True) as c:
+        r = await c.get(get_url())
+        return r.json()
+"#;
+        let calls = parse_and_summarize_http(src);
+        assert_eq!(calls.len(), 1);
+        assert!(matches!(calls[0].client_kind, HttpClientKind::Httpx));
+        assert_eq!(calls[0].method_name, "get");
+        assert!(!calls[0].has_timeout);
     }
 }

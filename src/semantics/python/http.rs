@@ -320,6 +320,16 @@ fn extract_http_call(
         _ => return None,
     };
 
+    // Filter out non-HTTP method calls (e.g., httpx.URL(), httpx.Headers())
+    // Only consider actual HTTP request methods
+    let is_http_method = matches!(
+        method_name.to_lowercase().as_str(),
+        "get" | "post" | "put" | "patch" | "delete" | "head" | "options" | "request"
+    );
+    if !is_http_method {
+        return None;
+    }
+
     let call_text = file.text_for_node(&call_node);
     let args_text = if let Some(args) = call_node.child_by_field_name("arguments") {
         file.text_for_node(&args)
@@ -489,6 +499,25 @@ mod tests {
         );
         assert_eq!(calls.len(), 1);
         assert!(!calls[0].has_timeout);
+    }
+
+    #[test]
+    fn ignores_non_http_methods() {
+        // httpx.URL() and httpx.Headers() are not HTTP requests
+        let src = r#"
+client.base_url = httpx.URL(base_url)
+client.headers = httpx.Headers({"Authorization": "Bearer token"})
+"#;
+        let calls = parse_and_summarize_http(src);
+        assert_eq!(calls.len(), 0, "Should not detect httpx.URL or httpx.Headers as HTTP calls");
+    }
+
+    #[test]
+    fn ignores_requests_session_constructor() {
+        // requests.Session() is not an HTTP request
+        let src = "session = requests.Session()";
+        let calls = parse_and_summarize_http(src);
+        assert_eq!(calls.len(), 0, "Should not detect requests.Session() as HTTP call");
     }
 
     // ==================== Function Context Tests ====================

@@ -1644,6 +1644,9 @@ fn add_fastapi_nodes(
             existing
         } else {
             let qualified_name = route.handler_name.clone();
+            // Use location from route - it has the function's line range
+            let start_line = route.location.range.start_line + 1; // Convert to 1-based
+            let end_line = route.location.range.end_line + 1;
             let node = cg.graph.add_node(GraphNode::Function {
                 file_id,
                 name: route.handler_name.clone(),
@@ -1652,8 +1655,8 @@ fn add_fastapi_nodes(
                 is_handler: true,
                 http_method: Some(route.http_method.clone()),
                 http_path: Some(route.path.clone()),
-                start_line: None, // Route handlers don't have line info in this context
-                end_line: None,
+                start_line: Some(start_line),
+                end_line: Some(end_line),
             });
 
             // File contains function
@@ -1749,6 +1752,8 @@ fn add_express_nodes(
 
         let http_method = route.method.to_uppercase();
         let http_path = route.path.clone();
+        let start_line = route.location.range.start_line + 1; // Convert to 1-based
+        let end_line = route.location.range.end_line + 1;
 
         let func_node = cg.graph.add_node(GraphNode::Function {
             file_id,
@@ -1758,8 +1763,8 @@ fn add_express_nodes(
             is_handler: true,
             http_method: Some(http_method),
             http_path,
-            start_line: None, // Route handlers don't have line info in this context
-            end_line: None,
+            start_line: Some(start_line),
+            end_line: Some(end_line),
         });
 
         // File contains function
@@ -1800,6 +1805,9 @@ fn add_go_framework_nodes(
             continue;
         }
 
+        let start_line = route.location.range.start_line + 1; // Convert to 1-based
+        let end_line = route.location.range.end_line + 1;
+        
         let func_node = cg.graph.add_node(GraphNode::Function {
             file_id,
             name: handler_name.clone(),
@@ -1808,8 +1816,8 @@ fn add_go_framework_nodes(
             is_handler: true,
             http_method: Some(route.http_method.clone()),
             http_path: Some(route.path.clone()),
-            start_line: None, // Go route handlers don't have line info in this context
-            end_line: None,
+            start_line: Some(start_line),
+            end_line: Some(end_line),
         });
 
         // File contains function
@@ -1846,6 +1854,9 @@ fn add_rust_framework_nodes(
             continue;
         }
 
+        let start_line = route.location.range.start_line + 1; // Convert to 1-based
+        let end_line = route.location.range.end_line + 1;
+        
         let func_node = cg.graph.add_node(GraphNode::Function {
             file_id,
             name: handler_name.clone(),
@@ -1854,8 +1865,8 @@ fn add_rust_framework_nodes(
             is_handler: true,
             http_method: Some(route.method.clone()),
             http_path: Some(route.path.clone()),
-            start_line: None, // Rust route handlers don't have line info in this context
-            end_line: None,
+            start_line: Some(start_line),
+            end_line: Some(end_line),
         });
 
         // File contains function

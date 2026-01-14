@@ -464,7 +464,8 @@ fn convert_python_function(
         decorators: vec![],
         class_name: py_func.class_name.clone(),
         calls,
-        body_lines: 0,
+        // Calculate body_lines from location range
+        body_lines: py_func.location.range.end_line.saturating_sub(py_func.location.range.start_line),
         has_error_handling: false,
         has_documentation: false,
         location: CommonLocation {

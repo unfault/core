@@ -96,6 +96,10 @@ pub enum GraphNode {
         http_method: Option<String>,
         /// HTTP path if this is an HTTP route handler (e.g., "/users/{user_id}")
         http_path: Option<String>,
+        /// Start line of the function definition (1-based)
+        start_line: Option<u32>,
+        /// End line of the function definition (1-based)
+        end_line: Option<u32>,
     },
 
     /// A class or type definition
@@ -1431,6 +1435,8 @@ fn add_function_nodes(
             is_handler: func.is_route_handler(),
             http_method: None,
             http_path: None,
+            start_line: Some(func.location.line),
+            end_line: Some(func.location.line + func.body_lines),
         });
 
         // File contains function
@@ -1646,6 +1652,8 @@ fn add_fastapi_nodes(
                 is_handler: true,
                 http_method: Some(route.http_method.clone()),
                 http_path: Some(route.path.clone()),
+                start_line: None, // Route handlers don't have line info in this context
+                end_line: None,
             });
 
             // File contains function
@@ -1750,6 +1758,8 @@ fn add_express_nodes(
             is_handler: true,
             http_method: Some(http_method),
             http_path,
+            start_line: None, // Route handlers don't have line info in this context
+            end_line: None,
         });
 
         // File contains function
@@ -1798,6 +1808,8 @@ fn add_go_framework_nodes(
             is_handler: true,
             http_method: Some(route.http_method.clone()),
             http_path: Some(route.path.clone()),
+            start_line: None, // Go route handlers don't have line info in this context
+            end_line: None,
         });
 
         // File contains function
@@ -1842,6 +1854,8 @@ fn add_rust_framework_nodes(
             is_handler: true,
             http_method: Some(route.method.clone()),
             http_path: Some(route.path.clone()),
+            start_line: None, // Rust route handlers don't have line info in this context
+            end_line: None,
         });
 
         // File contains function
@@ -1938,6 +1952,8 @@ mod tests {
             is_handler: false,
             http_method: None,
             http_path: None,
+            start_line: Some(10),
+            end_line: Some(20),
         };
         let debug_str = format!("{:?}", node);
         assert!(debug_str.contains("Function"));
@@ -2018,6 +2034,8 @@ mod tests {
             is_handler: true,
             http_method: None,
             http_path: None,
+            start_line: None,
+            end_line: None,
         };
         assert_eq!(func.display_name(), "Handler.process");
 
@@ -2061,6 +2079,8 @@ mod tests {
             is_handler: false,
             http_method: None,
             http_path: None,
+            start_line: None,
+            end_line: None,
         };
         assert!(!func.is_file());
     }
@@ -2684,6 +2704,8 @@ def bar():
             is_handler: false,
             http_method: None,
             http_path: None,
+            start_line: Some(1),
+            end_line: Some(10),
         });
 
         let func_b = cg.graph.add_node(GraphNode::Function {
@@ -2694,6 +2716,8 @@ def bar():
             is_handler: false,
             http_method: None,
             http_path: None,
+            start_line: Some(12),
+            end_line: Some(20),
         });
 
         // File contains both functions
@@ -2748,6 +2772,8 @@ def bar():
             is_handler: false,
             http_method: None,
             http_path: None,
+            start_line: Some(1),
+            end_line: Some(15),
         });
         cg.function_nodes
             .insert((file_id, "my_func".to_string()), func_node);

@@ -4,6 +4,20 @@ All notable changes to `unfault-core` will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.1.4] - 2026-01-14
+
+### Added
+- Added `start_line`/`end_line` attributes to Function nodes for precise code location.
+- Added HTTP call detection on client instances in Python analysis.
+
+### Fixed
+- Populated `start_line`/`end_line` for route handler function nodes.
+- Fixed `body_lines` calculation from location range for accurate function end line detection.
+- Filtered non-HTTP methods from HTTP call detection to reduce false positives.
+
+### Docs
+- Added CONTRIBUTING.md guide.
+
 ## [0.1.3] - 2026-01-09
 
 ### Added
@@ -22,6 +36,7 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 - Framework summaries and route extraction (e.g., FastAPI, net/http, Express/NestJS/Fastify).
 - Common semantics extraction across languages (annotations, route patterns, error contexts).
 
+[0.1.4]: https://github.com/unfault/core/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/unfault/core/compare/v0.1.1...v0.1.3
 [0.1.1]: https://github.com/unfault/core/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/unfault/core/releases/tag/v0.1.0

@@ -4,6 +4,10 @@ All notable changes to `unfault-core` will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.1.6] - 2026-01-15
+
+- Fix publishing of the crate
+
 ## [0.1.4] - 2026-01-14
 
 ### Added
@@ -36,6 +40,7 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 - Framework summaries and route extraction (e.g., FastAPI, net/http, Express/NestJS/Fastify).
 - Common semantics extraction across languages (annotations, route patterns, error contexts).
 
+[0.1.6]: https://github.com/unfault/core/compare/v0.1.5...v0.1.6
 [0.1.4]: https://github.com/unfault/core/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/unfault/core/compare/v0.1.1...v0.1.3
 [0.1.1]: https://github.com/unfault/core/compare/v0.1.0...v0.1.1

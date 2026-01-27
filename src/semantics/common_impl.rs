@@ -7,7 +7,6 @@ use crate::parse::ast::FileId;
 use crate::types::context::Language;
 
 use super::common::{
-    CommonLocation, CommonSemantics,
     annotations::{Annotation, AnnotationType},
     async_ops::{AsyncOperation, AsyncOperationType, AsyncRuntime},
     db::{DbLibrary, DbOperation, DbOperationType},
@@ -18,6 +17,7 @@ use super::common::{
     http::{HttpCall, HttpClientLibrary, HttpMethod},
     imports::{Import, ImportSource, ImportStyle, ImportedItem},
     route_patterns::{RouteFramework, RoutePattern},
+    CommonLocation, CommonSemantics,
 };
 
 use super::go::model::{GoCallSite, GoFileSemantics, GoFunction, GoImport, GoMethod};
@@ -74,7 +74,8 @@ impl CommonSemantics for PyFileSemantics {
                 HttpCall {
                     library,
                     method,
-                    url: None, // HttpCallSite doesn't store URL directly
+                    url: call.url_literal.clone(),
+                    url_expr: call.url_expr.clone(),
                     has_timeout: call.has_timeout,
                     timeout_value: None,
                     retry_mechanism: None,
@@ -465,7 +466,11 @@ fn convert_python_function(
         class_name: py_func.class_name.clone(),
         calls,
         // Calculate body_lines from location range
-        body_lines: py_func.location.range.end_line.saturating_sub(py_func.location.range.start_line),
+        body_lines: py_func
+            .location
+            .range
+            .end_line
+            .saturating_sub(py_func.location.range.start_line),
         has_error_handling: false,
         has_documentation: false,
         location: CommonLocation {
@@ -546,6 +551,7 @@ impl CommonSemantics for GoFileSemantics {
                     library,
                     method,
                     url: None, // Go HttpCallSite doesn't store URL
+                    url_expr: None,
                     has_timeout: call.has_timeout,
                     timeout_value: None,
                     retry_mechanism: None,
@@ -1610,6 +1616,7 @@ impl CommonSemantics for TsFileSemantics {
                     library,
                     method,
                     url: call.url.clone(),
+                    url_expr: call.url_expr.clone(),
                     has_timeout: call.has_timeout,
                     timeout_value: None,
                     retry_mechanism: None,

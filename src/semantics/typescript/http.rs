@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::parse::ast::{AstLocation, ParsedFile};
 
+use crate::semantics::common::http::{HttpUrlExpr, HttpUrlExprKind};
+
 /// Represents an HTTP client call in TypeScript code.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HttpCallSite {
@@ -13,6 +15,12 @@ pub struct HttpCallSite {
     pub method: String,
     /// URL if statically determinable
     pub url: Option<String>,
+
+    /// URL if statically determinable as a literal
+    pub url_literal: Option<String>,
+
+    /// URL expression metadata when the URL is not a literal
+    pub url_expr: Option<HttpUrlExpr>,
     /// Whether a timeout is configured
     pub has_timeout: bool,
     /// Whether error handling is present (try-catch or .catch())
@@ -126,15 +134,9 @@ fn detect_http_call(
         return None;
     }
 
-    // Get URL from first argument if available
-    let url = node
-        .child_by_field_name("arguments")
-        .and_then(|args| args.named_child(0))
-        .map(|arg| {
-            let text = parsed.text_for_node(&arg);
-            text.trim_matches(|c| c == '\'' || c == '"' || c == '`')
-                .to_string()
-        });
+    let (url_literal, url_expr) = extract_url_from_first_arg(parsed, node);
+    // Backwards-compatible field: only populate when the URL is a literal.
+    let url = url_literal.clone();
 
     // Check for timeout configuration
     let has_timeout = check_timeout(parsed, node, &callee);
@@ -149,6 +151,8 @@ fn detect_http_call(
         client_kind,
         method,
         url,
+        url_literal,
+        url_expr,
         has_timeout,
         has_error_handling,
         has_retry,
@@ -158,6 +162,115 @@ fn detect_http_call(
         start_byte: node.start_byte(),
         end_byte: node.end_byte(),
     })
+}
+
+fn extract_url_from_first_arg(
+    parsed: &ParsedFile,
+    call: &tree_sitter::Node,
+) -> (Option<String>, Option<HttpUrlExpr>) {
+    let args = match call.child_by_field_name("arguments") {
+        Some(a) => a,
+        None => return (None, None),
+    };
+    let first = match args.named_child(0) {
+        Some(a) => a,
+        None => return (None, None),
+    };
+
+    extract_url_from_expr(parsed, &first)
+}
+
+fn extract_url_from_expr(
+    parsed: &ParsedFile,
+    expr: &tree_sitter::Node,
+) -> (Option<String>, Option<HttpUrlExpr>) {
+    let text = parsed.text_for_node(expr);
+    let trimmed = text.trim();
+
+    // String literal
+    if expr.kind() == "string" {
+        return (
+            Some(trimmed.trim_matches(|c| c == '\'' || c == '"').to_string()),
+            None,
+        );
+    }
+
+    // Template literal
+    if expr.kind() == "template_string" {
+        let has_subst = trimmed.contains("${");
+        if !has_subst {
+            return (Some(trimmed.trim_matches('`').to_string()), None);
+        }
+
+        return (
+            None,
+            Some(HttpUrlExpr {
+                text: trimmed.to_string(),
+                kind: HttpUrlExprKind::Template,
+                env_var: None,
+            }),
+        );
+    }
+
+    let kind = match expr.kind() {
+        "identifier" => HttpUrlExprKind::Identifier,
+        "member_expression" | "subscript_expression" => HttpUrlExprKind::Member,
+        "call_expression" => HttpUrlExprKind::Call,
+        _ => HttpUrlExprKind::Unknown,
+    };
+
+    let env_var = detect_env_var_name_ts(parsed, expr);
+    (
+        None,
+        Some(HttpUrlExpr {
+            text: trimmed.to_string(),
+            kind,
+            env_var,
+        }),
+    )
+}
+
+fn detect_env_var_name_ts(parsed: &ParsedFile, expr: &tree_sitter::Node) -> Option<String> {
+    // process.env.FOO
+    if expr.kind() == "member_expression" {
+        let object = expr.child_by_field_name("object")?;
+        let property = expr.child_by_field_name("property")?;
+        if is_process_env_object(parsed, &object) {
+            return Some(parsed.text_for_node(&property));
+        }
+    }
+
+    // process.env["FOO"]
+    if expr.kind() == "subscript_expression" {
+        let object = expr.child_by_field_name("object")?;
+        let index = expr.child_by_field_name("index")?;
+        if is_process_env_object(parsed, &object) && index.kind() == "string" {
+            let idx = parsed.text_for_node(&index);
+            return Some(
+                idx.trim()
+                    .trim_matches(|c| c == '\'' || c == '"')
+                    .to_string(),
+            );
+        }
+    }
+
+    None
+}
+
+fn is_process_env_object(parsed: &ParsedFile, expr: &tree_sitter::Node) -> bool {
+    // process.env
+    if expr.kind() != "member_expression" {
+        return false;
+    }
+    let object = match expr.child_by_field_name("object") {
+        Some(o) => o,
+        None => return false,
+    };
+    let property = match expr.child_by_field_name("property") {
+        Some(p) => p,
+        None => return false,
+    };
+    parsed.text_for_node(&object) == "process" && parsed.text_for_node(&property) == "env"
 }
 
 fn detect_client_and_method(callee: &str) -> Option<(HttpClientKind, String)> {
@@ -380,6 +493,56 @@ mod tests {
         let calls = parse_and_summarize("fetch('https://api.example.com');");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].client_kind, HttpClientKind::Fetch);
+    }
+
+    #[test]
+    fn extracts_url_literal_for_fetch() {
+        let calls = parse_and_summarize("fetch('https://api.example.com');");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].url_literal,
+            Some("https://api.example.com".to_string())
+        );
+        assert!(calls[0].url_expr.is_none());
+        assert_eq!(calls[0].url, calls[0].url_literal);
+    }
+
+    #[test]
+    fn extracts_process_env_url_expr_member() {
+        let calls = parse_and_summarize("fetch(process.env.API_URL);");
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].url_literal.is_none());
+        assert!(calls[0].url.is_none());
+        let expr = calls[0]
+            .url_expr
+            .clone()
+            .expect("url_expr should be present");
+        assert_eq!(expr.kind, HttpUrlExprKind::Member);
+        assert_eq!(expr.env_var, Some("API_URL".to_string()));
+    }
+
+    #[test]
+    fn extracts_process_env_url_expr_subscript() {
+        let calls = parse_and_summarize("fetch(process.env['API_URL']);");
+        assert_eq!(calls.len(), 1);
+        let expr = calls[0]
+            .url_expr
+            .clone()
+            .expect("url_expr should be present");
+        assert_eq!(expr.kind, HttpUrlExprKind::Member);
+        assert_eq!(expr.env_var, Some("API_URL".to_string()));
+    }
+
+    #[test]
+    fn extracts_template_literal_with_substitution_as_expr() {
+        let calls = parse_and_summarize("fetch(`${baseUrl}/v1`);");
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].url_literal.is_none());
+        let expr = calls[0]
+            .url_expr
+            .clone()
+            .expect("url_expr should be present");
+        assert_eq!(expr.kind, HttpUrlExprKind::Template);
     }
 
     #[test]

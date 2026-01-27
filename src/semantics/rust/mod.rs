@@ -16,9 +16,9 @@ pub use model::RustFileSemantics;
 use anyhow::Result;
 
 use crate::parse::ast::ParsedFile;
-use crate::semantics::common::CommonLocation;
 use crate::semantics::common::calls::FunctionCall;
 use crate::semantics::common::db::{DbLibrary, DbOperation, DbOperationType};
+use crate::semantics::common::CommonLocation;
 
 /// Build the semantic model for a single Rust file.
 ///
@@ -100,6 +100,7 @@ fn convert_http_call_site(
         library,
         method,
         url: None,
+        url_expr: None,
         has_timeout: site.has_timeout,
         timeout_value: site.timeout_value,
         retry_mechanism: None,

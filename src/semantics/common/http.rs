@@ -93,6 +93,39 @@ pub enum HttpMethod {
     Other(String),
 }
 
+/// Best-effort classification for non-literal URL expressions.
+///
+/// This is used to power IDE features (e.g., fault injection on egress calls)
+/// without requiring full constant folding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HttpUrlExprKind {
+    /// A string literal (handled separately via `HttpCall.url`)
+    Literal,
+    /// A bare identifier (e.g., `BASE_URL`)
+    Identifier,
+    /// Member / attribute access (e.g., `config.base_url`)
+    Member,
+    /// A call expression (e.g., `os.getenv("FOO")`, `get_url()`)
+    Call,
+    /// A template / interpolated string (e.g., JS template literal, Python f-string)
+    Template,
+    /// Anything else / unknown shape
+    Unknown,
+}
+
+/// Best-effort representation of a URL expression when the URL is not statically
+/// determinable as a literal.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HttpUrlExpr {
+    /// Raw source text for the expression.
+    pub text: String,
+    /// Shape classification for the expression.
+    pub kind: HttpUrlExprKind,
+    /// Environment variable name if the expression is a recognized env var read.
+    pub env_var: Option<String>,
+}
+
 impl HttpMethod {
     pub fn as_str(&self) -> &str {
         match self {
@@ -140,6 +173,9 @@ pub struct HttpCall {
 
     /// The URL being called (if statically determinable)
     pub url: Option<String>,
+
+    /// URL expression metadata when `url` cannot be statically determined.
+    pub url_expr: Option<HttpUrlExpr>,
 
     /// Whether this call has an explicit timeout configured
     pub has_timeout: bool,
@@ -217,6 +253,7 @@ pub struct HttpCallBuilder {
     library: Option<HttpClientLibrary>,
     method: Option<HttpMethod>,
     url: Option<String>,
+    url_expr: Option<HttpUrlExpr>,
     has_timeout: bool,
     timeout_value: Option<f64>,
     retry_mechanism: Option<RetryMechanism>,
@@ -246,6 +283,11 @@ impl HttpCallBuilder {
 
     pub fn url(mut self, url: impl Into<String>) -> Self {
         self.url = Some(url.into());
+        self
+    }
+
+    pub fn url_expr(mut self, expr: HttpUrlExpr) -> Self {
+        self.url_expr = Some(expr);
         self
     }
 
@@ -301,6 +343,7 @@ impl HttpCallBuilder {
             library: self.library?,
             method: self.method.unwrap_or(HttpMethod::Get),
             url: self.url,
+            url_expr: self.url_expr,
             has_timeout: self.has_timeout,
             timeout_value: self.timeout_value,
             retry_mechanism: self.retry_mechanism,

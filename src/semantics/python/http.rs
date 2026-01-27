@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use crate::parse::ast::ParsedFile;
 use tree_sitter::Node;
 
+use crate::semantics::common::http::{HttpUrlExpr, HttpUrlExprKind};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum HttpClientKind {
     Requests,
@@ -40,6 +42,12 @@ pub struct HttpCallSite {
 
     /// Method name, e.g. "get", "post".
     pub method_name: String,
+
+    /// URL if statically determinable as a literal.
+    pub url_literal: Option<String>,
+
+    /// URL expression metadata when the URL is not a literal.
+    pub url_expr: Option<HttpUrlExpr>,
 
     /// Exact text of the call expression.
     pub call_text: String,
@@ -322,7 +330,6 @@ fn extract_http_client_assignment(
     file: &ParsedFile,
     node: Node,
 ) -> Option<(String, HttpClientKind)> {
-
     // Pattern 1: Assignment like `client = httpx.Client()`
     if node.kind() == "assignment" {
         let left = node.child_by_field_name("left")?;
@@ -362,11 +369,7 @@ fn extract_with_statement_binding(
     with_node: Node,
 ) -> Option<(String, HttpClientKind)> {
     // Walk through all descendants looking for with_item nodes
-    fn find_with_item_binding(
-        file: &ParsedFile,
-        node: Node,
-    ) -> Option<(String, HttpClientKind)> {
-        
+    fn find_with_item_binding(file: &ParsedFile, node: Node) -> Option<(String, HttpClientKind)> {
         if node.kind() == "with_item" {
             // The with_item structure is:
             // with_item
@@ -499,12 +502,16 @@ fn extract_http_call(
 
     let has_timeout = args_text.contains("timeout=");
 
+    let (url_literal, url_expr) = extract_url_from_call_args(file, call_node);
+
     let location = file.location_for_node(&call_node);
     let byte_range = call_node.byte_range();
 
     Some(HttpCallSite {
         client_kind,
         method_name,
+        url_literal,
+        url_expr,
         call_text,
         has_timeout,
         location,
@@ -515,6 +522,200 @@ fn extract_http_call(
         end_byte: byte_range.end,
         retry_source: None,
     })
+}
+
+fn extract_url_from_call_args(
+    file: &ParsedFile,
+    call_node: Node,
+) -> (Option<String>, Option<HttpUrlExpr>) {
+    let args = match call_node.child_by_field_name("arguments") {
+        Some(a) => a,
+        None => return (None, None),
+    };
+
+    // Best-effort: pick the first positional (non-keyword) argument.
+    let mut cursor = args.walk();
+    let mut first_arg: Option<Node> = None;
+    for child in args.named_children(&mut cursor) {
+        match child.kind() {
+            "keyword_argument" | "dictionary_splat" => continue,
+            _ => {
+                first_arg = Some(child);
+                break;
+            }
+        }
+    }
+
+    let arg = match first_arg {
+        Some(n) => n,
+        None => return (None, None),
+    };
+
+    extract_url_from_expr(file, arg)
+}
+
+fn extract_url_from_expr(file: &ParsedFile, expr: Node) -> (Option<String>, Option<HttpUrlExpr>) {
+    let text = file.text_for_node(&expr);
+    let trimmed = text.trim();
+
+    // Python string literal
+    if expr.kind() == "string" {
+        // Treat f-strings as templates (non-literal)
+        if looks_like_f_string(trimmed) {
+            return (
+                None,
+                Some(HttpUrlExpr {
+                    text: trimmed.to_string(),
+                    kind: HttpUrlExprKind::Template,
+                    env_var: None,
+                }),
+            );
+        }
+
+        if let Some(lit) = unquote_python_string_literal(trimmed) {
+            return (Some(lit), None);
+        }
+    }
+
+    let kind = match expr.kind() {
+        "identifier" => HttpUrlExprKind::Identifier,
+        "attribute" => HttpUrlExprKind::Member,
+        "call" => HttpUrlExprKind::Call,
+        // e.g. os.environ["FOO"]
+        "subscript" => HttpUrlExprKind::Member,
+        _ => HttpUrlExprKind::Unknown,
+    };
+
+    let env_var = detect_env_var_name(file, expr);
+    (
+        None,
+        Some(HttpUrlExpr {
+            text: trimmed.to_string(),
+            kind,
+            env_var,
+        }),
+    )
+}
+
+fn looks_like_f_string(s: &str) -> bool {
+    // Very small heuristic: python prefixes can be combined (rf, fr, etc.).
+    // If any prefix contains f/F, treat as template.
+    let mut i = 0;
+    for ch in s.chars() {
+        if ch == '\'' || ch == '"' {
+            break;
+        }
+        if ch.is_ascii_alphabetic() {
+            i += ch.len_utf8();
+            continue;
+        }
+        break;
+    }
+    let prefix = &s[..i];
+    prefix.contains('f') || prefix.contains('F')
+}
+
+fn unquote_python_string_literal(s: &str) -> Option<String> {
+    // Best-effort, non-evaluating extraction. Handles prefixes and single/double quotes.
+    let mut i = 0;
+    for ch in s.chars() {
+        if ch == '\'' || ch == '"' {
+            break;
+        }
+        if ch.is_ascii_alphabetic() {
+            i += ch.len_utf8();
+            continue;
+        }
+        break;
+    }
+    let without_prefix = &s[i..];
+
+    let quote = if without_prefix.starts_with("\"\"\"") {
+        "\"\"\""
+    } else if without_prefix.starts_with("'''") {
+        "'''"
+    } else if without_prefix.starts_with('"') {
+        "\""
+    } else if without_prefix.starts_with('\'') {
+        "'"
+    } else {
+        return None;
+    };
+
+    if !without_prefix.ends_with(quote) {
+        return None;
+    }
+
+    let start = quote.len();
+    let end = without_prefix.len().saturating_sub(quote.len());
+    if end < start {
+        return None;
+    }
+    Some(without_prefix[start..end].to_string())
+}
+
+fn detect_env_var_name(file: &ParsedFile, expr: Node) -> Option<String> {
+    match expr.kind() {
+        "call" => detect_env_var_from_call(file, expr),
+        "subscript" => detect_env_var_from_subscript(file, expr),
+        _ => None,
+    }
+}
+
+fn detect_env_var_from_call(file: &ParsedFile, call: Node) -> Option<String> {
+    let func = call.child_by_field_name("function")?;
+
+    // os.getenv("FOO")
+    if func.kind() == "attribute" {
+        let object = func.child_by_field_name("object")?;
+        let attr = func.child_by_field_name("attribute")?;
+        let object_text = file.text_for_node(&object);
+        let attr_text = file.text_for_node(&attr);
+
+        if object_text == "os" && attr_text == "getenv" {
+            return first_string_arg(file, call);
+        }
+
+        // os.environ.get("FOO")
+        if attr_text == "get" && object.kind() == "attribute" {
+            let obj_obj = object.child_by_field_name("object")?;
+            let obj_attr = object.child_by_field_name("attribute")?;
+            if file.text_for_node(&obj_obj) == "os" && file.text_for_node(&obj_attr) == "environ" {
+                return first_string_arg(file, call);
+            }
+        }
+    }
+
+    None
+}
+
+fn detect_env_var_from_subscript(file: &ParsedFile, sub: Node) -> Option<String> {
+    // os.environ["FOO"]
+    let value = sub.child_by_field_name("value")?;
+    if value.kind() != "attribute" {
+        return None;
+    }
+    let obj = value.child_by_field_name("object")?;
+    let attr = value.child_by_field_name("attribute")?;
+    if file.text_for_node(&obj) != "os" || file.text_for_node(&attr) != "environ" {
+        return None;
+    }
+
+    let index = sub.child_by_field_name("subscript")?;
+    if index.kind() != "string" {
+        return None;
+    }
+
+    unquote_python_string_literal(file.text_for_node(&index).trim())
+}
+
+fn first_string_arg(file: &ParsedFile, call: Node) -> Option<String> {
+    let args = call.child_by_field_name("arguments")?;
+    let first = args.named_child(0)?;
+    if first.kind() != "string" {
+        return None;
+    }
+    unquote_python_string_literal(file.text_for_node(&first).trim())
 }
 
 #[cfg(test)]
@@ -542,6 +743,71 @@ mod tests {
         let calls = parse_and_summarize_http("requests.get('https://example.com')");
         assert_eq!(calls.len(), 1);
         assert!(matches!(calls[0].client_kind, HttpClientKind::Requests));
+    }
+
+    #[test]
+    fn extracts_url_literal() {
+        let calls = parse_and_summarize_http("requests.get('https://example.com')");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].url_literal,
+            Some("https://example.com".to_string())
+        );
+        assert!(calls[0].url_expr.is_none());
+    }
+
+    #[test]
+    fn extracts_url_identifier_expr() {
+        let src = r#"
+url = 'https://example.com'
+requests.get(url)
+"#;
+        let calls = parse_and_summarize_http(src);
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].url_literal.is_none());
+        let expr = calls[0]
+            .url_expr
+            .clone()
+            .expect("url_expr should be present");
+        assert_eq!(expr.text, "url");
+        assert_eq!(expr.kind, HttpUrlExprKind::Identifier);
+        assert!(expr.env_var.is_none());
+    }
+
+    #[test]
+    fn extracts_env_var_from_os_getenv() {
+        let calls = parse_and_summarize_http("import os\nrequests.get(os.getenv('API_URL'))");
+        assert_eq!(calls.len(), 1);
+        let expr = calls[0]
+            .url_expr
+            .clone()
+            .expect("url_expr should be present");
+        assert_eq!(expr.kind, HttpUrlExprKind::Call);
+        assert_eq!(expr.env_var, Some("API_URL".to_string()));
+    }
+
+    #[test]
+    fn extracts_env_var_from_os_environ_subscript() {
+        let calls = parse_and_summarize_http("import os\nrequests.get(os.environ['API_URL'])");
+        assert_eq!(calls.len(), 1);
+        let expr = calls[0]
+            .url_expr
+            .clone()
+            .expect("url_expr should be present");
+        assert_eq!(expr.kind, HttpUrlExprKind::Member);
+        assert_eq!(expr.env_var, Some("API_URL".to_string()));
+    }
+
+    #[test]
+    fn extracts_f_string_as_template_expr() {
+        let calls = parse_and_summarize_http("base='https://x'\nrequests.get(f\"{base}/a\")");
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].url_literal.is_none());
+        let expr = calls[0]
+            .url_expr
+            .clone()
+            .expect("url_expr should be present");
+        assert_eq!(expr.kind, HttpUrlExprKind::Template);
     }
 
     #[test]
@@ -669,7 +935,11 @@ client.base_url = httpx.URL(base_url)
 client.headers = httpx.Headers({"Authorization": "Bearer token"})
 "#;
         let calls = parse_and_summarize_http(src);
-        assert_eq!(calls.len(), 0, "Should not detect httpx.URL or httpx.Headers as HTTP calls");
+        assert_eq!(
+            calls.len(),
+            0,
+            "Should not detect httpx.URL or httpx.Headers as HTTP calls"
+        );
     }
 
     #[test]
@@ -677,7 +947,11 @@ client.headers = httpx.Headers({"Authorization": "Bearer token"})
         // requests.Session() is not an HTTP request
         let src = "session = requests.Session()";
         let calls = parse_and_summarize_http(src);
-        assert_eq!(calls.len(), 0, "Should not detect requests.Session() as HTTP call");
+        assert_eq!(
+            calls.len(),
+            0,
+            "Should not detect requests.Session() as HTTP call"
+        );
     }
 
     // ==================== Function Context Tests ====================

@@ -170,6 +170,7 @@ fn collect_http_calls(file: &ParsedFile, root: Node, out: &mut Vec<HttpCallSite>
         enclosing_fn_retry: &mut Option<RetrySource>,
         has_session_retry: bool,
         http_client_vars: &mut HashMap<String, HttpClientKind>,
+        env_var_bindings: &mut HashMap<String, String>,
     ) {
         // Detect decorated function definitions (for retry decorator detection)
         // In tree-sitter Python, decorated functions are:
@@ -202,6 +203,15 @@ fn collect_http_calls(file: &ParsedFile, root: Node, out: &mut Vec<HttpCallSite>
             http_client_vars.insert(var_name, client_kind);
         }
 
+        // Track module-level env-var-backed bindings like:
+        //   KITCHEN_URL = os.getenv("KITCHEN_URL")
+        // This enables resolving f-strings like f"{KITCHEN_URL}/orders".
+        if enclosing_fn_name.is_none() {
+            if let Some((var_name, env_name)) = extract_env_var_assignment(file, node) {
+                env_var_bindings.insert(var_name, env_name);
+            }
+        }
+
         if node.kind() == "call" {
             // Check if this call is wrapped in asyncio.to_thread/run_in_executor
             let is_thread_offloaded = check_thread_offload(file, node);
@@ -213,6 +223,7 @@ fn collect_http_calls(file: &ParsedFile, root: Node, out: &mut Vec<HttpCallSite>
                 *enclosing_fn_is_async,
                 is_thread_offloaded,
                 http_client_vars,
+                env_var_bindings,
             ) {
                 // Set retry source based on context
                 if enclosing_fn_retry.is_some() {
@@ -235,6 +246,7 @@ fn collect_http_calls(file: &ParsedFile, root: Node, out: &mut Vec<HttpCallSite>
                 enclosing_fn_retry,
                 has_session_retry,
                 http_client_vars,
+                env_var_bindings,
             );
             child = c.next_sibling();
         }
@@ -255,6 +267,7 @@ fn collect_http_calls(file: &ParsedFile, root: Node, out: &mut Vec<HttpCallSite>
     let mut enclosing_fn_is_async = false;
     let mut enclosing_fn_retry: Option<RetrySource> = None;
     let mut http_client_vars: HashMap<String, HttpClientKind> = HashMap::new();
+    let mut env_var_bindings: HashMap<String, String> = HashMap::new();
     walk(
         file,
         root,
@@ -264,6 +277,7 @@ fn collect_http_calls(file: &ParsedFile, root: Node, out: &mut Vec<HttpCallSite>
         &mut enclosing_fn_retry,
         has_session_retry,
         &mut http_client_vars,
+        &mut env_var_bindings,
     );
 }
 
@@ -360,6 +374,23 @@ fn extract_http_client_assignment(
     }
 
     None
+}
+
+fn extract_env_var_assignment(file: &ParsedFile, node: Node) -> Option<(String, String)> {
+    if node.kind() != "assignment" {
+        return None;
+    }
+
+    let left = node.child_by_field_name("left")?;
+    let right = node.child_by_field_name("right")?;
+
+    if left.kind() != "identifier" {
+        return None;
+    }
+
+    let var_name = file.text_for_node(&left);
+    let env_name = detect_env_var_name(file, right)?;
+    Some((var_name, env_name))
 }
 
 /// Extract HTTP client binding from a with statement.
@@ -459,6 +490,7 @@ fn extract_http_call(
     in_async_function: bool,
     is_thread_offloaded: bool,
     http_client_vars: &std::collections::HashMap<String, HttpClientKind>,
+    env_var_bindings: &std::collections::HashMap<String, String>,
 ) -> Option<HttpCallSite> {
     let func = call_node.child_by_field_name("function")?;
 
@@ -502,7 +534,7 @@ fn extract_http_call(
 
     let has_timeout = args_text.contains("timeout=");
 
-    let (url_literal, url_expr) = extract_url_from_call_args(file, call_node);
+    let (url_literal, url_expr) = extract_url_from_call_args(file, call_node, env_var_bindings);
 
     let location = file.location_for_node(&call_node);
     let byte_range = call_node.byte_range();
@@ -527,6 +559,7 @@ fn extract_http_call(
 fn extract_url_from_call_args(
     file: &ParsedFile,
     call_node: Node,
+    env_var_bindings: &std::collections::HashMap<String, String>,
 ) -> (Option<String>, Option<HttpUrlExpr>) {
     let args = match call_node.child_by_field_name("arguments") {
         Some(a) => a,
@@ -551,10 +584,14 @@ fn extract_url_from_call_args(
         None => return (None, None),
     };
 
-    extract_url_from_expr(file, arg)
+    extract_url_from_expr(file, arg, env_var_bindings)
 }
 
-fn extract_url_from_expr(file: &ParsedFile, expr: Node) -> (Option<String>, Option<HttpUrlExpr>) {
+fn extract_url_from_expr(
+    file: &ParsedFile,
+    expr: Node,
+    env_var_bindings: &std::collections::HashMap<String, String>,
+) -> (Option<String>, Option<HttpUrlExpr>) {
     let text = file.text_for_node(&expr);
     let trimmed = text.trim();
 
@@ -562,12 +599,13 @@ fn extract_url_from_expr(file: &ParsedFile, expr: Node) -> (Option<String>, Opti
     if expr.kind() == "string" {
         // Treat f-strings as templates (non-literal)
         if looks_like_f_string(trimmed) {
+            let env_var = detect_env_var_in_f_string(file, expr, env_var_bindings);
             return (
                 None,
                 Some(HttpUrlExpr {
                     text: trimmed.to_string(),
                     kind: HttpUrlExprKind::Template,
-                    env_var: None,
+                    env_var,
                 }),
             );
         }
@@ -595,6 +633,76 @@ fn extract_url_from_expr(file: &ParsedFile, expr: Node) -> (Option<String>, Opti
             env_var,
         }),
     )
+}
+
+fn detect_env_var_in_f_string(
+    file: &ParsedFile,
+    string_node: Node,
+    env_var_bindings: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    // First, see if the f-string itself contains a recognized env var read
+    // like f"{os.getenv('FOO')}/...".
+    let mut stack: Vec<Node> = Vec::new();
+    let mut child = string_node.child(0);
+    while let Some(c) = child {
+        stack.push(c);
+        child = c.next_sibling();
+    }
+
+    while let Some(n) = stack.pop() {
+        if n.kind() == "call" || n.kind() == "subscript" {
+            if let Some(env) = detect_env_var_name(file, n) {
+                return Some(env);
+            }
+        }
+
+        let mut inner = n.child(0);
+        while let Some(ic) = inner {
+            stack.push(ic);
+            inner = ic.next_sibling();
+        }
+    }
+
+    // Otherwise, look for {IDENT} patterns and resolve module-level bindings
+    // like IDENT = os.getenv("FOO").
+    let raw = file.text_for_node(&string_node);
+    let mut vars = std::collections::BTreeSet::new();
+    let bytes = raw.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            let start = j;
+            if j < bytes.len() && (bytes[j].is_ascii_alphabetic() || bytes[j] == b'_') {
+                j += 1;
+                while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                    j += 1;
+                }
+                let ident = &raw[start..j];
+
+                // Ensure the pattern is exactly {IDENT} (allowing whitespace before closing brace)
+                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if j < bytes.len() && bytes[j] == b'}' {
+                    vars.insert(ident.to_string());
+                }
+            }
+        }
+        i += 1;
+    }
+
+    if vars.len() == 1 {
+        let var = vars.iter().next().cloned()?;
+        if let Some(env) = env_var_bindings.get(&var) {
+            return Some(env.clone());
+        }
+    }
+
+    None
 }
 
 fn looks_like_f_string(s: &str) -> bool {
@@ -808,6 +916,28 @@ requests.get(url)
             .clone()
             .expect("url_expr should be present");
         assert_eq!(expr.kind, HttpUrlExprKind::Template);
+    }
+
+    #[test]
+    fn extracts_env_var_from_f_string_identifier_binding() {
+        let src = r#"
+import os
+KITCHEN_URL = os.getenv('KITCHEN_URL')
+
+async def create_order():
+    async with httpx.AsyncClient() as client:
+        await client.post(f"{KITCHEN_URL}/orders")
+"#;
+
+        let calls = parse_and_summarize_http(src);
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].url_literal.is_none());
+        let expr = calls[0]
+            .url_expr
+            .clone()
+            .expect("url_expr should be present");
+        assert_eq!(expr.kind, HttpUrlExprKind::Template);
+        assert_eq!(expr.env_var, Some("KITCHEN_URL".to_string()));
     }
 
     #[test]

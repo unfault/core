@@ -7,12 +7,18 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 ## [Unreleased]
 
 ### Added
+
+### Fixed
+
+## [0.1.12] - 2026-01-28
+
+### Added
 - Cross-language URL env-var extraction for HTTP calls (Go: `os.Getenv`, Rust: `std::env::var`/`env!`, TypeScript: `process.env`/`import.meta.env`/`Bun.env`/`Deno.env.get`).
 - Go/Rust HTTP URL literal + expression metadata for client callsites.
 - Richer HTTP call extraction parity:
   - Go: timeout values (seconds), request/context association for `client.Do(req)`, and retryablehttp classification.
   - TypeScript: timeout values (seconds), instance tracking (`axios.create`, `got.extend`, `ky.create/extend`), and best-effort base URL joining.
-  - Rust: best-effort retry and loop context propagation.
+  - Rust: tighter reqwest binding detection, improved retry recognition, and loop context propagation.
   - Python: http detection upgraded toward httpx-level richness (client defaults, timeout values, retry mapping).
 - Prefix-aware route extraction across frameworks:
   - Go: Gin groups, Chi `Route`/`Mount`, and Gorilla/mux `PathPrefix(...).Subrouter()`.
@@ -20,7 +26,14 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
   - TypeScript: Express router mounts, Fastify register prefixes, NestJS controller prefixes.
 - FastAPI: `include_router(..., prefix=...)` parsing and path composition with `APIRouter(prefix=...)`.
 - Django: method inference for views (decorators and class-based views) and richer URL pattern metadata.
+- CodeGraph best-effort cross-file route composition:
+  - FastAPI: apply `include_router(..., prefix=...)` prefixes to imported router modules.
+  - Django: follow `include(...)` across urlconf modules and compose path prefixes into handler HTTP metadata.
+- Django URL patterns emitted as common `RoutePattern` entries (best-effort; includes skipped in per-file emission).
 - Language support audit document: `docs/language-support-audit.md`.
+
+### Fixed
+- Stop tracking `.unfault/` cache artifacts.
 
 ## [0.1.11] - 2026-01-28
 
@@ -73,4 +86,5 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 [0.1.1]: https://github.com/unfault/core/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/unfault/core/releases/tag/v0.1.0
 [0.1.11]: https://github.com/unfault/core/compare/v0.1.7...v0.1.11
-[Unreleased]: https://github.com/unfault/core/compare/v0.1.11...main
+[0.1.12]: https://github.com/unfault/core/compare/v0.1.11...v0.1.12
+[Unreleased]: https://github.com/unfault/core/compare/v0.1.12...main

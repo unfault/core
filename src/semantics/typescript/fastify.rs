@@ -2,6 +2,8 @@
 
 use crate::parse::ast::ParsedFile;
 
+use std::collections::HashMap;
+
 use super::model::{FastifyFileSummary, FastifyMiddleware, FastifyRoute};
 
 pub fn summarize_fastify(parsed: &ParsedFile) -> Option<FastifyFileSummary> {
@@ -12,7 +14,8 @@ pub fn summarize_fastify(parsed: &ParsedFile) -> Option<FastifyFileSummary> {
     };
 
     let root = parsed.tree.root_node();
-    walk_for_fastify(root, parsed, &mut summary);
+    let mut plugin_prefixes: HashMap<String, String> = HashMap::new();
+    walk_for_fastify(root, parsed, "/", &mut plugin_prefixes, &mut summary);
 
     if summary.apps.is_empty() && summary.routes.is_empty() && summary.middlewares.is_empty() {
         return None;
@@ -24,14 +27,41 @@ pub fn summarize_fastify(parsed: &ParsedFile) -> Option<FastifyFileSummary> {
 fn walk_for_fastify(
     node: tree_sitter::Node,
     parsed: &ParsedFile,
+    current_prefix: &str,
+    plugin_prefixes: &mut HashMap<String, String>,
     summary: &mut FastifyFileSummary,
 ) {
     match node.kind() {
         "lexical_declaration" | "variable_declaration" => {
             check_fastify_instantiation(parsed, &node, summary);
         }
+        "function_declaration" => {
+            // If this is a registered plugin function, walk its body with the plugin prefix.
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = parsed.text_for_node(&name_node);
+                if let Some(prefix) = plugin_prefixes.get(&name).cloned() {
+                    if let Some(body) = node.child_by_field_name("body") {
+                        walk_for_fastify(body, parsed, &prefix, plugin_prefixes, summary);
+                        return;
+                    }
+                }
+            }
+
+            // Avoid traversing into arbitrary function bodies: Fastify routes should be collected
+            // from the plugin callback passed to `register` (handled above).
+            return;
+        }
         "call_expression" => {
-            check_fastify_routes_and_middleware(parsed, &node, summary);
+            if check_fastify_register_with_prefix(
+                parsed,
+                &node,
+                current_prefix,
+                plugin_prefixes,
+                summary,
+            ) {
+                return;
+            }
+            check_fastify_routes_and_middleware(parsed, &node, current_prefix, summary);
         }
         _ => {}
     }
@@ -39,7 +69,7 @@ fn walk_for_fastify(
     let child_count = node.child_count();
     for i in 0..child_count {
         if let Some(child) = node.child(i) {
-            walk_for_fastify(child, parsed, summary);
+            walk_for_fastify(child, parsed, current_prefix, plugin_prefixes, summary);
         }
     }
 }
@@ -76,6 +106,7 @@ fn check_fastify_instantiation(
 fn check_fastify_routes_and_middleware(
     parsed: &ParsedFile,
     node: &tree_sitter::Node,
+    current_prefix: &str,
     summary: &mut FastifyFileSummary,
 ) {
     let func_node = match node.child_by_field_name("function") {
@@ -100,7 +131,7 @@ fn check_fastify_routes_and_middleware(
                 || callee == pattern.as_str()
                 || callee.ends_with(&format!(".{}", method))
             {
-                let route = extract_route_info(parsed, node, method, &location);
+                let route = extract_route_info(parsed, node, method, current_prefix, &location);
                 summary.routes.push(route);
                 return;
             }
@@ -123,6 +154,7 @@ fn extract_route_info(
     parsed: &ParsedFile,
     node: &tree_sitter::Node,
     method: &str,
+    current_prefix: &str,
     location: &crate::parse::ast::AstLocation,
 ) -> FastifyRoute {
     let mut path = None;
@@ -133,10 +165,10 @@ fn extract_route_info(
         if let Some(first_arg) = args_node.named_child(0) {
             let text = parsed.text_for_node(&first_arg);
             if text.starts_with('\'') || text.starts_with('"') || text.starts_with('`') {
-                path = Some(
-                    text.trim_matches(|c| c == '\'' || c == '"' || c == '`')
-                        .to_string(),
-                );
+                let raw = text
+                    .trim_matches(|c| c == '\'' || c == '"' || c == '`')
+                    .to_string();
+                path = Some(join_paths(current_prefix, &raw));
             }
         }
 
@@ -157,6 +189,168 @@ fn extract_route_info(
         is_async,
         location: location.clone(),
     }
+}
+
+fn check_fastify_register_with_prefix(
+    parsed: &ParsedFile,
+    node: &tree_sitter::Node,
+    current_prefix: &str,
+    plugin_prefixes: &mut HashMap<String, String>,
+    summary: &mut FastifyFileSummary,
+) -> bool {
+    let Some(func_node) = node.child_by_field_name("function") else {
+        return false;
+    };
+    let callee = parsed.text_for_node(&func_node);
+    if !(callee.ends_with(".register") || callee.contains(".register(")) {
+        return false;
+    }
+
+    let Some(args_node) = node.child_by_field_name("arguments") else {
+        return false;
+    };
+
+    // Find plugin function or identifier.
+    let plugin = args_node.named_child(0);
+    let prefix_opt = extract_fastify_register_prefix(parsed, &args_node);
+
+    let Some(prefix) = prefix_opt else {
+        // No prefix to apply; let normal traversal handle.
+        return false;
+    };
+    let new_prefix = join_paths(current_prefix, &prefix);
+
+    if let Some(p) = plugin {
+        if p.kind() == "arrow_function"
+            || p.kind() == "function"
+            || p.kind() == "function_expression"
+        {
+            // Walk plugin body with prefix.
+            if let Some(body) = p.child_by_field_name("body") {
+                walk_for_fastify(body, parsed, &new_prefix, plugin_prefixes, summary);
+                return true;
+            }
+        }
+        if p.kind() == "identifier" {
+            let name = parsed.text_for_node(&p);
+            plugin_prefixes.insert(name.clone(), new_prefix.clone());
+
+            // Best-effort: if the plugin function is declared in this file,
+            // walk its body immediately (registration can appear after declaration).
+            if let Some(body) = find_function_body_by_name(parsed, &name) {
+                walk_for_fastify(body, parsed, &new_prefix, plugin_prefixes, summary);
+            }
+            return true;
+        }
+    }
+
+    true
+}
+
+fn find_function_body_by_name<'a>(
+    parsed: &'a ParsedFile,
+    name: &'a str,
+) -> Option<tree_sitter::Node<'a>> {
+    let root = parsed.tree.root_node();
+
+    fn walk<'a>(
+        parsed: &'a ParsedFile,
+        node: tree_sitter::Node<'a>,
+        name: &'a str,
+    ) -> Option<tree_sitter::Node<'a>> {
+        if node.kind() == "function_declaration" {
+            if let Some(n) = node.child_by_field_name("name") {
+                if parsed.text_for_node(&n) == name {
+                    return node.child_by_field_name("body");
+                }
+            }
+        }
+
+        let child_count = node.child_count();
+        for i in 0..child_count {
+            if let Some(child) = node.child(i) {
+                if let Some(found) = walk(parsed, child, name) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+
+    walk(parsed, root, name)
+}
+
+fn extract_fastify_register_prefix(
+    parsed: &ParsedFile,
+    args_node: &tree_sitter::Node,
+) -> Option<String> {
+    // Look for an object literal like { prefix: '/api' } among arguments.
+    for i in 0..args_node.named_child_count() {
+        if let Some(arg) = args_node.named_child(i) {
+            if arg.kind() == "object" {
+                if let Some(prefix) = extract_prefix_from_object_literal(parsed, &arg) {
+                    return Some(prefix);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn extract_prefix_from_object_literal(
+    parsed: &ParsedFile,
+    obj: &tree_sitter::Node,
+) -> Option<String> {
+    // tree-sitter TS object: (object (pair key value) ...)
+    let mut cursor = obj.walk();
+    for child in obj.named_children(&mut cursor) {
+        if child.kind() != "pair" {
+            continue;
+        }
+        let key = child.child_by_field_name("key")?;
+        let value = child.child_by_field_name("value")?;
+        let key_text_raw = parsed.text_for_node(&key);
+        let key_text = key_text_raw
+            .trim()
+            .trim_matches(|c| c == '\'' || c == '"')
+            .to_string();
+        if key_text != "prefix" {
+            continue;
+        }
+        let v = parsed.text_for_node(&value);
+        if v.starts_with('\'') || v.starts_with('"') || v.starts_with('`') {
+            return Some(
+                v.trim_matches(|c| c == '\'' || c == '"' || c == '`')
+                    .to_string(),
+            );
+        }
+    }
+    None
+}
+
+fn join_paths(prefix: &str, path: &str) -> String {
+    let mut pfx = prefix.trim().to_string();
+    let mut p = path.trim().to_string();
+
+    if pfx.is_empty() {
+        pfx = "/".to_string();
+    }
+    if p.is_empty() {
+        p = "/".to_string();
+    }
+    if !pfx.starts_with('/') {
+        pfx = format!("/{}", pfx);
+    }
+    if !p.starts_with('/') {
+        p = format!("/{}", p);
+    }
+    if pfx == "/" {
+        return p;
+    }
+    if p == "/" {
+        return pfx;
+    }
+    format!("{}{}", pfx.trim_end_matches('/'), p)
 }
 
 fn extract_middleware_name(
@@ -299,6 +493,42 @@ app.get('/users', (req, reply) => {
         assert!(!summary.routes.is_empty());
         assert_eq!(summary.routes[0].method, "get");
         assert_eq!(summary.routes[0].path, Some("/users".to_string()));
+    }
+
+    #[test]
+    fn applies_register_prefix_for_inline_plugin() {
+        let src = r#"
+import fastify from 'fastify';
+
+const app = fastify();
+
+app.register((instance, _opts, done) => {
+  instance.get('/users', () => {});
+  done();
+}, { prefix: '/api' });
+"#;
+        let summary = parse_and_summarize(src).unwrap();
+        assert_eq!(summary.routes.len(), 1);
+        assert_eq!(summary.routes[0].path, Some("/api/users".to_string()));
+    }
+
+    #[test]
+    fn applies_register_prefix_for_named_plugin_function() {
+        let src = r#"
+import fastify from 'fastify';
+
+const app = fastify();
+
+function routes(instance, _opts, done) {
+  instance.get('/users', () => {});
+  done();
+}
+
+app.register(routes, { prefix: '/api' });
+"#;
+        let summary = parse_and_summarize(src).unwrap();
+        assert_eq!(summary.routes.len(), 1);
+        assert_eq!(summary.routes[0].path, Some("/api/users".to_string()));
     }
 
     #[test]

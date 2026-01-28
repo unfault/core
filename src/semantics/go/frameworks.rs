@@ -9,6 +9,7 @@
 
 use crate::parse::ast::{AstLocation, ParsedFile};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use tree_sitter::Node;
 
 /// A single HTTP route registration from any Go framework.
@@ -65,8 +66,11 @@ pub fn extract_go_routes(parsed: &ParsedFile) -> GoFrameworkSummary {
     // First pass: detect which frameworks are imported
     detect_frameworks(parsed, root, &mut summary);
 
-    // Second pass: extract routes
-    collect_routes(parsed, root, &mut summary);
+    // Second pass: collect router prefixes (Gin Group, Chi Route/Mount, Mux Subrouter)
+    let router_prefixes = collect_group_prefixes(parsed, root);
+
+    // Third pass: extract routes
+    collect_routes(parsed, root, &router_prefixes, "/", &mut summary);
 
     summary
 }
@@ -121,9 +125,26 @@ fn detect_frameworks(parsed: &ParsedFile, node: Node, summary: &mut GoFrameworkS
     }
 }
 
-fn collect_routes(parsed: &ParsedFile, node: Node, summary: &mut GoFrameworkSummary) {
+fn collect_routes(
+    parsed: &ParsedFile,
+    node: Node,
+    router_prefixes: &HashMap<String, String>,
+    current_prefix: &str,
+    summary: &mut GoFrameworkSummary,
+) {
     if node.kind() == "call_expression" {
-        if let Some(route) = extract_route(parsed, node, &summary.frameworks) {
+        // Chi scoped routes: r.Route("/api", func(r chi.Router) { ... })
+        if summary.frameworks.contains(&GoHttpFramework::Chi) {
+            if let Some((scope_prefix, body_node)) = extract_chi_route_scope(parsed, node) {
+                let new_prefix = join_paths(current_prefix, &scope_prefix);
+                collect_routes(parsed, body_node, router_prefixes, &new_prefix, summary);
+                return;
+            }
+        }
+
+        if let Some(mut route) = extract_route(parsed, node, &summary.frameworks, router_prefixes) {
+            // Apply the current prefix (from Chi Route scopes)
+            route.path = join_paths(current_prefix, &route.path);
             summary.routes.push(route);
         }
     }
@@ -131,7 +152,7 @@ fn collect_routes(parsed: &ParsedFile, node: Node, summary: &mut GoFrameworkSumm
     // Recurse
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i) {
-            collect_routes(parsed, child, summary);
+            collect_routes(parsed, child, router_prefixes, current_prefix, summary);
         }
     }
 }
@@ -140,13 +161,23 @@ fn extract_route(
     parsed: &ParsedFile,
     call_node: Node,
     frameworks: &[GoHttpFramework],
+    router_prefixes: &HashMap<String, String>,
 ) -> Option<GoRoute> {
     let func = call_node.child_by_field_name("function")?;
 
     // Check for selector expression: router.GET, e.POST, app.Get, etc.
     if func.kind() == "selector_expression" {
         let field = func.child_by_field_name("field")?;
+        let operand = func.child_by_field_name("operand");
         let method_name = parsed.text_for_node(&field);
+
+        // net/http: http.HandleFunc("/path", handler) / http.Handle("/path", handler)
+        if let Some(op) = operand {
+            let recv = parsed.text_for_node(&op);
+            if recv == "http" && (method_name == "HandleFunc" || method_name == "Handle") {
+                return extract_net_http_selector_route(parsed, call_node);
+            }
+        }
 
         // Determine HTTP method and framework
         let (http_method, framework) = if HTTP_METHODS_UPPER.contains(&method_name.as_str()) {
@@ -169,7 +200,23 @@ fn extract_route(
             // Gin's Any and Handle methods
             ("ANY".to_string(), GoHttpFramework::Gin)
         } else if method_name == "HandleFunc" {
-            // Gorilla mux or net/http style
+            // Gorilla mux or net/http style.
+            // Disambiguate using receiver and imported frameworks.
+            if let Some(op) = operand {
+                let recv = parsed.text_for_node(&op);
+                if recv == "http"
+                    || (frameworks.contains(&GoHttpFramework::NetHttp)
+                        && !frameworks.contains(&GoHttpFramework::Mux))
+                {
+                    return extract_net_http_selector_route(parsed, call_node);
+                }
+
+                let mut route = extract_mux_route(parsed, call_node)?;
+                if let Some(prefix) = extract_receiver_prefix(parsed, op, router_prefixes) {
+                    route.path = join_paths(&prefix, &route.path);
+                }
+                return Some(route);
+            }
             return extract_mux_route(parsed, call_node);
         } else {
             return None;
@@ -202,7 +249,13 @@ fn extract_route(
             }
         }
 
-        let route_path = path?;
+        let mut route_path = path?;
+
+        if let Some(op) = operand {
+            if let Some(prefix) = extract_receiver_prefix(parsed, op, router_prefixes) {
+                route_path = join_paths(&prefix, &route_path);
+            }
+        }
 
         Some(GoRoute {
             framework,
@@ -219,6 +272,293 @@ fn extract_route(
     } else {
         None
     }
+}
+
+fn extract_net_http_selector_route(parsed: &ParsedFile, call_node: Node) -> Option<GoRoute> {
+    let args = call_node.child_by_field_name("arguments")?;
+
+    let mut path: Option<String> = None;
+    let mut handler_name: Option<String> = None;
+
+    let mut arg_index = 0;
+    for i in 0..args.child_count() {
+        if let Some(arg) = args.child(i) {
+            if arg.kind() == "," || arg.kind() == "(" || arg.kind() == ")" {
+                continue;
+            }
+            if arg_index == 0 {
+                let path_text = parsed.text_for_node(&arg);
+                path = Some(path_text.trim_matches('"').to_string());
+            } else if arg_index == 1 {
+                let handler_text = parsed.text_for_node(&arg);
+                handler_name = extract_handler_name(&handler_text);
+            }
+            arg_index += 1;
+        }
+    }
+
+    let route_path = path?;
+
+    Some(GoRoute {
+        framework: GoHttpFramework::NetHttp,
+        http_method: "ANY".to_string(),
+        path: route_path,
+        handler_name,
+        location: parsed.location_for_node(&call_node),
+        start_byte: call_node.start_byte(),
+        end_byte: call_node.end_byte(),
+    })
+}
+
+fn collect_group_prefixes(parsed: &ParsedFile, root: Node) -> HashMap<String, String> {
+    let mut out: HashMap<String, String> = HashMap::new();
+
+    fn walk(parsed: &ParsedFile, node: Node, out: &mut HashMap<String, String>) {
+        // Capture `group := r.Group("/api")` and `group = r.Group("/api")`.
+        if node.kind() == "short_var_declaration" || node.kind() == "assignment_statement" {
+            let left = node.child_by_field_name("left");
+            let right = node.child_by_field_name("right");
+            if let (Some(lhs), Some(rhs)) = (left, right) {
+                // We only handle simple identifier LHS and call_expression RHS.
+                if lhs.kind() == "expression_list" {
+                    if let Some(first) = lhs.named_child(0) {
+                        if first.kind() == "identifier" {
+                            if let Some(prefix) = extract_prefix_from_expr(parsed, rhs, &*out) {
+                                out.insert(parsed.text_for_node(&first), prefix);
+                            }
+                        }
+                    }
+                } else if lhs.kind() == "identifier" {
+                    if let Some(prefix) = extract_prefix_from_expr(parsed, rhs, &*out) {
+                        out.insert(parsed.text_for_node(&lhs), prefix);
+                    }
+                }
+            }
+        }
+
+        // Chi Mount: r.Mount("/api", apiRouter)
+        if node.kind() == "call_expression" {
+            if let Some((mounted_router, prefix)) = extract_chi_mount_binding(parsed, node) {
+                out.entry(mounted_router).or_insert(prefix);
+            }
+        }
+
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i) {
+                walk(parsed, child, out);
+            }
+        }
+    }
+
+    walk(parsed, root, &mut out);
+
+    // Fallback: best-effort text scan for common Group patterns.
+    extend_group_prefixes_from_text(parsed, &mut out);
+    out
+}
+
+fn extend_group_prefixes_from_text(parsed: &ParsedFile, out: &mut HashMap<String, String>) {
+    for line in parsed.source.lines() {
+        let l = line.trim();
+        if !(l.contains(".Group(")
+            || l.contains(".Route(")
+            || l.contains(".Mount(")
+            || l.contains(".PathPrefix(")
+            || l.contains(".Subrouter(")
+            || l.contains(".SubRouter(")
+            || l.contains(".Subrouter()")
+            || l.contains(".SubRouter()"))
+        {
+            continue;
+        }
+
+        // Match: name := something.Group("/prefix")
+        if let Some(pos) = l.find(":=") {
+            let name = l[..pos].trim();
+            if let Some(prefix) = extract_prefix_from_group_call_text(l) {
+                if !name.is_empty() {
+                    out.entry(name.to_string()).or_insert(prefix);
+                }
+            }
+            continue;
+        }
+        // Match: name = something.Group("/prefix")
+        if let Some(pos) = l.find('=') {
+            let name = l[..pos].trim();
+            if let Some(prefix) = extract_prefix_from_group_call_text(l) {
+                if !name.is_empty() {
+                    out.entry(name.to_string()).or_insert(prefix);
+                }
+            }
+        }
+    }
+}
+
+fn extract_prefix_from_group_call_text(text: &str) -> Option<String> {
+    // Best-effort: return first quoted string in the line.
+    let q1 = text.find('"')?;
+    let rest = &text[q1 + 1..];
+    let q2 = rest.find('"')?;
+    Some(rest[..q2].to_string())
+}
+
+fn extract_receiver_prefix(
+    parsed: &ParsedFile,
+    receiver_expr: Node,
+    router_prefixes: &HashMap<String, String>,
+) -> Option<String> {
+    if receiver_expr.kind() == "identifier" {
+        return router_prefixes
+            .get(&parsed.text_for_node(&receiver_expr))
+            .cloned();
+    }
+    extract_prefix_from_expr(parsed, receiver_expr, router_prefixes)
+}
+
+fn extract_prefix_from_expr(
+    parsed: &ParsedFile,
+    expr: Node,
+    router_prefixes: &HashMap<String, String>,
+) -> Option<String> {
+    if expr.kind() == "identifier" {
+        return router_prefixes.get(&parsed.text_for_node(&expr)).cloned();
+    }
+
+    if expr.kind() != "call_expression" {
+        return None;
+    }
+
+    let func = expr.child_by_field_name("function")?;
+    if func.kind() != "selector_expression" {
+        return None;
+    }
+
+    let field = func.child_by_field_name("field")?;
+    let operand = func.child_by_field_name("operand");
+    let field_name = parsed.text_for_node(&field);
+
+    let base = operand.and_then(|op| extract_prefix_from_expr(parsed, op, router_prefixes));
+
+    // Builders that introduce a prefix.
+    if matches!(
+        field_name.as_str(),
+        "Group" | "Route" | "Mount" | "PathPrefix"
+    ) {
+        if let Some(cur) = extract_first_string_arg_node(parsed, expr) {
+            return Some(match base {
+                Some(b) => join_paths(&b, &cur),
+                None => cur,
+            });
+        }
+        return base;
+    }
+
+    // Subrouter keeps the prefix from its operand chain.
+    if field_name == "Subrouter" || field_name == "SubRouter" {
+        return base;
+    }
+
+    base
+}
+
+fn extract_first_string_arg_node(parsed: &ParsedFile, call_node: Node) -> Option<String> {
+    let args = call_node.child_by_field_name("arguments")?;
+    let first = args.named_child(0)?;
+    let raw = parsed.text_for_node(&first);
+    if raw.starts_with('"') {
+        return Some(raw.trim_matches('"').to_string());
+    }
+    None
+}
+
+fn extract_chi_route_scope<'a>(
+    parsed: &'a ParsedFile,
+    call_node: Node<'a>,
+) -> Option<(String, Node<'a>)> {
+    // Match: r.Route("/api", func(r chi.Router) { ... })
+    let func = call_node.child_by_field_name("function")?;
+    if func.kind() != "selector_expression" {
+        return None;
+    }
+    let field = func.child_by_field_name("field")?;
+    if parsed.text_for_node(&field) != "Route" {
+        return None;
+    }
+
+    let prefix = extract_first_string_arg_node(parsed, call_node)?;
+    let args = call_node.child_by_field_name("arguments")?;
+
+    for i in 0..args.named_child_count() {
+        if let Some(arg) = args.named_child(i) {
+            if arg.kind() == "func_literal" {
+                if let Some(body) = arg.child_by_field_name("body") {
+                    return Some((prefix, body));
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn extract_chi_mount_binding<'a>(
+    parsed: &'a ParsedFile,
+    call_node: Node<'a>,
+) -> Option<(String, String)> {
+    // Match: r.Mount("/api", apiRouter)
+    let func = call_node.child_by_field_name("function")?;
+    if func.kind() != "selector_expression" {
+        return None;
+    }
+    let field = func.child_by_field_name("field")?;
+    if parsed.text_for_node(&field) != "Mount" {
+        return None;
+    }
+
+    let args = call_node.child_by_field_name("arguments")?;
+    if args.named_child_count() < 2 {
+        return None;
+    }
+    let prefix_node = args.named_child(0)?;
+    let target_node = args.named_child(1)?;
+
+    if target_node.kind() != "identifier" {
+        return None;
+    }
+
+    let raw = parsed.text_for_node(&prefix_node);
+    if !raw.starts_with('"') {
+        return None;
+    }
+
+    let prefix = raw.trim_matches('"').to_string();
+    let target = parsed.text_for_node(&target_node);
+    Some((target, prefix))
+}
+
+fn join_paths(prefix: &str, path: &str) -> String {
+    let mut pfx = prefix.trim().to_string();
+    let mut p = path.trim().to_string();
+
+    if pfx.is_empty() {
+        pfx = "/".to_string();
+    }
+    if p.is_empty() {
+        p = "/".to_string();
+    }
+    if !pfx.starts_with('/') {
+        pfx = format!("/{}", pfx);
+    }
+    if !p.starts_with('/') {
+        p = format!("/{}", p);
+    }
+    if pfx == "/" {
+        return p;
+    }
+    if p == "/" {
+        return pfx;
+    }
+    format!("{}{}", pfx.trim_end_matches('/'), p)
 }
 
 fn extract_mux_route(parsed: &ParsedFile, call_node: Node) -> Option<GoRoute> {
@@ -409,6 +749,25 @@ func main() {
     }
 
     #[test]
+    fn applies_group_prefix_for_gin_grouped_routes() {
+        let src = r#"
+package main
+
+import "github.com/gin-gonic/gin"
+
+func main() {
+    r := gin.Default()
+    api := r.Group("/api")
+    api.GET("/users", getUsers)
+}
+"#;
+        let summary = parse_and_extract(src);
+        assert_eq!(summary.routes.len(), 1);
+        assert_eq!(summary.routes[0].path, "/api/users");
+        assert_eq!(summary.routes[0].http_method, "GET");
+    }
+
+    #[test]
     fn detects_echo_routes() {
         let src = r#"
 package main
@@ -461,6 +820,65 @@ func main() {
         let summary = parse_and_extract(src);
         assert!(summary.frameworks.contains(&GoHttpFramework::Chi));
         assert_eq!(summary.routes.len(), 2);
+    }
+
+    #[test]
+    fn applies_route_prefix_for_chi_route_scope() {
+        let src = r#"
+package main
+
+import "github.com/go-chi/chi/v5"
+
+func main() {
+    r := chi.NewRouter()
+    r.Route("/api", func(r chi.Router) {
+        r.Get("/users", getUsers)
+    })
+}
+"#;
+        let summary = parse_and_extract(src);
+        assert_eq!(summary.routes.len(), 1);
+        assert_eq!(summary.routes[0].path, "/api/users");
+        assert_eq!(summary.routes[0].http_method, "GET");
+    }
+
+    #[test]
+    fn applies_mount_prefix_for_chi_mount() {
+        let src = r#"
+package main
+
+import "github.com/go-chi/chi/v5"
+
+func main() {
+    r := chi.NewRouter()
+    api := chi.NewRouter()
+    api.Get("/users", getUsers)
+    r.Mount("/api", api)
+}
+"#;
+        let summary = parse_and_extract(src);
+        assert_eq!(summary.routes.len(), 1);
+        assert_eq!(summary.routes[0].path, "/api/users");
+    }
+
+    #[test]
+    fn applies_pathprefix_subrouter_prefix_for_mux() {
+        let src = r#"
+package main
+
+import "github.com/gorilla/mux"
+
+func main() {
+    r := mux.NewRouter()
+    api := r.PathPrefix("/api").Subrouter()
+    api.HandleFunc("/users", getUsers).Methods("GET")
+}
+"#;
+        let summary = parse_and_extract(src);
+        assert!(summary.frameworks.contains(&GoHttpFramework::Mux));
+        assert_eq!(summary.routes.len(), 1);
+        assert_eq!(summary.routes[0].path, "/api/users");
+        assert_eq!(summary.routes[0].http_method, "GET");
     }
 
     #[test]

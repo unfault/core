@@ -23,7 +23,10 @@ Repo scope: `/home/sylvain/dev/unfault/core` (crate: `unfault-core`).
   - Go: route extraction across multiple frameworks; more heuristic classification.
   - Rust: framework detection is import/text-based + route extraction for several frameworks.
   - TypeScript: Express/Fastify/NestJS support; decorators/routes are heuristic but broad.
-- HTTP client detection exists in all four; URL extraction is strongest in Python/TypeScript, weakest in Rust/Go.
+- HTTP client detection exists in all four with a shared common model (`src/semantics/common/http.rs`).
+  - Python: richest (client bindings, retry sources, timeout value extraction).
+  - Go/TypeScript: now extract URL literal/expr + timeout value (seconds) and propagate into common `HttpCall`.
+  - Rust: URL literal/expr + timeout value are present; retry/in-loop detection is best-effort.
 - CI tests are Rust-only (this is a Rust crate); there are extensive unit tests for parsing and many semantics features.
 
 ---
@@ -132,9 +135,11 @@ Dependencies (tree-sitter grammars): `Cargo.toml` includes python/rust/go/typesc
       - env-var extraction: `os.getenv("X")`, `os.environ["X"]`, `os.environ.get("X")`.
       - can resolve f-string `{VAR}` when `VAR = os.getenv("ENV")` at module level.
     - Timeout presence: checks `timeout=` kwarg (text-based).
+      - Also extracts best-effort timeout values (seconds) and client-default timeouts.
     - Retry signals:
       - decorators: tenacity/backoff/stamina.
       - session-level retry config (HTTPAdapter/Retry, httpx transport retries).
+      - emits a structured retry source which is mapped into common `RetryMechanism`.
     - Async correctness signal:
       - marks blocking calls as “thread-offloaded” if wrapped in `asyncio.to_thread`, `run_in_executor`, `sync_to_async`, etc.
 
@@ -195,6 +200,11 @@ Dependencies (tree-sitter grammars): `Cargo.toml` includes python/rust/go/typesc
     - Fiber/Chi style: `app.Get("/path", handler)`.
     - Mux: `r.HandleFunc("/path", handler).Methods("GET")`.
     - net/http: attempts `http.HandleFunc("/path", handler)` and `http.Handle(...)`.
+    - Prefix propagation (best-effort):
+      - Gin: group prefix via `r.Group("/api")` then `group.GET("/x", ...)`.
+      - Chi: `r.Route("/api", func(r chi.Router) { ... })`.
+      - Chi: `r.Mount("/api", apiRouter)`.
+      - Gorilla/mux: `r.PathPrefix("/api").Subrouter()`.
   - Emits: framework, http method, path, handler name (optional), location/byte ranges.
 
 #### HTTP client detection
@@ -203,9 +213,21 @@ Dependencies (tree-sitter grammars): `Cargo.toml` includes python/rust/go/typesc
   - Recognized client patterns:
     - `http.Get`, `http.Post`, `http.PostForm`, `http.Head`.
     - heuristic for `*Client.Do/Get/Post/Head`, plus resty/fasthttp based on receiver text.
+    - `retryablehttp.Get/Post/Do` (hashicorp/go-retryablehttp).
   - Extracts:
     - method name, call text.
-    - timeout hints (string search for `WithTimeout`/`WithDeadline`/`Timeout:`).
+    - URL literal vs expression:
+      - literal strings.
+      - expression classification (`HttpUrlExpr`) including `os.Getenv("X")` env-var extraction.
+      - request binding resolution for `client.Do(req)` when `req` came from `http.NewRequest*`.
+    - timeout:
+      - `context.WithTimeout(...)` / `context.WithDeadline(...)` best-effort mapping.
+      - `http.Client{Timeout: ...}` best-effort mapping.
+      - parses simple duration expressions into `timeout_value` seconds.
+    - retry:
+      - resty retry configuration heuristics.
+      - go-retryablehttp classified as middleware retry.
+    - loop context: tracks whether a call occurs inside a loop (`in_loop`).
     - “error handled” heuristic: checks whether call expression is in assignment/short var decl/if statement.
 
 ---
@@ -230,8 +252,12 @@ Dependencies (tree-sitter grammars): `Cargo.toml` includes python/rust/go/typesc
   - Framework detection (import/text): Axum, Actix-web, Rocket, Warp, Poem, Tide.
   - Route extraction patterns:
     - Axum: `.route("/path", get(handler))` and chained `.post(...)` etc.
+      - Prefix propagation for `.nest("/prefix", Router::new().route(...))`.
+      - Service routes: `.route_service("/path", ...)` and `.nest_service("/prefix", ...)`.
     - Actix-web: `.route("/path", web::get().to(handler))` and `web::resource("/path")...`.
+      - Prefix propagation across nested scopes/resources.
     - Rocket: `#[get("/path")] fn handler...`.
+      - Mount prefix propagation for `.mount("/prefix", routes![handler])`.
     - Warp: `warp::path("x").and(warp::get()).and_then(handler)` and `warp::path!(...)`.
     - Poem/Tide: `.at("/path", get(handler))` / `.at("/path").get(handler)`.
   - Middleware extraction:
@@ -248,6 +274,10 @@ Dependencies (tree-sitter grammars): `Cargo.toml` includes python/rust/go/typesc
     - method name (field name heuristics).
     - has_timeout + timeout_value from chains like `.timeout(Duration::from_secs(...))`.
     - async context + whether call appears under an await expression (`has_await`).
+    - retry + loop context (best-effort):
+      - marks `in_loop` for calls inside Rust loop nodes.
+      - marks retry as `ManualLoop` when a loop contains an HTTP call and the loop text suggests a sleep/backoff.
+      - detects some client-level retry middleware patterns (reqwest-middleware / tower) conservatively.
   - Converted into common `HttpCall` representation in `src/semantics/rust/mod.rs`.
 
 #### DB detection
@@ -292,15 +322,18 @@ Dependencies (tree-sitter grammars): `Cargo.toml` includes python/rust/go/typesc
 - Express: `src/semantics/typescript/express.rs`
   - Detects `const app = express()` and `const router = Router()` / `express.Router()`.
   - Routes: `app.get('/path', handler)` / `router.post(...)` etc.
+  - Prefix propagation (best-effort): `app.use('/api', router)` prefixes `router.get('/x', ...)`.
   - Middleware: `app.use(...)` / `router.use(...)` with common middleware-name heuristics.
   - Extracts method, path (if first arg string-ish), handler name (if identifier), `is_async`, “error handler” heuristics (4 params).
 - Fastify: `src/semantics/typescript/fastify.rs`
   - Detects `const app = fastify()` (and some require patterns).
   - Routes: `app.get('/path', handler)` etc.
   - Middleware/plugins: `.use(...)` and `.register(...)` with plugin-name heuristics (jwt/cookie/rate-limit, cors, helmet).
+  - Prefix propagation (best-effort): `.register(plugin, { prefix: '/api' })` prefixes routes defined inside the plugin.
 - NestJS: `src/semantics/typescript/nestjs.rs`
   - Detects `@Controller(...)` classes, `@Injectable`, `@Module`.
   - Method decorators: `@Get/@Post/...` routes.
+  - Prefix propagation (best-effort): controller prefix + method decorator path.
   - Guards/interceptors: `@UseGuards`, `@UseInterceptors`.
   - Extracts method, decorator path argument (string), handler name, `is_async`.
 
@@ -322,9 +355,19 @@ Dependencies (tree-sitter grammars): `Cargo.toml` includes python/rust/go/typesc
       - strings.
       - template literals (distinguishes templates with `${...}`).
       - `process.env.FOO` and `process.env["FOO"]` env-var extraction.
-    - timeout: args contain `timeout` or fetch `signal` usage.
+    - timeout: extracts `has_timeout` plus best-effort numeric `timeout_value` (seconds) for common patterns:
+      - `fetch(..., { signal: AbortSignal.timeout(5000) })`.
+      - `axios.get(..., { timeout: 5000 })`.
+      - got: `timeout: { request: 5000 }`.
+    - instance tracking:
+      - `axios.create({ baseURL, timeout })` and uses of the bound instance.
+      - `got.extend({ prefixUrl, timeout, retry })` and uses of the bound instance.
+      - `ky.create/extend` tracked (best-effort).
+      - applies base URL/prefix URL to relative URL literals.
     - error handling: try/catch ancestor or promise `.catch()` chaining heuristic.
     - retry: args contain `retry`/`retries` heuristic.
+      - tracks `axiosRetry(instance, ...)` as an instance-level retry signal.
+    - loop context: tracks whether a call occurs inside a loop (`in_loop`).
 
 ---
 
@@ -347,8 +390,8 @@ This section is organized by feature area; each item includes likely failure mod
 
 - Risk: framework inference can misclassify between Gin/Echo or Fiber/Chi when imports aren’t explicit; defaults are applied.
   - Improve: bind router variables from constructor calls (`r := gin.Default()`, `e := echo.New()`, etc.) and use that mapping for route calls.
-- Risk: net/http route extraction may be brittle; it should be based on selector_expression fields rather than text prefix checks.
-  - Improve: detect `selector_expression` with operand `http` and field `HandleFunc`/`Handle`.
+- Risk: prefix propagation is best-effort and can miss complex aliasing or indirection.
+  - Improve: expand router variable binding (e.g., `api := r.Group(prefixVar)` and propagated identifier/const prefixes).
 
 #### Rust
 
@@ -371,31 +414,33 @@ This section is organized by feature area; each item includes likely failure mod
 #### Python
 
 - Strength: URL literal vs expression + env-var detection + f-string binding resolution + client instance tracking + thread-offload detection.
-- Risk: timeout detection is text-based (`timeout=`) and misses positional/client-level timeout configuration.
-  - Improve: parse keyword_argument nodes; detect `httpx.Timeout(...)` usage and client defaults.
+- Risk: some timeout extraction remains best-effort (positional vs kwarg handling varies by library).
+  - Improve: continue converging non-httpx client parsing toward the httpx-level argument parsing.
 - Risk: retry detection is primarily decorator/session-config signals.
   - Improve: detect loop+sleep backoff patterns around calls (some scaffolding exists via `RetrySource::LoopWithSleep`).
 
 #### Go
 
-- Risk: timeout detection is weak and local to call text.
-  - Improve: associate calls with nearby `context.WithTimeout/WithDeadline` usage and request construction patterns.
+- Strength: timeout extraction now includes best-effort value parsing and request/context association for `client.Do(req)`.
+- Risk: request/context association is conservative and may miss patterns with multi-assign or helper constructors.
+  - Improve: track multi-LHS assignments (e.g., `req, err := ...`) and common helper functions that wrap `http.NewRequest*`.
 - Risk: error handling heuristic may miss common `err` check structures.
   - Improve: explicitly detect `err` bindings + subsequent `if err != nil`.
 
 #### Rust
 
-- Risk: URL extraction is effectively absent.
-  - Improve: extract string literal first arguments for common call shapes (`.get("...")`, `ureq::get("...")`).
+- Strength: URL literal/expr extraction is present for common call shapes.
 - Risk: reqwest detection may false-positive when receiver contains “client”.
   - Improve: track bindings from `reqwest::Client::new()` to variable names and require those.
+- Risk: retry detection is best-effort.
+  - Improve: deepen middleware detection (reqwest-middleware / tower) and add richer manual-loop heuristics.
 
 #### TypeScript
 
 - Strength: broad library coverage + URL literal/expr + env-var extraction + route-handler suppression.
-- Risk: instance method HTTP detection relies on receiver-name heuristics.
-  - Improve: also track instantiations (axios instances via `axios.create()`, got/ky instances) to widen detection without introducing `map.get()` false positives.
-  - Improve: consider an opt-in “aggressive mode” based on first-arg URL shape (`http(s)://`).
+- Strength: instance tracking for axios/got/ky reduces reliance on receiver-name heuristics.
+- Risk: retry detection is still shallow (largely config/keyword based).
+  - Improve: add common retry wrappers (e.g., `p-retry`, `async-retry`) and better got retry mapping.
 
 ### 3.3 Async/concurrency detection
 
@@ -450,10 +495,10 @@ This section is organized by feature area; each item includes likely failure mod
 
 ## 4) Suggested Next Steps (Practical Roadmap)
 
-1. Fix Go `net/http` route extraction to use selector_expression fields (high-value correctness fix).
-2. Add URL extraction for Rust HTTP calls (at least literal URL strings).
-3. Make framework route extraction in TS and Go depend on tracked app/router bindings (reduce false positives).
-4. Improve Python Django method inference (DRF + class-based views + decorators).
+1. Improve Python FastAPI `include_router(prefix=...)` extraction and path composition.
+2. Improve Python Django method inference (DRF + class-based views + decorators).
+3. Deepen Rust retry extraction (reqwest-middleware / tower patterns + richer manual-loop signals).
+4. Deepen Go error-handling detection around HTTP calls (track `err` check blocks, ignore patterns).
 5. Add config knobs:
    - include/exclude tests (Rust),
    - strict vs aggressive HTTP client detection (TS),

@@ -7,6 +7,7 @@ use crate::parse::ast::FileId;
 use crate::types::context::Language;
 
 use super::common::{
+    CommonLocation, CommonSemantics,
     annotations::{Annotation, AnnotationType},
     async_ops::{AsyncOperation, AsyncOperationType, AsyncRuntime},
     db::{DbLibrary, DbOperation, DbOperationType},
@@ -14,10 +15,9 @@ use super::common::{
     functions::{
         FunctionCall, FunctionDecorator, FunctionDef, FunctionKind, FunctionParam, Visibility,
     },
-    http::{HttpCall, HttpClientLibrary, HttpMethod},
+    http::{HttpCall, HttpClientLibrary, HttpMethod, RetryMechanism},
     imports::{Import, ImportSource, ImportStyle, ImportedItem},
     route_patterns::{RouteFramework, RoutePattern},
-    CommonLocation, CommonSemantics,
 };
 
 use super::go::model::{GoCallSite, GoFileSemantics, GoFunction, GoImport, GoMethod};
@@ -53,6 +53,7 @@ impl CommonSemantics for PyFileSemantics {
 
     fn http_calls(&self) -> Vec<HttpCall> {
         use super::python::http::HttpClientKind;
+        use super::python::http::RetrySource;
 
         self.http_calls
             .iter()
@@ -71,14 +72,30 @@ impl CommonSemantics for PyFileSemantics {
                     "DELETE" => HttpMethod::Delete,
                     other => HttpMethod::Other(other.to_string()),
                 };
+
+                let retry_mechanism = match &call.retry_source {
+                    Some(RetrySource::TenacityDecorator) => {
+                        Some(RetryMechanism::Decorator("tenacity".to_string()))
+                    }
+                    Some(RetrySource::BackoffDecorator) => {
+                        Some(RetryMechanism::Decorator("backoff".to_string()))
+                    }
+                    Some(RetrySource::StaminaDecorator) => {
+                        Some(RetryMechanism::Decorator("stamina".to_string()))
+                    }
+                    Some(RetrySource::SessionConfiguredRetry) => Some(RetryMechanism::ClientConfig),
+                    Some(RetrySource::LoopWithSleep) => Some(RetryMechanism::ManualLoop),
+                    Some(RetrySource::Other(s)) => Some(RetryMechanism::Other(s.clone())),
+                    None => None,
+                };
                 HttpCall {
                     library,
                     method,
                     url: call.url_literal.clone(),
                     url_expr: call.url_expr.clone(),
                     has_timeout: call.has_timeout,
-                    timeout_value: None,
-                    retry_mechanism: None,
+                    timeout_value: call.timeout_value,
+                    retry_mechanism,
                     call_text: call.call_text.clone(),
                     location: CommonLocation {
                         file_id: self.file_id,
@@ -534,6 +551,9 @@ impl CommonSemantics for GoFileSemantics {
                 let library = match &call.client_kind {
                     HttpClientKind::NetHttp => HttpClientLibrary::NetHttp,
                     HttpClientKind::Resty => HttpClientLibrary::Other("Resty".to_string()),
+                    HttpClientKind::RetryableHttp => {
+                        HttpClientLibrary::Other("go-retryablehttp".to_string())
+                    }
                     HttpClientKind::Fasthttp => HttpClientLibrary::Other("Fasthttp".to_string()),
                     HttpClientKind::Fiber => HttpClientLibrary::Other("Fiber".to_string()),
                     HttpClientKind::Other(s) => HttpClientLibrary::Other(s.clone()),
@@ -550,11 +570,11 @@ impl CommonSemantics for GoFileSemantics {
                 HttpCall {
                     library,
                     method,
-                    url: None, // Go HttpCallSite doesn't store URL
-                    url_expr: None,
+                    url: call.url_literal.clone(),
+                    url_expr: call.url_expr.clone(),
                     has_timeout: call.has_timeout,
-                    timeout_value: None,
-                    retry_mechanism: None,
+                    timeout_value: call.timeout_value,
+                    retry_mechanism: call.retry_mechanism.clone(),
                     call_text: call.call_text.clone(),
                     location: CommonLocation {
                         file_id: self.file_id,
@@ -565,7 +585,7 @@ impl CommonSemantics for GoFileSemantics {
                     },
                     enclosing_function: call.function_name.clone(),
                     in_async_context: false, // Go doesn't have async/await
-                    in_loop: false,
+                    in_loop: call.in_loop,
                     start_byte: call.start_byte,
                     end_byte: call.end_byte,
                 }
@@ -1349,12 +1369,38 @@ impl CommonSemantics for RustFileSemantics {
         let mut routes = Vec::new();
 
         if let Some(ref framework) = self.rust_framework {
+            let framework_type = match framework.framework {
+                Some(super::rust::frameworks::RustFrameworkType::Axum) => RouteFramework::Axum,
+                Some(super::rust::frameworks::RustFrameworkType::ActixWeb) => {
+                    RouteFramework::ActixWeb
+                }
+                Some(super::rust::frameworks::RustFrameworkType::Rocket) => RouteFramework::Rocket,
+                Some(super::rust::frameworks::RustFrameworkType::Warp) => RouteFramework::Warp,
+                Some(super::rust::frameworks::RustFrameworkType::Poem) => {
+                    RouteFramework::Other("poem".to_string())
+                }
+                Some(super::rust::frameworks::RustFrameworkType::Tide) => RouteFramework::Tide,
+                None => RouteFramework::HttpLibrary,
+            };
+
             for route in &framework.routes {
                 let has_auth = route.handler_name.to_lowercase().contains("auth")
                     || route.handler_name.to_lowercase().contains("protected");
 
+                let path = if let Some(ref pfx) = route.scope_prefix {
+                    // Prefer the already-prefixed path if extractor applied it.
+                    // If not, join prefix + path as a fallback.
+                    if route.path.starts_with(pfx) {
+                        route.path.clone()
+                    } else {
+                        format!("{}{}", pfx.trim_end_matches('/'), route.path.clone())
+                    }
+                } else {
+                    route.path.clone()
+                };
+
                 routes.push(
-                    RoutePattern::new(&route.method, &route.path, RouteFramework::Axum)
+                    RoutePattern::new(&route.method, &path, framework_type.clone())
                         .with_handler(route.handler_name.clone(), &self.path)
                         .with_auth(has_auth)
                         .with_location(
@@ -1362,11 +1408,11 @@ impl CommonSemantics for RustFileSemantics {
                                 file_id: self.file_id,
                                 line: route.location.range.start_line + 1,
                                 column: route.location.range.start_col + 1,
-                                start_byte: 0,
-                                end_byte: 0,
+                                start_byte: route.start_byte,
+                                end_byte: route.end_byte,
                             },
-                            0,
-                            0,
+                            route.start_byte,
+                            route.end_byte,
                         ),
                 );
             }
@@ -1547,23 +1593,6 @@ fn convert_rust_call_site(call: &RustCallSite) -> FunctionCall {
     }
 }
 
-fn find_closing_brace(source: &str, start: usize, end_limit: usize) -> usize {
-    let mut depth = 1;
-    let mut pos = start;
-    let limit = end_limit.min(source.len());
-
-    while pos < limit && depth > 0 {
-        if source.as_bytes()[pos] == b'{' {
-            depth += 1;
-        } else if source.as_bytes()[pos] == b'}' {
-            depth -= 1;
-        }
-        pos += 1;
-    }
-
-    pos
-}
-
 // =============================================================================
 // TypeScript Implementation
 // =============================================================================
@@ -1618,9 +1647,13 @@ impl CommonSemantics for TsFileSemantics {
                     url: call.url.clone(),
                     url_expr: call.url_expr.clone(),
                     has_timeout: call.has_timeout,
-                    timeout_value: None,
-                    retry_mechanism: None,
-                    call_text: String::new(),
+                    timeout_value: call.timeout_value,
+                    retry_mechanism: if call.has_retry {
+                        Some(RetryMechanism::ClientConfig)
+                    } else {
+                        None
+                    },
+                    call_text: call.call_text.clone(),
                     location: CommonLocation {
                         file_id: self.file_id,
                         line: call.location.range.start_line + 1,
@@ -1630,7 +1663,7 @@ impl CommonSemantics for TsFileSemantics {
                     },
                     enclosing_function: call.function_name.clone(),
                     in_async_context: call.in_async_context,
-                    in_loop: false,
+                    in_loop: call.in_loop,
                     start_byte: call.start_byte,
                     end_byte: call.end_byte,
                 }
@@ -1882,6 +1915,68 @@ impl CommonSemantics for TsFileSemantics {
                             ),
                     );
                 }
+            }
+        }
+
+        if let Some(ref fastify) = self.fastify {
+            for route in &fastify.routes {
+                let has_auth = route
+                    .handler_name
+                    .as_ref()
+                    .map(|name| {
+                        name.to_lowercase().contains("auth")
+                            || name.to_lowercase().contains("protected")
+                    })
+                    .unwrap_or(false);
+
+                if let Some(ref path) = route.path {
+                    routes.push(
+                        RoutePattern::new(&route.method, path, RouteFramework::Fastify)
+                            .with_handler(
+                                route
+                                    .handler_name
+                                    .clone()
+                                    .unwrap_or_else(|| "unknown".to_string()),
+                                &self.path,
+                            )
+                            .with_auth(has_auth)
+                            .with_location(
+                                CommonLocation {
+                                    file_id: self.file_id,
+                                    line: route.location.range.start_line + 1,
+                                    column: route.location.range.start_col + 1,
+                                    start_byte: 0,
+                                    end_byte: 0,
+                                },
+                                0,
+                                0,
+                            ),
+                    );
+                }
+            }
+        }
+
+        if let Some(ref nestjs) = self.nestjs {
+            for route in &nestjs.routes {
+                let has_auth = route.handler_name.to_lowercase().contains("auth")
+                    || route.handler_name.to_lowercase().contains("protected");
+
+                routes.push(
+                    RoutePattern::new(&route.method, &route.path, RouteFramework::NestJS)
+                        .with_handler(route.handler_name.clone(), &self.path)
+                        .with_auth(has_auth)
+                        .with_location(
+                            CommonLocation {
+                                file_id: self.file_id,
+                                line: route.location.range.start_line + 1,
+                                column: route.location.range.start_col + 1,
+                                start_byte: 0,
+                                end_byte: 0,
+                            },
+                            0,
+                            0,
+                        ),
+                );
             }
         }
 

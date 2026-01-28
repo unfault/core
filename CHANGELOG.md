@@ -9,6 +9,17 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 ### Added
 - Cross-language URL env-var extraction for HTTP calls (Go: `os.Getenv`, Rust: `std::env::var`/`env!`, TypeScript: `process.env`/`import.meta.env`/`Bun.env`/`Deno.env.get`).
 - Go/Rust HTTP URL literal + expression metadata for client callsites.
+- Richer HTTP call extraction parity:
+  - Go: timeout values (seconds), request/context association for `client.Do(req)`, and retryablehttp classification.
+  - TypeScript: timeout values (seconds), instance tracking (`axios.create`, `got.extend`, `ky.create/extend`), and best-effort base URL joining.
+  - Rust: best-effort retry and loop context propagation.
+  - Python: http detection upgraded toward httpx-level richness (client defaults, timeout values, retry mapping).
+- Prefix-aware route extraction across frameworks:
+  - Go: Gin groups, Chi `Route`/`Mount`, and Gorilla/mux `PathPrefix(...).Subrouter()`.
+  - Rust: Axum nest/service routes, Actix-web scope nesting, Rocket mount prefixes.
+  - TypeScript: Express router mounts, Fastify register prefixes, NestJS controller prefixes.
+- FastAPI: `include_router(..., prefix=...)` parsing and path composition with `APIRouter(prefix=...)`.
+- Django: method inference for views (decorators and class-based views) and richer URL pattern metadata.
 - Language support audit document: `docs/language-support-audit.md`.
 
 ## [0.1.11] - 2026-01-28

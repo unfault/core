@@ -135,14 +135,18 @@ fn analyze_nestjs_method_decorators(
         .unwrap_or_default();
 
     let decorators = extract_method_decorators(parsed, node);
+    let controller_prefix =
+        extract_enclosing_controller_prefix(parsed, node).unwrap_or_else(|| "/".to_string());
 
     for decorator in &decorators {
         if let Some((http_method, path)) = extract_http_method_and_path(decorator) {
             let is_async = _method_text.contains("async");
 
+            let full_path = join_paths(&controller_prefix, &path);
+
             summary.routes.push(NestJSRoute {
                 method: http_method,
-                path,
+                path: full_path,
                 handler_name: method_name.clone(),
                 is_async,
                 location: location.clone(),
@@ -154,25 +158,36 @@ fn analyze_nestjs_method_decorators(
 fn extract_method_decorators(parsed: &ParsedFile, node: &tree_sitter::Node) -> Vec<String> {
     let mut decorators = Vec::new();
 
+    // Collect all decorators that immediately precede this method definition.
     if let Some(parent) = node.parent() {
-        let mut last_decorator: Option<String> = None;
-        let mut found_method = false;
-
+        // Find index of the method in its parent.
+        let mut method_index: Option<usize> = None;
         for i in 0..parent.child_count() {
             if let Some(child) = parent.child(i) {
                 if child.id() == node.id() {
-                    found_method = true;
-                }
-
-                if !found_method && child.kind() == "decorator" {
-                    last_decorator = Some(parsed.text_for_node(&child));
-                }
-
-                if found_method && last_decorator.is_some() {
-                    decorators.push(last_decorator.take().unwrap());
+                    method_index = Some(i);
                     break;
                 }
             }
+        }
+
+        if let Some(idx) = method_index {
+            // Walk backwards collecting contiguous decorators.
+            let mut i = idx;
+            while i > 0 {
+                i -= 1;
+                let Some(sib) = parent.child(i) else {
+                    continue;
+                };
+                if sib.kind() == "decorator" {
+                    decorators.push(parsed.text_for_node(&sib));
+                    continue;
+                }
+                // Stop at first non-decorator.
+                break;
+            }
+
+            decorators.reverse();
         }
     }
 
@@ -234,7 +249,11 @@ fn extract_http_method_and_path(decorator: &str) -> Option<(String, String)> {
 
     let args = args.trim();
 
-    let content = args.trim_matches(|c| c == '"' || c == '\'');
+    let content = if args.is_empty() {
+        "/".to_string()
+    } else {
+        args.trim_matches(|c| c == '"' || c == '\'').to_string()
+    };
 
     let http_method = if decorator.contains("@Get") {
         "GET"
@@ -254,7 +273,56 @@ fn extract_http_method_and_path(decorator: &str) -> Option<(String, String)> {
         return None;
     };
 
-    Some((http_method.to_string(), content.to_string()))
+    Some((http_method.to_string(), content))
+}
+
+fn extract_enclosing_controller_prefix(
+    parsed: &ParsedFile,
+    node: &tree_sitter::Node,
+) -> Option<String> {
+    // Walk up to the nearest class_declaration and extract @Controller(...) path if present.
+    let mut cur = node.parent();
+    while let Some(n) = cur {
+        if n.kind() == "class_declaration" {
+            let decorators = extract_decorators(parsed, &n);
+            for decorator in &decorators {
+                if decorator.contains("@Controller") || decorator.contains("@RestController") {
+                    return extract_controller_route(decorator);
+                }
+            }
+            return None;
+        }
+        cur = n.parent();
+    }
+    None
+}
+
+fn join_paths(prefix: &str, path: &str) -> String {
+    let mut pfx = prefix.trim().to_string();
+    let mut p = path.trim().to_string();
+
+    if pfx.is_empty() {
+        pfx = "/".to_string();
+    }
+    if p.is_empty() {
+        p = "/".to_string();
+    }
+
+    if !pfx.starts_with('/') {
+        pfx = format!("/{}", pfx);
+    }
+    if !p.starts_with('/') {
+        p = format!("/{}", p);
+    }
+
+    if pfx == "/" {
+        return p;
+    }
+    if p == "/" {
+        return pfx;
+    }
+
+    format!("{}{}", pfx.trim_end_matches('/'), p)
 }
 
 #[cfg(test)]
@@ -290,6 +358,33 @@ class UserController {
         let summary = parse_and_summarize(src).unwrap();
         assert_eq!(summary.controllers.len(), 1);
         assert_eq!(summary.controllers[0].class_name, "UserController");
+        assert_eq!(summary.routes.len(), 1);
+        assert_eq!(summary.routes[0].path, "/users".to_string());
+    }
+
+    #[test]
+    fn combines_controller_prefix_with_method_path() {
+        let src = r#"
+import { Controller, Get, Post } from '@nestjs/common';
+
+@Controller('users')
+class UserController {
+    @Get()
+    findAll() {
+        return [];
+    }
+
+    @Post('create')
+    create() {
+        return {};
+    }
+}
+"#;
+
+        let summary = parse_and_summarize(src).unwrap();
+        assert_eq!(summary.routes.len(), 2);
+        assert_eq!(summary.routes[0].path, "/users".to_string());
+        assert_eq!(summary.routes[1].path, "/users/create".to_string());
     }
 
     #[test]
@@ -345,8 +440,9 @@ class UserController {
         let summary = parse_and_summarize(src).unwrap();
         assert_eq!(summary.routes.len(), 2);
         assert_eq!(summary.routes[0].method, "GET");
-        assert_eq!(summary.routes[0].path, "");
+        assert_eq!(summary.routes[0].path, "/users");
         assert_eq!(summary.routes[1].method, "POST");
+        assert_eq!(summary.routes[1].path, "/users");
     }
 
     #[test]
@@ -369,8 +465,8 @@ class UserController {
 "#;
         let summary = parse_and_summarize(src).unwrap();
         assert_eq!(summary.routes.len(), 2);
-        assert_eq!(summary.routes[0].path, "profile");
-        assert_eq!(summary.routes[1].path, "create");
+        assert_eq!(summary.routes[0].path, "/users/profile");
+        assert_eq!(summary.routes[1].path, "/users/create");
     }
 
     #[test]
@@ -474,7 +570,7 @@ class UserController {
         let summary = parse_and_summarize(src).unwrap();
         assert_eq!(summary.controllers.len(), 1);
         assert_eq!(summary.controllers[0].routes[0], "api/v1/users");
-        assert_eq!(summary.routes[0].path, "profile");
+        assert_eq!(summary.routes[0].path, "/api/v1/users/profile");
     }
 
     #[test]

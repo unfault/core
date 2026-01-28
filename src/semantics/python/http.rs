@@ -55,6 +55,9 @@ pub struct HttpCallSite {
     /// Whether this call has an explicit `timeout=` kwarg.
     pub has_timeout: bool,
 
+    /// Timeout value in seconds (if statically determinable).
+    pub timeout_value: Option<f64>,
+
     /// Where in the file this call is (line/col).
     pub location: AstLocation,
 
@@ -72,6 +75,13 @@ pub struct HttpCallSite {
     /// These are absolute byte offsets into `ParsedFile.source`.
     pub start_byte: usize,
     pub end_byte: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HttpClientBinding {
+    kind: HttpClientKind,
+    base_url: Option<String>,
+    default_timeout: Option<f64>,
 }
 
 /// Build a list of HTTP client calls in this Python file.
@@ -169,7 +179,7 @@ fn collect_http_calls(file: &ParsedFile, root: Node, out: &mut Vec<HttpCallSite>
         enclosing_fn_is_async: &mut bool,
         enclosing_fn_retry: &mut Option<RetrySource>,
         has_session_retry: bool,
-        http_client_vars: &mut HashMap<String, HttpClientKind>,
+        http_client_vars: &mut HashMap<String, HttpClientBinding>,
         env_var_bindings: &mut HashMap<String, String>,
     ) {
         // Detect decorated function definitions (for retry decorator detection)
@@ -199,8 +209,10 @@ fn collect_http_calls(file: &ParsedFile, root: Node, out: &mut Vec<HttpCallSite>
         // - `client = httpx.Client()` / `client = httpx.AsyncClient()`
         // - `session = requests.Session()`
         // - `async with httpx.AsyncClient() as client:` / `with requests.Session() as s:`
-        if let Some((var_name, client_kind)) = extract_http_client_assignment(file, node) {
-            http_client_vars.insert(var_name, client_kind);
+        if let Some((var_name, binding)) =
+            extract_http_client_assignment(file, node, env_var_bindings)
+        {
+            http_client_vars.insert(var_name, binding);
         }
 
         // Track module-level env-var-backed bindings like:
@@ -266,7 +278,7 @@ fn collect_http_calls(file: &ParsedFile, root: Node, out: &mut Vec<HttpCallSite>
     let mut enclosing_fn_name: Option<String> = None;
     let mut enclosing_fn_is_async = false;
     let mut enclosing_fn_retry: Option<RetrySource> = None;
-    let mut http_client_vars: HashMap<String, HttpClientKind> = HashMap::new();
+    let mut http_client_vars: HashMap<String, HttpClientBinding> = HashMap::new();
     let mut env_var_bindings: HashMap<String, String> = HashMap::new();
     walk(
         file,
@@ -343,7 +355,8 @@ fn check_thread_offload(file: &ParsedFile, call_node: Node) -> bool {
 fn extract_http_client_assignment(
     file: &ParsedFile,
     node: Node,
-) -> Option<(String, HttpClientKind)> {
+    env_var_bindings: &std::collections::HashMap<String, String>,
+) -> Option<(String, HttpClientBinding)> {
     // Pattern 1: Assignment like `client = httpx.Client()`
     if node.kind() == "assignment" {
         let left = node.child_by_field_name("left")?;
@@ -360,15 +373,15 @@ fn extract_http_client_assignment(
             return None;
         }
 
-        let client_kind = detect_http_client_constructor(file, right)?;
-        return Some((var_name, client_kind));
+        let binding = detect_http_client_constructor(file, right, env_var_bindings)?;
+        return Some((var_name, binding));
     }
 
     // Pattern 2: With statement like `with httpx.Client() as client:`
     // or `async with httpx.AsyncClient() as client:`
     // Tree-sitter structure varies - we look for with_item children
     if node.kind() == "with_statement" {
-        if let Some(result) = extract_with_statement_binding(file, node) {
+        if let Some(result) = extract_with_statement_binding(file, node, env_var_bindings) {
             return Some(result);
         }
     }
@@ -398,9 +411,14 @@ fn extract_env_var_assignment(file: &ParsedFile, node: Node) -> Option<(String, 
 fn extract_with_statement_binding(
     file: &ParsedFile,
     with_node: Node,
-) -> Option<(String, HttpClientKind)> {
+    env_var_bindings: &std::collections::HashMap<String, String>,
+) -> Option<(String, HttpClientBinding)> {
     // Walk through all descendants looking for with_item nodes
-    fn find_with_item_binding(file: &ParsedFile, node: Node) -> Option<(String, HttpClientKind)> {
+    fn find_with_item_binding(
+        file: &ParsedFile,
+        node: Node,
+        env_var_bindings: &std::collections::HashMap<String, String>,
+    ) -> Option<(String, HttpClientBinding)> {
         if node.kind() == "with_item" {
             // The with_item structure is:
             // with_item
@@ -439,8 +457,9 @@ fn extract_with_statement_binding(
             }
 
             if let (Some(call), Some(name)) = (call_node, var_name) {
-                if let Some(client_kind) = detect_http_client_constructor(file, call) {
-                    return Some((name, client_kind));
+                if let Some(binding) = detect_http_client_constructor(file, call, env_var_bindings)
+                {
+                    return Some((name, binding));
                 }
             }
         }
@@ -448,7 +467,7 @@ fn extract_with_statement_binding(
         // Recurse into children
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            if let Some(result) = find_with_item_binding(file, child) {
+            if let Some(result) = find_with_item_binding(file, child, env_var_bindings) {
                 return Some(result);
             }
         }
@@ -456,13 +475,17 @@ fn extract_with_statement_binding(
         None
     }
 
-    find_with_item_binding(file, with_node)
+    find_with_item_binding(file, with_node, env_var_bindings)
 }
 
 /// Check if a call node is constructing an HTTP client.
 ///
 /// Matches: httpx.Client(), httpx.AsyncClient(), requests.Session(), aiohttp.ClientSession()
-fn detect_http_client_constructor(file: &ParsedFile, call_node: Node) -> Option<HttpClientKind> {
+fn detect_http_client_constructor(
+    file: &ParsedFile,
+    call_node: Node,
+    env_var_bindings: &std::collections::HashMap<String, String>,
+) -> Option<HttpClientBinding> {
     let func = call_node.child_by_field_name("function")?;
 
     if func.kind() != "attribute" {
@@ -475,12 +498,61 @@ fn detect_http_client_constructor(file: &ParsedFile, call_node: Node) -> Option<
     let object_text = file.text_for_node(&object);
     let attr_text = file.text_for_node(&attr);
 
-    match (object_text.as_str(), attr_text.as_str()) {
-        ("httpx", "Client" | "AsyncClient") => Some(HttpClientKind::Httpx),
-        ("requests", "Session") => Some(HttpClientKind::Requests),
-        ("aiohttp", "ClientSession") => Some(HttpClientKind::Aiohttp),
-        _ => None,
+    let kind = match (object_text.as_str(), attr_text.as_str()) {
+        ("httpx", "Client" | "AsyncClient") => HttpClientKind::Httpx,
+        ("requests", "Session") => HttpClientKind::Requests,
+        ("aiohttp", "ClientSession") => HttpClientKind::Aiohttp,
+        _ => return None,
+    };
+
+    let (base_url, default_timeout) =
+        extract_client_defaults(file, call_node, &kind, env_var_bindings);
+
+    Some(HttpClientBinding {
+        kind,
+        base_url,
+        default_timeout,
+    })
+}
+
+fn extract_client_defaults(
+    file: &ParsedFile,
+    call_node: Node,
+    kind: &HttpClientKind,
+    env_var_bindings: &std::collections::HashMap<String, String>,
+) -> (Option<String>, Option<f64>) {
+    let args = match call_node.child_by_field_name("arguments") {
+        Some(a) => a,
+        None => return (None, None),
+    };
+
+    let mut base_url: Option<String> = None;
+    let mut default_timeout: Option<f64> = None;
+
+    let mut cursor = args.walk();
+    for child in args.named_children(&mut cursor) {
+        if child.kind() != "keyword_argument" {
+            continue;
+        }
+        let name_node = child.child_by_field_name("name");
+        let value_node = child.child_by_field_name("value");
+        let (Some(n), Some(v)) = (name_node, value_node) else {
+            continue;
+        };
+
+        let name = file.text_for_node(&n);
+        if name == "timeout" {
+            default_timeout = extract_timeout_value(file, v);
+        }
+        if name == "base_url" {
+            if matches!(kind, HttpClientKind::Httpx | HttpClientKind::Aiohttp) {
+                let (lit, _expr) = extract_url_from_expr(file, v, env_var_bindings);
+                base_url = lit;
+            }
+        }
     }
+
+    (base_url, default_timeout)
 }
 
 fn extract_http_call(
@@ -489,7 +561,7 @@ fn extract_http_call(
     enclosing_fn_name: Option<String>,
     in_async_function: bool,
     is_thread_offloaded: bool,
-    http_client_vars: &std::collections::HashMap<String, HttpClientKind>,
+    http_client_vars: &std::collections::HashMap<String, HttpClientBinding>,
     env_var_bindings: &std::collections::HashMap<String, String>,
 ) -> Option<HttpCallSite> {
     let func = call_node.child_by_field_name("function")?;
@@ -506,14 +578,14 @@ fn extract_http_call(
     let method_name = file.text_for_node(&attr);
 
     // First, try to match module-level calls (requests.get, httpx.post)
-    let client_kind = match object_text.as_str() {
-        "requests" => Some(HttpClientKind::Requests),
-        "httpx" => Some(HttpClientKind::Httpx),
+    let (client_kind, base_url, default_timeout) = match object_text.as_str() {
+        "requests" => (HttpClientKind::Requests, None, None),
+        "httpx" => (HttpClientKind::Httpx, None, None),
         _ => {
-            // Check if the object is a known HTTP client variable
-            http_client_vars.get(&object_text).cloned()
+            let binding = http_client_vars.get(&object_text)?.clone();
+            (binding.kind, binding.base_url, binding.default_timeout)
         }
-    }?;
+    };
 
     // Filter out non-HTTP method calls (e.g., httpx.URL(), httpx.Headers())
     // Only consider actual HTTP request methods
@@ -526,15 +598,15 @@ fn extract_http_call(
     }
 
     let call_text = file.text_for_node(&call_node);
-    let args_text = if let Some(args) = call_node.child_by_field_name("arguments") {
-        file.text_for_node(&args)
-    } else {
-        String::new()
+    let (timeout_value, has_timeout) = match extract_timeout_kwarg_value(file, call_node) {
+        Some(v) => (v, true),
+        None => (default_timeout, default_timeout.is_some()),
     };
 
-    let has_timeout = args_text.contains("timeout=");
-
-    let (url_literal, url_expr) = extract_url_from_call_args(file, call_node, env_var_bindings);
+    let (url_literal_raw, url_expr_raw) =
+        extract_url_from_call_args(file, call_node, method_name.as_str(), env_var_bindings);
+    let (url_literal, url_expr) =
+        apply_base_url(base_url.as_deref(), url_literal_raw, url_expr_raw);
 
     let location = file.location_for_node(&call_node);
     let byte_range = call_node.byte_range();
@@ -546,6 +618,7 @@ fn extract_http_call(
         url_expr,
         call_text,
         has_timeout,
+        timeout_value,
         location,
         function_name: enclosing_fn_name,
         in_async_function,
@@ -559,6 +632,7 @@ fn extract_http_call(
 fn extract_url_from_call_args(
     file: &ParsedFile,
     call_node: Node,
+    method_name: &str,
     env_var_bindings: &std::collections::HashMap<String, String>,
 ) -> (Option<String>, Option<HttpUrlExpr>) {
     let args = match call_node.child_by_field_name("arguments") {
@@ -566,25 +640,137 @@ fn extract_url_from_call_args(
         None => return (None, None),
     };
 
-    // Best-effort: pick the first positional (non-keyword) argument.
+    // Best-effort: pick the right positional argument.
+    // For `.request(method, url, ...)`, the URL is the second positional argument.
     let mut cursor = args.walk();
-    let mut first_arg: Option<Node> = None;
+    let mut positional: Vec<Node> = Vec::new();
     for child in args.named_children(&mut cursor) {
         match child.kind() {
             "keyword_argument" | "dictionary_splat" => continue,
             _ => {
-                first_arg = Some(child);
-                break;
+                positional.push(child);
             }
         }
     }
 
-    let arg = match first_arg {
-        Some(n) => n,
+    let idx = if method_name.to_lowercase() == "request" {
+        1
+    } else {
+        0
+    };
+    let arg = match positional.get(idx) {
+        Some(n) => *n,
         None => return (None, None),
     };
 
     extract_url_from_expr(file, arg, env_var_bindings)
+}
+
+/// Extract `timeout=` keyword argument.
+///
+/// Returns:
+/// - `Some(Some(seconds))` when statically determinable
+/// - `Some(None)` when present but not statically determinable (e.g., `timeout=None`)
+/// - `None` when absent
+fn extract_timeout_kwarg_value(file: &ParsedFile, call_node: Node) -> Option<Option<f64>> {
+    let args = call_node.child_by_field_name("arguments")?;
+    let mut cursor = args.walk();
+    for child in args.named_children(&mut cursor) {
+        if child.kind() != "keyword_argument" {
+            continue;
+        }
+        let name_node = child.child_by_field_name("name")?;
+        let value_node = child.child_by_field_name("value")?;
+        if file.text_for_node(&name_node) != "timeout" {
+            continue;
+        }
+
+        let raw = file.text_for_node(&value_node).trim().to_string();
+        if raw == "None" {
+            return Some(None);
+        }
+
+        return Some(extract_timeout_value(file, value_node));
+    }
+    None
+}
+
+fn extract_timeout_value(file: &ParsedFile, expr: Node) -> Option<f64> {
+    let text = file.text_for_node(&expr).trim().to_string();
+
+    // numbers
+    if let Ok(v) = text.parse::<f64>() {
+        return Some(v);
+    }
+
+    // requests tuple: (connect, read)
+    if expr.kind() == "tuple" {
+        // Best-effort: extract first two numeric children and take max.
+        let mut vals: Vec<f64> = Vec::new();
+        let mut cursor = expr.walk();
+        for child in expr.named_children(&mut cursor) {
+            let t = file.text_for_node(&child).trim().to_string();
+            if let Ok(v) = t.parse::<f64>() {
+                vals.push(v);
+            }
+        }
+        if !vals.is_empty() {
+            return vals
+                .into_iter()
+                .fold(None, |acc, v| Some(acc.map(|a| a.max(v)).unwrap_or(v)));
+        }
+    }
+
+    // httpx.Timeout(5.0)
+    if expr.kind() == "call" {
+        let func = expr.child_by_field_name("function");
+        if let Some(f) = func {
+            let name = file.text_for_node(&f);
+            if name.ends_with("httpx.Timeout") || name == "Timeout" {
+                if let Some(args) = expr.child_by_field_name("arguments") {
+                    let mut cursor = args.walk();
+                    for child in args.named_children(&mut cursor) {
+                        if child.kind() == "keyword_argument" {
+                            continue;
+                        }
+                        let t = file.text_for_node(&child).trim().to_string();
+                        if let Ok(v) = t.parse::<f64>() {
+                            return Some(v);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn apply_base_url(
+    base_url: Option<&str>,
+    url_literal: Option<String>,
+    url_expr: Option<HttpUrlExpr>,
+) -> (Option<String>, Option<HttpUrlExpr>) {
+    let Some(base) = base_url else {
+        return (url_literal, url_expr);
+    };
+    let Some(url) = url_literal else {
+        return (None, url_expr);
+    };
+
+    // If already absolute, do nothing.
+    if url.starts_with("http://") || url.starts_with("https://") {
+        return (Some(url), None);
+    }
+
+    // Join base + relative.
+    let joined = if url.starts_with('/') {
+        format!("{}{}", base.trim_end_matches('/'), url)
+    } else {
+        format!("{}/{}", base.trim_end_matches('/'), url)
+    };
+    (Some(joined), None)
 }
 
 fn extract_url_from_expr(

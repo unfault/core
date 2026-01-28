@@ -2,6 +2,8 @@
 
 use crate::parse::ast::ParsedFile;
 
+use std::collections::HashMap;
+
 use super::model::{
     ExpressApp, ExpressFileSummary, ExpressMiddleware, ExpressRoute, ExpressRouter,
 };
@@ -16,7 +18,13 @@ pub fn summarize_express(parsed: &ParsedFile) -> Option<ExpressFileSummary> {
     };
 
     let root = parsed.tree.root_node();
-    walk_for_express(root, parsed, &mut summary);
+
+    // First pass: collect app/router instantiations.
+    walk_for_express_instantiations(root, parsed, &mut summary);
+
+    // Second pass: collect mounts and then routes/middleware.
+    let mounts = collect_router_mounts(root, parsed);
+    walk_for_express_calls(root, parsed, &mounts, &mut summary);
 
     // Only return Some if we found any Express-related constructs
     if summary.apps.is_empty()
@@ -30,7 +38,7 @@ pub fn summarize_express(parsed: &ParsedFile) -> Option<ExpressFileSummary> {
     Some(summary)
 }
 
-fn walk_for_express(
+fn walk_for_express_instantiations(
     node: tree_sitter::Node,
     parsed: &ParsedFile,
     summary: &mut ExpressFileSummary,
@@ -40,10 +48,6 @@ fn walk_for_express(
             // Check for express() or express.Router() calls
             check_express_instantiation(parsed, &node, summary);
         }
-        "call_expression" => {
-            // Check for route definitions and middleware
-            check_route_or_middleware(parsed, &node, summary);
-        }
         _ => {}
     }
 
@@ -51,9 +55,91 @@ fn walk_for_express(
     let child_count = node.child_count();
     for i in 0..child_count {
         if let Some(child) = node.child(i) {
-            walk_for_express(child, parsed, summary);
+            walk_for_express_instantiations(child, parsed, summary);
         }
     }
+}
+
+fn walk_for_express_calls(
+    node: tree_sitter::Node,
+    parsed: &ParsedFile,
+    mounts: &HashMap<String, Vec<String>>,
+    summary: &mut ExpressFileSummary,
+) {
+    if node.kind() == "call_expression" {
+        check_route_or_middleware(parsed, &node, mounts, summary);
+    }
+
+    let child_count = node.child_count();
+    for i in 0..child_count {
+        if let Some(child) = node.child(i) {
+            walk_for_express_calls(child, parsed, mounts, summary);
+        }
+    }
+}
+
+fn collect_router_mounts(
+    root: tree_sitter::Node,
+    parsed: &ParsedFile,
+) -> HashMap<String, Vec<String>> {
+    let mut mounts: HashMap<String, Vec<String>> = HashMap::new();
+
+    fn walk(
+        node: tree_sitter::Node,
+        parsed: &ParsedFile,
+        mounts: &mut HashMap<String, Vec<String>>,
+    ) {
+        if node.kind() == "call_expression" {
+            if let Some((path, router_var)) = extract_mount(parsed, &node) {
+                mounts.entry(router_var).or_default().push(path);
+            }
+        }
+
+        let child_count = node.child_count();
+        for i in 0..child_count {
+            if let Some(child) = node.child(i) {
+                walk(child, parsed, mounts);
+            }
+        }
+    }
+
+    walk(root, parsed, &mut mounts);
+    mounts
+}
+
+fn extract_mount(parsed: &ParsedFile, node: &tree_sitter::Node) -> Option<(String, String)> {
+    // app.use('/prefix', router)
+    let func_node = node.child_by_field_name("function")?;
+    if func_node.kind() != "member_expression" {
+        return None;
+    }
+    let property = func_node.child_by_field_name("property")?;
+    if parsed.text_for_node(&property) != "use" {
+        return None;
+    }
+
+    let args_node = node.child_by_field_name("arguments")?;
+    if args_node.named_child_count() < 2 {
+        return None;
+    }
+    let first = args_node.named_child(0)?;
+    let second = args_node.named_child(1)?;
+
+    // First arg must be a literal path.
+    let raw = parsed.text_for_node(&first);
+    if !(raw.starts_with('\'') || raw.starts_with('"') || raw.starts_with('`')) {
+        return None;
+    }
+    let path = raw
+        .trim_matches(|c| c == '\'' || c == '"' || c == '`')
+        .to_string();
+
+    // Second arg should be a router identifier.
+    if second.kind() != "identifier" {
+        return None;
+    }
+    let router_var = parsed.text_for_node(&second);
+    Some((path, router_var))
 }
 
 fn check_express_instantiation(
@@ -106,6 +192,7 @@ fn check_express_instantiation(
 fn check_route_or_middleware(
     parsed: &ParsedFile,
     node: &tree_sitter::Node,
+    mounts: &HashMap<String, Vec<String>>,
     summary: &mut ExpressFileSummary,
 ) {
     let func_node = match node.child_by_field_name("function") {
@@ -113,39 +200,51 @@ fn check_route_or_middleware(
         None => return,
     };
 
-    let callee = parsed.text_for_node(&func_node);
     let location = parsed.location_for_node(node);
 
-    // HTTP method routes: app.get(), router.post(), etc.
+    let (receiver, member) = match parse_member_call(parsed, &func_node) {
+        Some(v) => v,
+        None => return,
+    };
+
+    // HTTP method routes: <receiver>.<method>()
     let http_methods = [
         "get", "post", "put", "patch", "delete", "head", "options", "all",
     ];
 
-    for method in http_methods {
-        let patterns = [format!("app.{}", method), format!("router.{}", method)];
-
-        for pattern in &patterns {
-            if callee.ends_with(pattern.as_str())
-                || callee == pattern.as_str()
-                || callee.ends_with(&format!(".{}", method))
-            {
-                let route = extract_route_info(parsed, node, method, &location);
-                summary.routes.push(route);
-                return;
-            }
-        }
+    if http_methods.contains(&member.as_str()) {
+        let route = extract_route_info(parsed, node, &receiver, mounts, &member, &location);
+        summary.routes.push(route);
+        return;
     }
 
-    // Middleware: app.use() or router.use()
-    if callee.ends_with(".use") || callee == "app.use" || callee == "router.use" {
+    // Middleware: <receiver>.use()
+    if member == "use" {
         let middleware = extract_middleware_info(parsed, node, &location);
         summary.middlewares.push(middleware);
+        return;
     }
+}
+
+fn parse_member_call(
+    parsed: &ParsedFile,
+    func_node: &tree_sitter::Node,
+) -> Option<(String, String)> {
+    if func_node.kind() != "member_expression" {
+        return None;
+    }
+    let object = func_node.child_by_field_name("object")?;
+    let property = func_node.child_by_field_name("property")?;
+    let receiver = parsed.text_for_node(&object);
+    let member = parsed.text_for_node(&property);
+    Some((receiver, member))
 }
 
 fn extract_route_info(
     parsed: &ParsedFile,
     node: &tree_sitter::Node,
+    receiver: &str,
+    mounts: &HashMap<String, Vec<String>>,
     method: &str,
     location: &crate::parse::ast::AstLocation,
 ) -> ExpressRoute {
@@ -159,10 +258,10 @@ fn extract_route_info(
         if let Some(first_arg) = args_node.named_child(0) {
             let text = parsed.text_for_node(&first_arg);
             if text.starts_with('\'') || text.starts_with('"') || text.starts_with('`') {
-                path = Some(
-                    text.trim_matches(|c| c == '\'' || c == '"' || c == '`')
-                        .to_string(),
-                );
+                let raw_path = text
+                    .trim_matches(|c| c == '\'' || c == '"' || c == '`')
+                    .to_string();
+                path = Some(apply_mounts(receiver, mounts, &raw_path));
             }
         }
 
@@ -198,6 +297,43 @@ fn extract_route_info(
         has_error_handler,
         location: location.clone(),
     }
+}
+
+fn apply_mounts(receiver: &str, mounts: &HashMap<String, Vec<String>>, path: &str) -> String {
+    let Some(prefixes) = mounts.get(receiver) else {
+        return path.to_string();
+    };
+    // If multiple mounts exist, choose the first (best-effort).
+    let prefix = prefixes.first().map(|s| s.as_str()).unwrap_or("/");
+    join_paths(prefix, path)
+}
+
+fn join_paths(prefix: &str, path: &str) -> String {
+    let mut pfx = prefix.trim().to_string();
+    let mut p = path.trim().to_string();
+
+    if pfx.is_empty() {
+        pfx = "/".to_string();
+    }
+    if p.is_empty() {
+        p = "/".to_string();
+    }
+
+    if !pfx.starts_with('/') {
+        pfx = format!("/{}", pfx);
+    }
+    if !p.starts_with('/') {
+        p = format!("/{}", p);
+    }
+
+    if pfx == "/" {
+        return p;
+    }
+    if p == "/" {
+        return pfx;
+    }
+
+    format!("{}{}", pfx.trim_end_matches('/'), p)
 }
 
 fn has_four_params(node: &tree_sitter::Node) -> bool {
@@ -412,5 +548,22 @@ app.post('/users', createUser);
         );
         assert_eq!(summary.routes[1].path, Some("/users".to_string()));
         assert_eq!(summary.routes[1].method, "post");
+    }
+
+    #[test]
+    fn applies_router_mount_prefix_from_app_use() {
+        let src = r#"
+import express, { Router } from 'express';
+
+const app = express();
+const api = Router();
+
+app.use('/api', api);
+
+api.get('/users', (req, res) => {});
+"#;
+        let summary = parse_and_summarize(src).unwrap();
+        assert_eq!(summary.routes.len(), 1);
+        assert_eq!(summary.routes[0].path, Some("/api/users".to_string()));
     }
 }

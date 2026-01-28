@@ -18,9 +18,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use petgraph::Direction;
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
+use petgraph::Direction;
 use serde::{Deserialize, Serialize};
 
 use crate::parse::ast::FileId;
@@ -1615,11 +1615,22 @@ fn add_fastapi_nodes(
             .add_edge(file_node, route_node, GraphEdgeKind::Contains);
 
         // Try to find an app owner by heuristic.
-        // For now, we don't know which app exactly, so we might associate all apps.
-        // Later, we can refine using app.var_name, routers, and decorators.
-        for app_node in app_nodes.values() {
-            cg.graph
-                .add_edge(*app_node, route_node, GraphEdgeKind::FastApiAppOwnsRoute);
+        // Prefer exact ownership when the decorator receiver is the app var.
+        if let Some(owner) = &route.owner_var_name {
+            if let Some(app_node) = app_nodes.get(owner) {
+                cg.graph
+                    .add_edge(*app_node, route_node, GraphEdgeKind::FastApiAppOwnsRoute);
+            } else {
+                for app_node in app_nodes.values() {
+                    cg.graph
+                        .add_edge(*app_node, route_node, GraphEdgeKind::FastApiAppOwnsRoute);
+                }
+            }
+        } else {
+            for app_node in app_nodes.values() {
+                cg.graph
+                    .add_edge(*app_node, route_node, GraphEdgeKind::FastApiAppOwnsRoute);
+            }
         }
 
         // Ensure we have a function node for the route handler with HTTP metadata.
@@ -1807,7 +1818,7 @@ fn add_go_framework_nodes(
 
         let start_line = route.location.range.start_line + 1; // Convert to 1-based
         let end_line = route.location.range.end_line + 1;
-        
+
         let func_node = cg.graph.add_node(GraphNode::Function {
             file_id,
             name: handler_name.clone(),
@@ -1856,7 +1867,7 @@ fn add_rust_framework_nodes(
 
         let start_line = route.location.range.start_line + 1; // Convert to 1-based
         let end_line = route.location.range.end_line + 1;
-        
+
         let func_node = cg.graph.add_node(GraphNode::Function {
             file_id,
             name: handler_name.clone(),
@@ -1883,8 +1894,8 @@ mod tests {
     use super::*;
     use crate::parse::ast::FileId;
     use crate::parse::python::parse_python_file;
-    use crate::semantics::SourceSemantics;
     use crate::semantics::python::model::PyFileSemantics;
+    use crate::semantics::SourceSemantics;
     use crate::types::context::{Language, SourceFile};
 
     /// Helper to parse Python source and build semantics with framework analysis
@@ -2190,14 +2201,12 @@ async def fetch_user(user_id):
         assert!(stats.function_count >= 2);
 
         // Functions should be in lookup
-        assert!(
-            cg.function_nodes
-                .contains_key(&(file_id, "process_data".to_string()))
-        );
-        assert!(
-            cg.function_nodes
-                .contains_key(&(file_id, "fetch_user".to_string()))
-        );
+        assert!(cg
+            .function_nodes
+            .contains_key(&(file_id, "process_data".to_string())));
+        assert!(cg
+            .function_nodes
+            .contains_key(&(file_id, "fetch_user".to_string())));
     }
 
     #[test]
@@ -2822,14 +2831,12 @@ def bar():
         // Verify lookups are restored
         assert!(cg.file_nodes.contains_key(&file_id));
         assert!(cg.path_to_file.contains_key("test.py"));
-        assert!(
-            cg.function_nodes
-                .contains_key(&(file_id, "my_func".to_string()))
-        );
-        assert!(
-            cg.class_nodes
-                .contains_key(&(file_id, "MyClass".to_string()))
-        );
+        assert!(cg
+            .function_nodes
+            .contains_key(&(file_id, "my_func".to_string())));
+        assert!(cg
+            .class_nodes
+            .contains_key(&(file_id, "MyClass".to_string())));
         assert!(cg.external_modules.contains_key("requests"));
     }
 
@@ -2933,14 +2940,12 @@ def main():
         let cg = build_code_graph(&sem_entries);
 
         // Both functions should exist
-        assert!(
-            cg.function_nodes
-                .contains_key(&(helper_id, "helper_func".to_string()))
-        );
-        assert!(
-            cg.function_nodes
-                .contains_key(&(main_id, "main".to_string()))
-        );
+        assert!(cg
+            .function_nodes
+            .contains_key(&(helper_id, "helper_func".to_string())));
+        assert!(cg
+            .function_nodes
+            .contains_key(&(main_id, "main".to_string())));
 
         // Check that there's an import edge from main.py to helpers.py
         let stats = cg.stats();
@@ -3212,14 +3217,12 @@ def main():
         let cg = build_code_graph(&sem_entries);
 
         // Verify both functions exist
-        assert!(
-            cg.function_nodes
-                .contains_key(&(utils_id, "add".to_string()))
-        );
-        assert!(
-            cg.function_nodes
-                .contains_key(&(app_id, "main".to_string()))
-        );
+        assert!(cg
+            .function_nodes
+            .contains_key(&(utils_id, "add".to_string())));
+        assert!(cg
+            .function_nodes
+            .contains_key(&(app_id, "main".to_string())));
 
         // Key assertion: There should be a Calls edge from main() to add()
         let stats = cg.stats();
@@ -3292,14 +3295,12 @@ def process(db):
         let cg = build_code_graph(&sem_entries);
 
         // Verify both functions exist
-        assert!(
-            cg.function_nodes
-                .contains_key(&(file_id, "add".to_string()))
-        );
-        assert!(
-            cg.function_nodes
-                .contains_key(&(file_id, "process".to_string()))
-        );
+        assert!(cg
+            .function_nodes
+            .contains_key(&(file_id, "add".to_string())));
+        assert!(cg
+            .function_nodes
+            .contains_key(&(file_id, "process".to_string())));
 
         // Get the function nodes
         let add_func_idx = cg

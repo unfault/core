@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use crate::parse::ast::{AstLocation, ParsedFile};
 
-use crate::semantics::common::http::{HttpUrlExpr, HttpUrlExprKind};
+use crate::semantics::common::http::{HttpUrlExpr, HttpUrlExprKind, RetryMechanism};
 
 /// Rust HTTP client library classification
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -55,6 +55,10 @@ pub struct HttpCallSite {
     /// Timeout value in seconds if detectable
     pub timeout_value: Option<f64>,
 
+    /// Retry mechanism detected for this call
+    #[serde(default)]
+    pub retry_mechanism: Option<RetryMechanism>,
+
     /// Location in source
     pub location: AstLocation,
 
@@ -67,6 +71,10 @@ pub struct HttpCallSite {
     /// Whether this call uses `.await`
     pub has_await: bool,
 
+    /// Whether this call is inside a loop
+    #[serde(default)]
+    pub in_loop: bool,
+
     /// Byte range in original source
     pub start_byte: usize,
     pub end_byte: usize,
@@ -76,6 +84,8 @@ pub struct HttpCallSite {
 pub fn summarize_http_clients(file: &ParsedFile) -> Vec<HttpCallSite> {
     let root = file.tree.root_node();
     let const_string_bindings = collect_string_const_bindings(file, root);
+    let loop_infos = collect_loop_infos(file, root);
+    let retry_client_vars = collect_retry_client_vars(file, root);
     let mut calls = Vec::new();
     collect_http_calls(
         file,
@@ -86,7 +96,146 @@ pub fn summarize_http_clients(file: &ParsedFile) -> Vec<HttpCallSite> {
         None,
         &const_string_bindings,
     );
+
+    // Post-process loop context and best-effort retry detection.
+    for call in &mut calls {
+        if let Some(loop_info) =
+            innermost_loop_containing(&loop_infos, call.start_byte, call.end_byte)
+        {
+            call.in_loop = true;
+            if call.retry_mechanism.is_none() && loop_info.has_sleep {
+                call.retry_mechanism = Some(RetryMechanism::ManualLoop);
+            }
+        }
+
+        if call.retry_mechanism.is_none() {
+            if let Some(recv) = extract_receiver_ident_from_call_text(&call.call_text) {
+                if let Some(mech) = retry_client_vars.get(&recv) {
+                    call.retry_mechanism = Some(mech.clone());
+                }
+            }
+        }
+    }
+
     calls
+}
+
+#[derive(Debug, Clone)]
+struct LoopInfo {
+    start_byte: usize,
+    end_byte: usize,
+    has_sleep: bool,
+}
+
+fn collect_loop_infos(file: &ParsedFile, root: tree_sitter::Node) -> Vec<LoopInfo> {
+    let mut out = Vec::new();
+
+    fn walk(file: &ParsedFile, node: tree_sitter::Node, out: &mut Vec<LoopInfo>) {
+        if super::is_inline_test_subtree_root(file, &node) {
+            return;
+        }
+
+        if matches!(
+            node.kind(),
+            "for_expression" | "while_expression" | "loop_expression"
+        ) {
+            let text = file.text_for_node(&node);
+            let has_sleep = text.contains("sleep(")
+                || text.contains("tokio::time::sleep")
+                || text.contains("std::thread::sleep");
+            let r = node.byte_range();
+            out.push(LoopInfo {
+                start_byte: r.start,
+                end_byte: r.end,
+                has_sleep,
+            });
+        }
+
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i) {
+                walk(file, child, out);
+            }
+        }
+    }
+
+    walk(file, root, &mut out);
+    out
+}
+
+fn innermost_loop_containing(loops: &[LoopInfo], start: usize, end: usize) -> Option<&LoopInfo> {
+    loops
+        .iter()
+        .filter(|l| l.start_byte <= start && end <= l.end_byte)
+        .min_by_key(|l| l.end_byte - l.start_byte)
+}
+
+fn collect_retry_client_vars(
+    file: &ParsedFile,
+    root: tree_sitter::Node,
+) -> HashMap<String, RetryMechanism> {
+    let mut out: HashMap<String, RetryMechanism> = HashMap::new();
+
+    fn walk(file: &ParsedFile, node: tree_sitter::Node, out: &mut HashMap<String, RetryMechanism>) {
+        if super::is_inline_test_subtree_root(file, &node) {
+            return;
+        }
+
+        if node.kind() == "let_declaration" {
+            // best-effort: `let client = ...;`
+            let pat = node.child_by_field_name("pattern");
+            let value = node.child_by_field_name("value");
+            if let (Some(pat), Some(value)) = (pat, value) {
+                if pat.kind() == "identifier" {
+                    let name = file.text_for_node(&pat);
+                    let v = file.text_for_node(&value);
+                    if v.contains("ClientBuilder::new")
+                        && (v.contains("Retry")
+                            || v.contains("reqwest_retry")
+                            || v.contains("retry"))
+                    {
+                        out.insert(
+                            name,
+                            RetryMechanism::Middleware("reqwest-middleware".to_string()),
+                        );
+                    } else if v.contains("tower::retry") || v.contains("RetryLayer") {
+                        out.insert(name, RetryMechanism::Middleware("tower".to_string()));
+                    }
+                }
+            }
+        }
+
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i) {
+                walk(file, child, out);
+            }
+        }
+    }
+
+    walk(file, root, &mut out);
+    out
+}
+
+fn extract_receiver_ident_from_call_text(call_text: &str) -> Option<String> {
+    let t = call_text.trim();
+    if t.starts_with("self.") {
+        let rest = &t["self.".len()..];
+        let ident: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if !ident.is_empty() {
+            return Some(ident);
+        }
+    }
+
+    let ident: String = t
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    if ident.is_empty() {
+        return None;
+    }
+    Some(ident)
 }
 
 /// Context for tracking during AST traversal
@@ -236,10 +385,12 @@ fn extract_http_call(
             call_text,
             has_timeout,
             timeout_value,
+            retry_mechanism: None,
             location,
             function_name: ctx.current_function.clone(),
             in_async_function: ctx.in_async_fn,
             has_await,
+            in_loop: false,
             start_byte: byte_range.start,
             end_byte: byte_range.end,
         });
@@ -266,10 +417,12 @@ fn extract_http_call(
                 call_text,
                 has_timeout,
                 timeout_value,
+                retry_mechanism: None,
                 location,
                 function_name: ctx.current_function.clone(),
                 in_async_function: false,
                 has_await,
+                in_loop: false,
                 start_byte: byte_range.start,
                 end_byte: byte_range.end,
             });
@@ -299,10 +452,12 @@ fn extract_http_call(
                     call_text,
                     has_timeout,
                     timeout_value,
+                    retry_mechanism: None,
                     location,
                     function_name: ctx.current_function.clone(),
                     in_async_function: false,
                     has_await,
+                    in_loop: false,
                     start_byte: byte_range.start,
                     end_byte: byte_range.end,
                 });

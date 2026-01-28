@@ -54,6 +54,9 @@ pub struct FastApiRouter {
 /// A route defined via decorator or `app.<method>` call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FastApiRoute {
+    /// The decorator receiver variable name (e.g., "app" or "router").
+    #[serde(default)]
+    pub owner_var_name: Option<String>,
     pub http_method: String, // "GET", "POST", etc.
     pub path: String,        // "/users/{user_id}"
     pub handler_name: String,
@@ -102,7 +105,12 @@ pub fn summarize_fastapi(file: &ParsedFile) -> Option<FastApiFileSummary> {
     collect_fastapi_apps(file, root, &mut apps);
     collect_fastapi_middlewares(file, root, &mut middlewares);
     collect_fastapi_routers(file, root, &mut routers);
+
+    let router_instance_prefixes = collect_api_router_instance_prefixes(file, root);
+
     collect_fastapi_routes(file, root, &mut routes);
+
+    apply_router_prefixes_to_routes(&routers, &router_instance_prefixes, &mut routes);
     collect_fastapi_exception_handlers(file, root, &mut exception_handlers);
 
     if apps.is_empty()
@@ -316,20 +324,10 @@ fn extract_include_router_call(file: &ParsedFile, call_node: Node) -> Option<Fas
         return None;
     }
 
-    // For now, we don't try too hard to parse arguments. We just grab the raw
-    // text of the "arguments" node and, optionally later, can refine it into
-    // router_expr + prefix if needed.
-    let router_expr = {
-        if let Some(args) = call_node.child_by_field_name("arguments") {
-            file.text_for_node(&args)
-        } else {
-            "<unknown>".to_string()
-        }
-    };
-
-    // TODO: later we can inspect the arguments node and try to extract
-    // a literal `prefix="..."` keyword argument.
-    let prefix = None;
+    let args = call_node.child_by_field_name("arguments")?;
+    let router_expr =
+        extract_first_positional_arg_expr(file, args).unwrap_or_else(|| "<unknown>".to_string());
+    let prefix = extract_string_keyword_arg(file, args, "prefix");
 
     let location = file.location_for_node(&call_node);
 
@@ -531,7 +529,9 @@ fn extract_fastapi_route(file: &ParsedFile, decorated_def: Node) -> Option<FastA
 
     // Check if any decorator is a FastAPI route decorator
     for decorator in &decorators {
-        if let Some((http_method, path)) = extract_route_decorator_info(file, *decorator) {
+        if let Some((owner_var_name, http_method, path)) =
+            extract_route_decorator_info(file, *decorator)
+        {
             // Get the function name
             let handler_name = func_def
                 .child_by_field_name("name")
@@ -554,6 +554,7 @@ fn extract_fastapi_route(file: &ParsedFile, decorated_def: Node) -> Option<FastA
             let dependency_injections = extract_dependency_injections(file, &func_def);
 
             return Some(FastApiRoute {
+                owner_var_name: Some(owner_var_name),
                 http_method,
                 path,
                 handler_name,
@@ -818,7 +819,10 @@ fn parse_typed_default_param_text(text: &str) -> Option<(String, String)> {
 /// Handles patterns like:
 /// - `@app.get("/path")`
 /// - `@router.post("/path")`
-fn extract_route_decorator_info(file: &ParsedFile, decorator: Node) -> Option<(String, String)> {
+fn extract_route_decorator_info(
+    file: &ParsedFile,
+    decorator: Node,
+) -> Option<(String, String, String)> {
     let source_bytes = file.source.as_bytes();
 
     // Decorator structure:
@@ -839,6 +843,9 @@ fn extract_route_decorator_info(file: &ParsedFile, decorator: Node) -> Option<(S
                 continue;
             }
 
+            let object = func.child_by_field_name("object")?;
+            let owner_var_name = object.utf8_text(source_bytes).ok()?.to_string();
+
             let attr = func.child_by_field_name("attribute")?;
             let method_name = attr.utf8_text(source_bytes).ok()?;
 
@@ -858,11 +865,182 @@ fn extract_route_decorator_info(file: &ParsedFile, decorator: Node) -> Option<(S
             let args = child.child_by_field_name("arguments")?;
             let path = extract_first_string_arg(file, args)?;
 
-            return Some((http_method.to_string(), path));
+            return Some((owner_var_name, http_method.to_string(), path));
         }
     }
 
     None
+}
+
+fn extract_first_positional_arg_expr(file: &ParsedFile, args: Node) -> Option<String> {
+    let mut cursor = args.walk();
+    for child in args.children(&mut cursor) {
+        match child.kind() {
+            "(" | ")" | "," => continue,
+            "keyword_argument" => continue,
+            _ => {
+                return Some(
+                    strip_ws(&file.text_for_node(&child))
+                        .trim_end_matches(',')
+                        .to_string(),
+                );
+            }
+        }
+    }
+    None
+}
+
+fn extract_string_keyword_arg(file: &ParsedFile, args: Node, keyword: &str) -> Option<String> {
+    let source_bytes = file.source.as_bytes();
+    let mut cursor = args.walk();
+    for child in args.children(&mut cursor) {
+        if child.kind() != "keyword_argument" {
+            continue;
+        }
+        let name_node = child.child_by_field_name("name")?;
+        let name = name_node.utf8_text(source_bytes).ok()?;
+        if name != keyword {
+            continue;
+        }
+        let value_node = child.child_by_field_name("value")?;
+        return extract_string_from_node(file, value_node);
+    }
+    None
+}
+
+fn extract_string_from_node(file: &ParsedFile, node: Node) -> Option<String> {
+    let source_bytes = file.source.as_bytes();
+    match node.kind() {
+        "string" => {
+            let text = node.utf8_text(source_bytes).ok()?;
+            Some(text.trim_matches(|c| c == '"' || c == '\'').to_string())
+        }
+        "concatenated_string" => {
+            let mut cursor = node.walk();
+            for inner in node.children(&mut cursor) {
+                if inner.kind() == "string" {
+                    let text = inner.utf8_text(source_bytes).ok()?;
+                    return Some(text.trim_matches(|c| c == '"' || c == '\'').to_string());
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn collect_api_router_instance_prefixes(
+    file: &ParsedFile,
+    root: Node,
+) -> std::collections::HashMap<String, String> {
+    use std::collections::HashMap;
+    let mut out: HashMap<String, String> = HashMap::new();
+
+    fn walk(file: &ParsedFile, node: Node, out: &mut HashMap<String, String>) {
+        if node.kind() == "assignment" {
+            if let Some(left) = node.child_by_field_name("left") {
+                if left.kind() == "identifier" {
+                    if let Some(right) = node.child_by_field_name("right") {
+                        if right.kind() == "call" {
+                            if let Some(func) = right.child_by_field_name("function") {
+                                let func_text = strip_ws(&file.text_for_node(&func));
+                                let is_api_router = func_text == "APIRouter"
+                                    || func_text.ends_with(".APIRouter")
+                                    || func_text.ends_with("fastapi.APIRouter");
+                                if is_api_router {
+                                    if let Some(args) = right.child_by_field_name("arguments") {
+                                        if let Some(prefix) =
+                                            extract_string_keyword_arg(file, args, "prefix")
+                                        {
+                                            let name = file.text_for_node(&left);
+                                            out.insert(name, prefix);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            walk(file, child, out);
+        }
+    }
+
+    walk(file, root, &mut out);
+    out
+}
+
+fn apply_router_prefixes_to_routes(
+    include_routers: &[FastApiRouter],
+    router_instance_prefixes: &std::collections::HashMap<String, String>,
+    routes: &mut [FastApiRoute],
+) {
+    use std::collections::HashMap;
+
+    // Map router expr -> include_router prefix (if unique).
+    let mut include_prefixes: HashMap<String, Option<String>> = HashMap::new();
+    for r in include_routers {
+        let key = strip_ws(&r.router_expr);
+        let entry = include_prefixes.entry(key).or_insert(r.prefix.clone());
+        if *entry != r.prefix {
+            *entry = None;
+        }
+    }
+
+    for route in routes {
+        let Some(owner) = route.owner_var_name.clone() else {
+            continue;
+        };
+
+        // Only apply prefixes for routes declared on routers.
+        let mut prefix: Option<String> = None;
+
+        if let Some(p) = router_instance_prefixes.get(&owner) {
+            prefix = Some(p.clone());
+        }
+
+        if let Some(maybe_inc) = include_prefixes.get(&owner) {
+            if let Some(inc) = maybe_inc.clone() {
+                prefix = Some(match prefix {
+                    Some(p) => join_paths(&inc, &p),
+                    None => inc,
+                });
+            }
+        }
+
+        if let Some(pfx) = prefix {
+            route.path = join_paths(&pfx, &route.path);
+        }
+    }
+}
+
+fn join_paths(prefix: &str, path: &str) -> String {
+    let mut pfx = prefix.trim().to_string();
+    let mut p = path.trim().to_string();
+
+    if pfx.is_empty() {
+        pfx = "/".to_string();
+    }
+    if p.is_empty() {
+        p = "/".to_string();
+    }
+    if !pfx.starts_with('/') {
+        pfx = format!("/{}", pfx);
+    }
+    if !p.starts_with('/') {
+        p = format!("/{}", p);
+    }
+    if pfx == "/" {
+        return p;
+    }
+    if p == "/" {
+        return pfx;
+    }
+    format!("{}{}", pfx.trim_end_matches('/'), p)
 }
 
 /// Extract the first string argument from an argument list.
@@ -1029,11 +1207,9 @@ app.add_middleware(
         let summary = summary.unwrap();
         assert_eq!(summary.middlewares.len(), 1);
         assert_eq!(summary.middlewares[0].app_var_name, "app");
-        assert!(
-            summary.middlewares[0]
-                .middleware_type
-                .contains("CORSMiddleware")
-        );
+        assert!(summary.middlewares[0]
+            .middleware_type
+            .contains("CORSMiddleware"));
     }
 
     #[test]
@@ -1108,6 +1284,8 @@ app.include_router(users_router)
         let summary = summary.unwrap();
         assert_eq!(summary.routers.len(), 1);
         assert_eq!(summary.routers[0].app_var_name, "app");
+        assert_eq!(summary.routers[0].router_expr, "users_router");
+        assert!(summary.routers[0].prefix.is_none());
     }
 
     #[test]
@@ -1123,8 +1301,8 @@ app.include_router(users_router, prefix="/api/v1")
         assert!(summary.is_some());
         let summary = summary.unwrap();
         assert_eq!(summary.routers.len(), 1);
-        // The router_expr should contain the arguments
-        assert!(summary.routers[0].router_expr.contains("users_router"));
+        assert_eq!(summary.routers[0].router_expr, "users_router");
+        assert_eq!(summary.routers[0].prefix, Some("/api/v1".to_string()));
     }
 
     #[test]
@@ -1158,7 +1336,29 @@ app.include_router(users.router)
         assert!(summary.is_some());
         let summary = summary.unwrap();
         assert_eq!(summary.routers.len(), 1);
-        assert!(summary.routers[0].router_expr.contains("users.router"));
+        assert_eq!(summary.routers[0].router_expr, "users.router");
+    }
+
+    #[test]
+    fn applies_router_and_include_router_prefix_to_route_paths() {
+        let src = r#"
+from fastapi import FastAPI, APIRouter
+
+app = FastAPI()
+
+router = APIRouter(prefix='/v1')
+
+@router.get('/items')
+def list_items():
+    return []
+
+app.include_router(router, prefix='/api')
+"#;
+
+        let summary = parse_and_summarize_fastapi(src).expect("summary should exist");
+        assert_eq!(summary.routes.len(), 1);
+        assert_eq!(summary.routes[0].path, "/api/v1/items");
+        assert_eq!(summary.routes[0].owner_var_name, Some("router".to_string()));
     }
 
     // ==================== Location Tests ====================
@@ -1306,11 +1506,9 @@ async def root():
         assert_eq!(summary.apps[0].var_name, "app");
 
         assert_eq!(summary.middlewares.len(), 1);
-        assert!(
-            summary.middlewares[0]
-                .middleware_type
-                .contains("CORSMiddleware")
-        );
+        assert!(summary.middlewares[0]
+            .middleware_type
+            .contains("CORSMiddleware"));
 
         assert_eq!(summary.routers.len(), 2);
     }
@@ -1595,9 +1793,8 @@ app.include_router(users.router, prefix="/api/v1", tags=["users"])
         assert!(summary.is_some());
         let summary = summary.unwrap();
         assert_eq!(summary.routers.len(), 1);
-        // Should contain the full arguments text
-        assert!(summary.routers[0].router_expr.contains("users.router"));
-        assert!(summary.routers[0].router_expr.contains("prefix"));
+        assert_eq!(summary.routers[0].router_expr, "users.router");
+        assert_eq!(summary.routers[0].prefix, Some("/api/v1".to_string()));
     }
 
     // ==================== Exception Handler Detection Tests ====================
@@ -1698,11 +1895,9 @@ async def http_handler(request: Request, exc):
         let summary = summary.unwrap();
 
         assert_eq!(summary.exception_handlers.len(), 1);
-        assert!(
-            summary.exception_handlers[0]
-                .exception_type
-                .contains("HTTPException")
-        );
+        assert!(summary.exception_handlers[0]
+            .exception_type
+            .contains("HTTPException"));
     }
 
     #[test]

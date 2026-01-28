@@ -21,7 +21,7 @@ Repo scope: `/home/sylvain/dev/unfault/core` (crate: `unfault-core`).
 - Framework/server detection exists in all four, with varying precision:
   - Python: strongest and most explicit (FastAPI/Flask/Django).
   - Go: route extraction across multiple frameworks; more heuristic classification.
-  - Rust: framework detection is import/text-based + route extraction for several frameworks.
+  - Rust: framework detection is now AST-driven (less raw-text heuristics) + route extraction for several frameworks.
   - TypeScript: Express/Fastify/NestJS support; decorators/routes are heuristic but broad.
 - HTTP client detection exists in all four with a shared common model (`src/semantics/common/http.rs`).
   - Python: richest (client bindings, retry sources, timeout value extraction).
@@ -249,7 +249,9 @@ Dependencies (tree-sitter grammars): `Cargo.toml` includes python/rust/go/typesc
 #### HTTP server/framework route extraction
 
 - `src/semantics/rust/frameworks.rs`
-  - Framework detection (import/text): Axum, Actix-web, Rocket, Warp, Poem, Tide.
+  - Framework detection (AST-driven): Axum, Actix-web, Rocket, Warp, Poem, Tide.
+    - Uses AST walk over `use`/path/attribute nodes rather than plain `source.contains(...)`.
+    - Rocket detection is stricter (requires `rocket::...`/`#[rocket::...]`/`#[launch]`) to avoid confusing Actix-style `#[get("...")]` with Rocket.
   - Route extraction patterns:
     - Axum: `.route("/path", get(handler))` and chained `.post(...)` etc.
       - Prefix propagation for `.nest("/prefix", Router::new().route(...))`.
@@ -277,7 +279,11 @@ Dependencies (tree-sitter grammars): `Cargo.toml` includes python/rust/go/typesc
     - retry + loop context (best-effort):
       - marks `in_loop` for calls inside Rust loop nodes.
       - marks retry as `ManualLoop` when a loop contains an HTTP call and the loop text suggests a sleep/backoff.
-      - detects some client-level retry middleware patterns (reqwest-middleware / tower) conservatively.
+      - detects some client-level retry middleware patterns (reqwest-middleware / reqwest-retry / tower) conservatively.
+    - client binding precision:
+      - prefers explicit reqwest client bindings (`let c = reqwest::Client::new()` / builders) over name-based receiver heuristics.
+      - supports typed struct fields like `self.client.get(...)` when the field is declared as `reqwest::Client`.
+      - reduces false positives from unrelated `.get()` calls (e.g., `HashMap::get`).
   - Converted into common `HttpCall` representation in `src/semantics/rust/mod.rs`.
 
 #### DB detection

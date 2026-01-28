@@ -239,6 +239,32 @@ impl CommonSemantics for PyFileSemantics {
     fn route_patterns(&self) -> Vec<RoutePattern> {
         let mut routes = Vec::new();
 
+        fn parse_python_string_literal(expr: &str) -> Option<String> {
+            let s = expr.trim();
+            let s = s
+                .strip_prefix('r')
+                .or_else(|| s.strip_prefix('R'))
+                .unwrap_or(s);
+            let s = s.trim();
+            if (s.starts_with('"') && s.ends_with('"'))
+                || (s.starts_with('\'') && s.ends_with('\''))
+            {
+                return Some(s[1..s.len() - 1].to_string());
+            }
+            None
+        }
+
+        fn normalize_path(path: &str) -> String {
+            let mut p = path.trim().to_string();
+            if p.is_empty() {
+                return "/".to_string();
+            }
+            if !p.starts_with('/') {
+                p = format!("/{}", p);
+            }
+            p
+        }
+
         if let Some(ref fastapi) = self.fastapi {
             for route in &fastapi.routes {
                 let has_auth = route.handler_name.to_lowercase().contains("auth")
@@ -264,6 +290,78 @@ impl CommonSemantics for PyFileSemantics {
                             0,
                         ),
                 );
+            }
+        }
+
+        if let Some(ref django) = self.django {
+            use crate::semantics::python::django::ViewType;
+
+            let mut view_methods: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            for v in &django.views {
+                view_methods.insert(v.name.clone(), v.http_method.clone());
+            }
+
+            for url in &django.urls {
+                if url.view_type == ViewType::Include {
+                    continue;
+                }
+
+                let path = parse_python_string_literal(&url.path_expr)
+                    .map(|s| normalize_path(&s))
+                    .unwrap_or_else(|| normalize_path(&url.path_expr));
+
+                // view_name may be `views.home`, `home`, `MyView.as_view()`.
+                let (handler_expr, is_class) = if url.view_name.contains(".as_view") {
+                    let before = url
+                        .view_name
+                        .split(".as_view")
+                        .next()
+                        .unwrap_or(url.view_name.as_str())
+                        .trim();
+                    (before.to_string(), true)
+                } else {
+                    (url.view_name.trim().to_string(), false)
+                };
+
+                let handler_name = handler_expr
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(handler_expr.as_str())
+                    .to_string();
+
+                let method = view_methods
+                    .get(&handler_name)
+                    .cloned()
+                    .unwrap_or_else(|| "ANY".to_string());
+
+                let has_auth = handler_name.to_lowercase().contains("auth")
+                    || handler_name.to_lowercase().contains("protected");
+                let has_validation = handler_name.to_lowercase().contains("validate")
+                    || handler_name.to_lowercase().contains("serializer")
+                    || handler_name.to_lowercase().contains("schema");
+
+                let mut rp = RoutePattern::new(method, path, RouteFramework::Django)
+                    .with_handler(handler_name.clone(), &self.path)
+                    .with_auth(has_auth)
+                    .with_validation(has_validation)
+                    .with_location(
+                        CommonLocation {
+                            file_id: self.file_id,
+                            line: url.location.range.start_line + 1,
+                            column: url.location.range.start_col + 1,
+                            start_byte: 0,
+                            end_byte: 0,
+                        },
+                        0,
+                        0,
+                    );
+
+                if is_class {
+                    rp = rp.with_tag("class_view");
+                }
+
+                routes.push(rp);
             }
         }
 
@@ -2848,6 +2946,34 @@ def protected_auth():
             .find(|r| r.path == "/protected/auth-required")
             .unwrap();
         assert!(protected_route.has_auth);
+    }
+
+    #[test]
+    fn python_route_patterns_extracts_django_routes() {
+        let sem = parse_python(
+            r#"
+from django.urls import path
+from django.views.decorators.http import require_GET
+
+@require_GET
+def home(request):
+    return None
+
+urlpatterns = [
+    path('users', home, name='home'),
+]
+"#,
+        );
+
+        let routes = sem.route_patterns();
+        let django_routes: Vec<_> = routes
+            .iter()
+            .filter(|r| r.framework == RouteFramework::Django)
+            .collect();
+        assert_eq!(django_routes.len(), 1);
+        assert_eq!(django_routes[0].method, "GET");
+        assert_eq!(django_routes[0].path, "/users");
+        assert_eq!(django_routes[0].handler_name.as_deref(), Some("home"));
     }
 
     #[test]

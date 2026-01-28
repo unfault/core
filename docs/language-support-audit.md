@@ -95,7 +95,9 @@ Dependencies (tree-sitter grammars): `Cargo.toml` includes python/rust/go/typesc
   - Detects:
     - `app = FastAPI(...)` (only simple `identifier = FastAPI(...)`).
     - `app.add_middleware(CORSMiddleware, ...)` (currently only cares about CORS).
-    - `app.include_router(...)` (captures args text; prefix parsing TODO in code).
+    - `app.include_router(router, prefix="/x")` (captures router expr + best-effort static `prefix=` string).
+      - Intra-file path composition: `APIRouter(prefix=...)` + `include_router(prefix=...)` prefixes are applied to `@router.get(...)` routes.
+      - Cross-file path composition (CodeGraph best-effort): when `include_router` references an imported module router (e.g. `users.router`), the graph applies the prefix to routes in that router module.
     - Decorator routes:
       - `@app.get("/path")`, `@router.post("/path")`, etc.
       - Captures method/path/handler name/async/try-except presence.
@@ -113,7 +115,11 @@ Dependencies (tree-sitter grammars): `Cargo.toml` includes python/rust/go/typesc
 - Django: `src/semantics/python/django.rs`
   - Detects:
     - Models: `class X(models.Model): ...` and variants with base classes containing `Model`.
-    - Views: function definitions are treated as views (HTTP method detection currently stubbed to `"GET"`).
+    - Views:
+      - function-based views, including decorator-based method inference (e.g., `require_http_methods`, `require_GET/POST`, DRF `api_view`).
+      - class-based views: infers supported methods from `def get/post/...` on `View`/`APIView`-like bases.
+    - Cross-file URL composition (CodeGraph best-effort): follows `include(...)` across urlconf modules and composes URL prefixes into handler `Function.http_path`.
+    - Common route emission (best-effort): non-include Django URL patterns are also emitted as common `RoutePattern` entries.
     - URL patterns: `path(...)`, `re_path(...)`, `include(...)`.
     - Middleware: assignment of middleware lists or calls containing `Middleware`.
 
@@ -501,13 +507,27 @@ This section is organized by feature area; each item includes likely failure mod
 
 ## 4) Suggested Next Steps (Practical Roadmap)
 
-1. Improve Python FastAPI `include_router(prefix=...)` extraction and path composition.
-2. Improve Python Django method inference (DRF + class-based views + decorators).
-3. Deepen Rust retry extraction (reqwest-middleware / tower patterns + richer manual-loop signals).
-4. Deepen Go error-handling detection around HTTP calls (track `err` check blocks, ignore patterns).
-5. Add config knobs:
-   - include/exclude tests (Rust),
-   - strict vs aggressive HTTP client detection (TS),
+1. Deepen Rust HTTP retry extraction:
+   - recognize more `tower`/`tower-http` retry layers and policy types.
+   - add richer manual-loop/backoff signals beyond “loop + sleep”.
+2. Expand Rust HTTP client coverage and binding precision:
+   - broaden beyond reqwest/ureq (hyper client usage, surf/isahc/awc call shapes).
+   - track more client-builder defaults (timeouts/base URLs) and attach them to calls.
+3. Deepen Go error-handling detection around HTTP calls:
+   - track `err` bindings + `if err != nil` blocks, and avoid false positives from unrelated control flow.
+4. Improve TypeScript retry extraction:
+   - recognize common retry wrappers (`p-retry`, `async-retry`) and map them into `RetryMechanism`.
+5. Improve Python cross-file route composition depth:
+   - FastAPI: handle `include_router(users_router, prefix=...)` where `users_router` is an imported name (including `from ... import router as users_router`).
+   - FastAPI: handle multiple/nested `include_router` prefixes (and avoid double-prefixing when the same router is included more than once).
+   - Django: support richer `include(...)` forms (tuple includes, namespaces) and compose deeper urlconf graphs.
+   - Django/DRF: detect `DefaultRouter`/`SimpleRouter` registrations in `urls.py` and emit route patterns.
+6. Promote Django URLConf routes into the common `RoutePattern` model:
+   - today, composed Django paths are primarily attached to handler `Function` nodes in the CodeGraph.
+   - add a dedicated common route emission so Django endpoints show up alongside FastAPI/Flask/Express/etc.
+7. Add config knobs:
+   - include/exclude test subtrees,
+   - strict vs aggressive HTTP client detection,
    - strict vs best-effort framework classification.
 
 ---

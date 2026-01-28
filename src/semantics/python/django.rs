@@ -467,11 +467,7 @@ fn extract_string_list(file: &ParsedFile, list: Node) -> Option<Vec<String>> {
         }
         out.push(s.to_uppercase());
     }
-    if out.is_empty() {
-        None
-    } else {
-        Some(out)
-    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 fn is_inside_class_definition(node: Node) -> bool {

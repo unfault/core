@@ -16,9 +16,9 @@ pub use model::RustFileSemantics;
 use anyhow::Result;
 
 use crate::parse::ast::ParsedFile;
+use crate::semantics::common::CommonLocation;
 use crate::semantics::common::calls::FunctionCall;
 use crate::semantics::common::db::{DbLibrary, DbOperation, DbOperationType};
-use crate::semantics::common::CommonLocation;
 
 /// Build the semantic model for a single Rust file.
 ///

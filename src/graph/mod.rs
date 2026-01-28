@@ -15,18 +15,19 @@
 //! - UsesLibrary: File/function uses external library
 //! - Framework-specific edges (FastAPI routes, middlewares)
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use petgraph::Direction;
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
-use petgraph::Direction;
 use serde::{Deserialize, Serialize};
 
 use crate::parse::ast::FileId;
 use crate::semantics::common::CommonSemantics;
 use crate::semantics::go::frameworks::GoFrameworkSummary;
 use crate::semantics::go::model::GoFileSemantics;
+use crate::semantics::python::django::{DjangoFileSummary, ViewType};
 use crate::semantics::python::fastapi::FastApiFileSummary;
 use crate::semantics::python::model::PyFileSemantics;
 use crate::semantics::rust::frameworks::RustFrameworkSummary;
@@ -857,6 +858,10 @@ pub fn build_code_graph(sem_entries: &[(FileId, Arc<SourceSemantics>)]) -> CodeG
                 if let Some(fastapi) = &py.fastapi {
                     add_fastapi_nodes(&mut cg, file_node, *file_id, py, fastapi);
                 }
+
+                if let Some(django) = &py.django {
+                    add_django_route_handlers(&mut cg, file_node, *file_id, py, django);
+                }
             }
             SourceSemantics::Go(go) => {
                 // Add Go framework-specific nodes (Gin, Echo, Chi, Fiber, etc.)
@@ -877,6 +882,10 @@ pub fn build_code_graph(sem_entries: &[(FileId, Arc<SourceSemantics>)]) -> CodeG
             }
         }
     }
+
+    // Post-pass: compose cross-file router/url prefixes (best-effort).
+    apply_fastapi_cross_file_include_router_prefixes(&mut cg, sem_entries);
+    apply_django_cross_file_include_prefixes(&mut cg, sem_entries);
 
     // Third pass: add Calls edges between functions
     // First resolve intra-file calls (callee within the same file)
@@ -926,6 +935,485 @@ pub fn build_code_graph(sem_entries: &[(FileId, Arc<SourceSemantics>)]) -> CodeG
     add_cross_file_call_edges(&mut cg, sem_entries);
 
     cg
+}
+
+fn join_http_paths(prefix: &str, path: &str) -> String {
+    let mut pfx = prefix.trim().to_string();
+    let mut p = path.trim().to_string();
+
+    if pfx.is_empty() {
+        pfx = "/".to_string();
+    }
+    if p.is_empty() {
+        p = "/".to_string();
+    }
+    if !pfx.starts_with('/') {
+        pfx = format!("/{}", pfx);
+    }
+    if !p.starts_with('/') {
+        p = format!("/{}", p);
+    }
+    if pfx == "/" {
+        return p;
+    }
+    if p == "/" {
+        return pfx;
+    }
+    format!("{}{}", pfx.trim_end_matches('/'), p)
+}
+
+fn apply_fastapi_cross_file_include_router_prefixes(
+    cg: &mut CodeGraph,
+    sem_entries: &[(FileId, Arc<SourceSemantics>)],
+) {
+    // Best-effort: for `app.include_router(module.router, prefix=...)`, apply the prefix
+    // to FastAPI routes in the imported router module.
+    let mut applied: HashSet<(FileId, String, String)> = HashSet::new();
+
+    for (_file_id, sem) in sem_entries {
+        let SourceSemantics::Python(py) = sem.as_ref() else {
+            continue;
+        };
+        let Some(fastapi) = &py.fastapi else {
+            continue;
+        };
+
+        let imports = py.imports();
+        for r in &fastapi.routers {
+            let Some(prefix) = &r.prefix else {
+                continue;
+            };
+            if prefix.trim().is_empty() {
+                continue;
+            }
+
+            let router_expr = r.router_expr.trim();
+            let Some((module_alias, _attr)) = router_expr.split_once('.') else {
+                continue;
+            };
+            let module_alias = module_alias.trim();
+
+            // Resolve module alias to module path.
+            let mut target_module_path: Option<String> = None;
+            for import in &imports {
+                let matches_alias = import.module_alias.as_deref() == Some(module_alias)
+                    || import.local_module_name() == Some(module_alias);
+                if matches_alias {
+                    target_module_path = Some(import.module_path.clone());
+                    break;
+                }
+
+                // `from pkg import users` then `users.router`
+                if import.imports_item(module_alias) {
+                    for item in &import.items {
+                        if item.local_name() == module_alias {
+                            target_module_path =
+                                Some(format!("{}.{}", import.module_path, item.name));
+                            break;
+                        }
+                    }
+                    if target_module_path.is_some() {
+                        break;
+                    }
+                }
+            }
+
+            let Some(target_module_path) = target_module_path else {
+                continue;
+            };
+
+            let Some(target_file_idx) =
+                find_import_source_file_with_context(cg, &target_module_path, &py.path)
+            else {
+                continue;
+            };
+            let GraphNode::File {
+                file_id: target_file_id,
+                ..
+            } = &cg.graph[target_file_idx]
+            else {
+                continue;
+            };
+            let target_file_id = *target_file_id;
+
+            // Avoid rewriting the main app file.
+            if file_has_fastapi_app(cg, target_file_id) {
+                continue;
+            }
+
+            for node_idx in cg.graph.node_indices() {
+                let old_path = match &cg.graph[node_idx] {
+                    GraphNode::FastApiRoute { file_id, path, .. } if *file_id == target_file_id => {
+                        path.clone()
+                    }
+                    _ => continue,
+                };
+
+                let key = (target_file_id, old_path.clone(), prefix.clone());
+                if !applied.insert(key) {
+                    continue;
+                }
+
+                let new_path = join_http_paths(prefix, &old_path);
+                if let GraphNode::FastApiRoute { path, .. } = &mut cg.graph[node_idx] {
+                    *path = new_path.clone();
+                }
+
+                for func_idx in cg.graph.node_indices() {
+                    let matches = match &cg.graph[func_idx] {
+                        GraphNode::Function {
+                            file_id, http_path, ..
+                        } => *file_id == target_file_id && http_path.as_deref() == Some(&old_path),
+                        _ => false,
+                    };
+                    if !matches {
+                        continue;
+                    }
+                    if let GraphNode::Function { http_path, .. } = &mut cg.graph[func_idx] {
+                        *http_path = Some(new_path.clone());
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn file_has_fastapi_app(cg: &CodeGraph, file_id: FileId) -> bool {
+    cg.graph
+        .node_indices()
+        .any(|idx| matches!(&cg.graph[idx], GraphNode::FastApiApp { file_id: fid, .. } if *fid == file_id))
+}
+
+fn add_django_route_handlers(
+    cg: &mut CodeGraph,
+    file_node: NodeIndex,
+    file_id: FileId,
+    _py: &PyFileSemantics,
+    django: &DjangoFileSummary,
+) {
+    // Create handler nodes for class-based views so other files can reference them.
+    for v in &django.views {
+        let key = (file_id, v.name.clone());
+        if cg.function_nodes.contains_key(&key) {
+            continue;
+        }
+        if !cg.class_nodes.contains_key(&key) {
+            continue;
+        }
+
+        let start_line = v.location.range.start_line + 1;
+        let end_line = v.location.range.end_line + 1;
+        let node = cg.graph.add_node(GraphNode::Function {
+            file_id,
+            name: v.name.clone(),
+            qualified_name: v.name.clone(),
+            is_async: v.is_async,
+            is_handler: false,
+            http_method: None,
+            http_path: None,
+            start_line: Some(start_line),
+            end_line: Some(end_line),
+        });
+        cg.graph.add_edge(file_node, node, GraphEdgeKind::Contains);
+        cg.function_nodes.insert(key, node);
+    }
+}
+
+fn apply_django_cross_file_include_prefixes(
+    cg: &mut CodeGraph,
+    sem_entries: &[(FileId, Arc<SourceSemantics>)],
+) {
+    let mut django_by_file: HashMap<FileId, DjangoFileSummary> = HashMap::new();
+    let mut imports_by_file: HashMap<FileId, Vec<Import>> = HashMap::new();
+    let mut path_by_file: HashMap<FileId, String> = HashMap::new();
+
+    for (file_id, sem) in sem_entries {
+        let SourceSemantics::Python(py) = sem.as_ref() else {
+            continue;
+        };
+        if let Some(dj) = &py.django {
+            django_by_file.insert(*file_id, dj.clone());
+            imports_by_file.insert(*file_id, py.imports());
+            path_by_file.insert(*file_id, py.path.clone());
+        }
+    }
+
+    if django_by_file.is_empty() {
+        return;
+    }
+
+    let mut view_meta: HashMap<(FileId, String), String> = HashMap::new();
+    for (fid, dj) in &django_by_file {
+        for v in &dj.views {
+            view_meta.insert((*fid, v.name.clone()), v.http_method.clone());
+        }
+    }
+
+    for (root_fid, dj) in &django_by_file {
+        let mut visited: HashSet<(FileId, String)> = HashSet::new();
+        expand_django_urls(
+            cg,
+            *root_fid,
+            dj,
+            "",
+            &django_by_file,
+            &imports_by_file,
+            &path_by_file,
+            &view_meta,
+            &mut visited,
+            0,
+        );
+    }
+}
+
+fn expand_django_urls(
+    cg: &mut CodeGraph,
+    file_id: FileId,
+    django: &DjangoFileSummary,
+    base_prefix: &str,
+    django_by_file: &HashMap<FileId, DjangoFileSummary>,
+    imports_by_file: &HashMap<FileId, Vec<Import>>,
+    path_by_file: &HashMap<FileId, String>,
+    view_meta: &HashMap<(FileId, String), String>,
+    visited: &mut HashSet<(FileId, String)>,
+    depth: usize,
+) {
+    if depth > 6 {
+        return;
+    }
+    let visit_key = (file_id, base_prefix.to_string());
+    if !visited.insert(visit_key) {
+        return;
+    }
+
+    let imports = imports_by_file
+        .get(&file_id)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let importing_path = path_by_file.get(&file_id).map(String::as_str).unwrap_or("");
+
+    for pat in &django.urls {
+        let Some(path_part) = parse_python_string_literal(&pat.path_expr) else {
+            continue;
+        };
+        let path_part = normalize_django_path(&path_part);
+        let cur_prefix = if base_prefix.is_empty() {
+            path_part
+        } else {
+            join_http_paths(base_prefix, &path_part)
+        };
+
+        if pat.view_type == ViewType::Include {
+            if let Some(target_file_id) =
+                resolve_django_include_target_file_id(cg, imports, importing_path, &pat.view_name)
+            {
+                if let Some(target_dj) = django_by_file.get(&target_file_id) {
+                    expand_django_urls(
+                        cg,
+                        target_file_id,
+                        target_dj,
+                        &cur_prefix,
+                        django_by_file,
+                        imports_by_file,
+                        path_by_file,
+                        view_meta,
+                        visited,
+                        depth + 1,
+                    );
+                }
+            }
+            continue;
+        }
+
+        let handler = pat.view_name.trim().trim_end_matches(',');
+        let (handler_expr, is_class) = normalize_django_view_expr(handler);
+
+        if is_class {
+            if let Some((handler_file_id, class_name)) =
+                resolve_django_class_handler(cg, &handler_expr, imports, importing_path)
+            {
+                let key = (handler_file_id, class_name.clone());
+                if let Some(&func_idx) = cg.function_nodes.get(&key) {
+                    set_handler_http_metadata(cg, func_idx, view_meta.get(&key), &cur_prefix);
+                }
+            }
+        } else {
+            let callee = handler_expr
+                .rsplit('.')
+                .next()
+                .unwrap_or(handler_expr.as_str());
+            if let Some(func_idx) = resolve_call_through_imports(
+                cg,
+                callee,
+                &handler_expr,
+                None,
+                imports,
+                importing_path,
+            ) {
+                let handler_file_id = match &cg.graph[func_idx] {
+                    GraphNode::Function { file_id, .. } => *file_id,
+                    _ => file_id,
+                };
+                let key = (handler_file_id, callee.to_string());
+                set_handler_http_metadata(cg, func_idx, view_meta.get(&key), &cur_prefix);
+            }
+        }
+    }
+}
+
+fn set_handler_http_metadata(
+    cg: &mut CodeGraph,
+    func_idx: NodeIndex,
+    http_method: Option<&String>,
+    http_path: &str,
+) {
+    if let GraphNode::Function {
+        is_handler,
+        http_method: hm,
+        http_path: hp,
+        ..
+    } = &mut cg.graph[func_idx]
+    {
+        *is_handler = true;
+
+        // Prefer the most-specific (longest) composed path.
+        let replace_path = match hp.as_deref() {
+            None => true,
+            Some(existing) => http_path.len() > existing.len(),
+        };
+        if replace_path {
+            *hp = Some(http_path.to_string());
+        }
+
+        if hm.is_none() {
+            *hm = Some(http_method.cloned().unwrap_or_else(|| "ANY".to_string()));
+        }
+    }
+}
+
+fn normalize_django_path(path: &str) -> String {
+    let mut p = path.trim().to_string();
+    if p.is_empty() {
+        return "/".to_string();
+    }
+    if !p.starts_with('/') {
+        p = format!("/{}", p);
+    }
+    p
+}
+
+fn parse_python_string_literal(expr: &str) -> Option<String> {
+    let s = expr.trim();
+    let s = s
+        .strip_prefix('r')
+        .or_else(|| s.strip_prefix('R'))
+        .unwrap_or(s);
+    let s = s.trim();
+    if (s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')) {
+        return Some(s[1..s.len() - 1].to_string());
+    }
+    None
+}
+
+fn resolve_django_include_target_file_id(
+    cg: &CodeGraph,
+    imports: &[Import],
+    importing_path: &str,
+    include_expr: &str,
+) -> Option<FileId> {
+    let include_expr = include_expr.trim();
+    let inside = include_expr
+        .strip_prefix("include(")
+        .and_then(|s| s.rsplit_once(')').map(|(a, _)| a.trim()))
+        .unwrap_or(include_expr);
+
+    let mut module_path = parse_python_string_literal(inside);
+    if module_path.is_none() {
+        let token = inside.split(',').next().unwrap_or(inside).trim();
+        if token.contains('.') {
+            module_path = Some(token.to_string());
+        } else {
+            for import in imports {
+                if import.imports_item(token) {
+                    for item in &import.items {
+                        if item.local_name() == token {
+                            module_path = Some(format!("{}.{}", import.module_path, item.name));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let module_path = module_path?;
+    let file_idx = find_import_source_file_with_context(cg, &module_path, importing_path)?;
+    match &cg.graph[file_idx] {
+        GraphNode::File { file_id, .. } => Some(*file_id),
+        _ => None,
+    }
+}
+
+fn normalize_django_view_expr(view_expr: &str) -> (String, bool) {
+    let mut expr = view_expr.trim().to_string();
+    expr = expr.trim_end_matches("()").to_string();
+    if expr.contains(".as_view") {
+        let before = expr.split(".as_view").next().unwrap_or(expr.as_str());
+        return (before.trim().to_string(), true);
+    }
+    (expr, false)
+}
+
+fn resolve_django_class_handler(
+    cg: &CodeGraph,
+    class_expr: &str,
+    imports: &[Import],
+    importing_path: &str,
+) -> Option<(FileId, String)> {
+    let class_name = class_expr
+        .rsplit('.')
+        .next()
+        .unwrap_or(class_expr)
+        .to_string();
+
+    // Direct import
+    for import in imports {
+        if import.imports_item(&class_name) {
+            let source_file_idx =
+                find_import_source_file_with_context(cg, &import.module_path, importing_path)?;
+            if let GraphNode::File { file_id, .. } = &cg.graph[source_file_idx] {
+                let resolved = import
+                    .items
+                    .iter()
+                    .find(|i| i.local_name() == class_name)
+                    .map(|i| i.name.clone())
+                    .unwrap_or(class_name.clone());
+                if cg.class_nodes.contains_key(&(*file_id, resolved.clone())) {
+                    return Some((*file_id, resolved));
+                }
+            }
+        }
+    }
+
+    // Module attribute access
+    if let Some((module_alias, _)) = class_expr.split_once('.') {
+        for import in imports {
+            let matches_alias = import.module_alias.as_deref() == Some(module_alias)
+                || import.local_module_name() == Some(module_alias);
+            if !matches_alias {
+                continue;
+            }
+            let source_file_idx =
+                find_import_source_file_with_context(cg, &import.module_path, importing_path)?;
+            if let GraphNode::File { file_id, .. } = &cg.graph[source_file_idx] {
+                if cg.class_nodes.contains_key(&(*file_id, class_name.clone())) {
+                    return Some((*file_id, class_name));
+                }
+            }
+        }
+    }
+
+    None
 }
 
 /// Add cross-file Calls edges by resolving function calls through imports.
@@ -1894,8 +2382,8 @@ mod tests {
     use super::*;
     use crate::parse::ast::FileId;
     use crate::parse::python::parse_python_file;
-    use crate::semantics::python::model::PyFileSemantics;
     use crate::semantics::SourceSemantics;
+    use crate::semantics::python::model::PyFileSemantics;
     use crate::types::context::{Language, SourceFile};
 
     /// Helper to parse Python source and build semantics with framework analysis
@@ -2201,12 +2689,14 @@ async def fetch_user(user_id):
         assert!(stats.function_count >= 2);
 
         // Functions should be in lookup
-        assert!(cg
-            .function_nodes
-            .contains_key(&(file_id, "process_data".to_string())));
-        assert!(cg
-            .function_nodes
-            .contains_key(&(file_id, "fetch_user".to_string())));
+        assert!(
+            cg.function_nodes
+                .contains_key(&(file_id, "process_data".to_string()))
+        );
+        assert!(
+            cg.function_nodes
+                .contains_key(&(file_id, "fetch_user".to_string()))
+        );
     }
 
     #[test]
@@ -2239,6 +2729,74 @@ import sqlalchemy
     }
 
     #[test]
+    fn build_code_graph_composes_django_include_prefix_across_files() {
+        let (root_id, root_sem) = parse_python_with_id(
+            "project/urls.py",
+            r#"
+from django.urls import path, include
+
+urlpatterns = [
+    path('api', include('users.urls')),
+]
+"#,
+            100,
+        );
+
+        let (_users_urls_id, users_urls_sem) = parse_python_with_id(
+            "users/urls.py",
+            r#"
+from django.urls import path
+from users import views
+
+urlpatterns = [
+    path('users', views.home, name='home'),
+]
+"#,
+            101,
+        );
+
+        let (views_id, views_sem) = parse_python_with_id(
+            "users/views.py",
+            r#"
+from django.views.decorators.http import require_GET
+
+@require_GET
+def home(request):
+    return None
+"#,
+            102,
+        );
+
+        let sem_entries = vec![
+            (root_id, root_sem),
+            (FileId(101), users_urls_sem),
+            (views_id, views_sem),
+        ];
+        let cg = build_code_graph(&sem_entries);
+
+        let func_key = (views_id, "home".to_string());
+        let func_idx = cg
+            .function_nodes
+            .get(&func_key)
+            .copied()
+            .expect("home function should exist");
+
+        let GraphNode::Function {
+            is_handler,
+            http_path,
+            http_method,
+            ..
+        } = &cg.graph[func_idx]
+        else {
+            panic!("expected function node");
+        };
+
+        assert!(*is_handler);
+        assert_eq!(http_method.as_deref(), Some("GET"));
+        assert_eq!(http_path.as_deref(), Some("/api/users"));
+    }
+
+    #[test]
     fn build_code_graph_with_fastapi_app() {
         let src = r#"
 from fastapi import FastAPI
@@ -2255,6 +2813,49 @@ app = FastAPI()
 
         // Should have at least one edge (file contains app)
         assert!(cg.graph.edge_count() >= 1);
+    }
+
+    #[test]
+    fn build_code_graph_applies_cross_file_fastapi_include_router_prefix() {
+        let (main_id, main_sem) = parse_python_with_id(
+            "app/main.py",
+            r#"
+from fastapi import FastAPI
+from app.routers import users
+
+app = FastAPI()
+app.include_router(users.router, prefix='/api')
+"#,
+            200,
+        );
+
+        let (users_id, users_sem) = parse_python_with_id(
+            "app/routers/users.py",
+            r#"
+from fastapi import APIRouter
+
+router = APIRouter()
+
+@router.get('/health')
+def health():
+    return 'ok'
+"#,
+            201,
+        );
+
+        let sem_entries = vec![(main_id, main_sem), (users_id, users_sem)];
+        let cg = build_code_graph(&sem_entries);
+
+        let mut found = false;
+        for idx in cg.graph.node_indices() {
+            if let GraphNode::FastApiRoute { file_id, path, .. } = &cg.graph[idx] {
+                if *file_id == users_id {
+                    assert_eq!(path, "/api/health");
+                    found = true;
+                }
+            }
+        }
+        assert!(found);
     }
 
     #[test]
@@ -2831,12 +3432,14 @@ def bar():
         // Verify lookups are restored
         assert!(cg.file_nodes.contains_key(&file_id));
         assert!(cg.path_to_file.contains_key("test.py"));
-        assert!(cg
-            .function_nodes
-            .contains_key(&(file_id, "my_func".to_string())));
-        assert!(cg
-            .class_nodes
-            .contains_key(&(file_id, "MyClass".to_string())));
+        assert!(
+            cg.function_nodes
+                .contains_key(&(file_id, "my_func".to_string()))
+        );
+        assert!(
+            cg.class_nodes
+                .contains_key(&(file_id, "MyClass".to_string()))
+        );
         assert!(cg.external_modules.contains_key("requests"));
     }
 
@@ -2940,12 +3543,14 @@ def main():
         let cg = build_code_graph(&sem_entries);
 
         // Both functions should exist
-        assert!(cg
-            .function_nodes
-            .contains_key(&(helper_id, "helper_func".to_string())));
-        assert!(cg
-            .function_nodes
-            .contains_key(&(main_id, "main".to_string())));
+        assert!(
+            cg.function_nodes
+                .contains_key(&(helper_id, "helper_func".to_string()))
+        );
+        assert!(
+            cg.function_nodes
+                .contains_key(&(main_id, "main".to_string()))
+        );
 
         // Check that there's an import edge from main.py to helpers.py
         let stats = cg.stats();
@@ -3217,12 +3822,14 @@ def main():
         let cg = build_code_graph(&sem_entries);
 
         // Verify both functions exist
-        assert!(cg
-            .function_nodes
-            .contains_key(&(utils_id, "add".to_string())));
-        assert!(cg
-            .function_nodes
-            .contains_key(&(app_id, "main".to_string())));
+        assert!(
+            cg.function_nodes
+                .contains_key(&(utils_id, "add".to_string()))
+        );
+        assert!(
+            cg.function_nodes
+                .contains_key(&(app_id, "main".to_string()))
+        );
 
         // Key assertion: There should be a Calls edge from main() to add()
         let stats = cg.stats();
@@ -3295,12 +3902,14 @@ def process(db):
         let cg = build_code_graph(&sem_entries);
 
         // Verify both functions exist
-        assert!(cg
-            .function_nodes
-            .contains_key(&(file_id, "add".to_string())));
-        assert!(cg
-            .function_nodes
-            .contains_key(&(file_id, "process".to_string())));
+        assert!(
+            cg.function_nodes
+                .contains_key(&(file_id, "add".to_string()))
+        );
+        assert!(
+            cg.function_nodes
+                .contains_key(&(file_id, "process".to_string()))
+        );
 
         // Get the function nodes
         let add_func_idx = cg

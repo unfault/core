@@ -231,26 +231,48 @@ fn extract_url_from_expr(
 }
 
 fn detect_env_var_name_ts(parsed: &ParsedFile, expr: &tree_sitter::Node) -> Option<String> {
-    // process.env.FOO
+    // process.env.FOO / Bun.env.FOO / import.meta.env.VITE_FOO
     if expr.kind() == "member_expression" {
         let object = expr.child_by_field_name("object")?;
         let property = expr.child_by_field_name("property")?;
-        if is_process_env_object(parsed, &object) {
+
+        if is_process_env_object(parsed, &object)
+            || is_bun_env_object(parsed, &object)
+            || is_import_meta_env_object(parsed, &object)
+        {
             return Some(parsed.text_for_node(&property));
         }
     }
 
-    // process.env["FOO"]
+    // process.env["FOO"] / Bun.env["FOO"] / import.meta.env["VITE_FOO"]
     if expr.kind() == "subscript_expression" {
         let object = expr.child_by_field_name("object")?;
         let index = expr.child_by_field_name("index")?;
-        if is_process_env_object(parsed, &object) && index.kind() == "string" {
+        if index.kind() == "string"
+            && (is_process_env_object(parsed, &object)
+                || is_bun_env_object(parsed, &object)
+                || is_import_meta_env_object(parsed, &object))
+        {
             let idx = parsed.text_for_node(&index);
             return Some(
                 idx.trim()
                     .trim_matches(|c| c == '\'' || c == '"')
                     .to_string(),
             );
+        }
+    }
+
+    // Deno.env.get("FOO")
+    if expr.kind() == "call_expression" {
+        let func = expr.child_by_field_name("function")?;
+        let callee_norm = normalize_ts_chain(parsed.text_for_node(&func).as_str());
+        if callee_norm == "Deno.env.get" {
+            let args = expr.child_by_field_name("arguments")?;
+            let first = args.named_child(0)?;
+            if first.kind() == "string" {
+                let s = parsed.text_for_node(&first);
+                return Some(s.trim().trim_matches(|c| c == '\'' || c == '"').to_string());
+            }
         }
     }
 
@@ -271,6 +293,31 @@ fn is_process_env_object(parsed: &ParsedFile, expr: &tree_sitter::Node) -> bool 
         None => return false,
     };
     parsed.text_for_node(&object) == "process" && parsed.text_for_node(&property) == "env"
+}
+
+fn is_bun_env_object(parsed: &ParsedFile, expr: &tree_sitter::Node) -> bool {
+    // Bun.env
+    if expr.kind() != "member_expression" {
+        return false;
+    }
+    let object = match expr.child_by_field_name("object") {
+        Some(o) => o,
+        None => return false,
+    };
+    let property = match expr.child_by_field_name("property") {
+        Some(p) => p,
+        None => return false,
+    };
+    parsed.text_for_node(&object) == "Bun" && parsed.text_for_node(&property) == "env"
+}
+
+fn is_import_meta_env_object(parsed: &ParsedFile, expr: &tree_sitter::Node) -> bool {
+    // import.meta.env
+    normalize_ts_chain(parsed.text_for_node(expr).as_str()) == "import.meta.env"
+}
+
+fn normalize_ts_chain(s: &str) -> String {
+    s.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
 fn detect_client_and_method(callee: &str) -> Option<(HttpClientKind, String)> {
@@ -530,6 +577,39 @@ mod tests {
             .clone()
             .expect("url_expr should be present");
         assert_eq!(expr.kind, HttpUrlExprKind::Member);
+        assert_eq!(expr.env_var, Some("API_URL".to_string()));
+    }
+
+    #[test]
+    fn extracts_import_meta_env_url_expr_member() {
+        let calls = parse_and_summarize("fetch(import.meta.env.VITE_API_URL);");
+        assert_eq!(calls.len(), 1);
+        let expr = calls[0]
+            .url_expr
+            .clone()
+            .expect("url_expr should be present");
+        assert_eq!(expr.env_var, Some("VITE_API_URL".to_string()));
+    }
+
+    #[test]
+    fn extracts_bun_env_url_expr_member() {
+        let calls = parse_and_summarize("fetch(Bun.env.API_URL);");
+        assert_eq!(calls.len(), 1);
+        let expr = calls[0]
+            .url_expr
+            .clone()
+            .expect("url_expr should be present");
+        assert_eq!(expr.env_var, Some("API_URL".to_string()));
+    }
+
+    #[test]
+    fn extracts_deno_env_get_call() {
+        let calls = parse_and_summarize("fetch(Deno.env.get('API_URL'));");
+        assert_eq!(calls.len(), 1);
+        let expr = calls[0]
+            .url_expr
+            .clone()
+            .expect("url_expr should be present");
         assert_eq!(expr.env_var, Some("API_URL".to_string()));
     }
 

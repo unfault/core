@@ -99,8 +99,8 @@ fn convert_http_call_site(
     crate::semantics::common::http::HttpCall {
         library,
         method,
-        url: None,
-        url_expr: None,
+        url: site.url_literal,
+        url_expr: site.url_expr,
         has_timeout: site.has_timeout,
         timeout_value: site.timeout_value,
         retry_mechanism: None,
@@ -2286,6 +2286,20 @@ mod tests {
     }
 
     #[test]
+    fn http_calls_extract_env_var_into_common_http_call() {
+        let src = r#"
+async fn f() {
+    client.get(std::env::var("API_URL").unwrap()).send().await;
+}
+"#;
+        let sem = parse_and_build_semantics(src);
+        assert_eq!(sem.http_calls.len(), 1);
+        let call = &sem.http_calls[0];
+        let expr = call.url_expr.clone().expect("url_expr should be present");
+        assert_eq!(expr.env_var, Some("API_URL".to_string()));
+    }
+
+    #[test]
     fn detects_async_functions() {
         let src = r#"
 async fn fetch_data() -> Result<String, Error> {
@@ -2492,13 +2506,13 @@ async fn fetch_data() -> Result<String, reqwest::Error> {
     fn rust_http_calls_via_common_semantics() {
         use crate::semantics::common::CommonSemantics;
 
-        let src = r#"
+        let src = r##"
 use reqwest;
 
 async fn fetch() -> Result<String, reqwest::Error> {
     reqwest::Client::new().get("https://example.com").send().await?.text().await
 }
-"#;
+"##;
         let sem = parse_and_build_semantics(src);
 
         // Verify via CommonSemantics trait

@@ -4,8 +4,11 @@
 //! detecting patterns using reqwest, ureq, hyper, and other libraries.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 use crate::parse::ast::{AstLocation, ParsedFile};
+
+use crate::semantics::common::http::{HttpUrlExpr, HttpUrlExprKind};
 
 /// Rust HTTP client library classification
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -37,6 +40,12 @@ pub struct HttpCallSite {
     /// HTTP method name (get, post, put, etc.)
     pub method_name: String,
 
+    /// URL if statically determinable as a literal.
+    pub url_literal: Option<String>,
+
+    /// URL expression metadata when the URL is not a literal.
+    pub url_expr: Option<HttpUrlExpr>,
+
     /// Full text of the call expression
     pub call_text: String,
 
@@ -66,8 +75,17 @@ pub struct HttpCallSite {
 /// Build a list of HTTP client calls in this Rust file.
 pub fn summarize_http_clients(file: &ParsedFile) -> Vec<HttpCallSite> {
     let root = file.tree.root_node();
+    let const_string_bindings = collect_string_const_bindings(file, root);
     let mut calls = Vec::new();
-    collect_http_calls(file, root, &mut calls, None, false, None);
+    collect_http_calls(
+        file,
+        root,
+        &mut calls,
+        None,
+        false,
+        None,
+        &const_string_bindings,
+    );
     calls
 }
 
@@ -85,6 +103,7 @@ fn collect_http_calls(
     ctx: Option<HttpCallContext>,
     has_await: bool,
     _parent_fn: Option<String>,
+    const_string_bindings: &HashMap<String, String>,
 ) {
     let ctx = ctx.unwrap_or_default();
 
@@ -103,16 +122,16 @@ fn collect_http_calls(
         new_ctx.current_function = name;
         new_ctx.in_async_fn = is_async;
 
-        walk_http_calls(file, node, out, &new_ctx, false);
+        walk_http_calls(file, node, out, &new_ctx, false, const_string_bindings);
         return;
     }
 
     if node.kind() == "await_expression" {
-        walk_http_calls(file, node, out, &ctx, true);
+        walk_http_calls(file, node, out, &ctx, true, const_string_bindings);
         return;
     }
 
-    walk_http_calls(file, node, out, &ctx, has_await);
+    walk_http_calls(file, node, out, &ctx, has_await, const_string_bindings);
 }
 
 fn walk_http_calls(
@@ -121,13 +140,14 @@ fn walk_http_calls(
     out: &mut Vec<HttpCallSite>,
     ctx: &HttpCallContext,
     has_await: bool,
+    const_string_bindings: &HashMap<String, String>,
 ) {
     if super::is_inline_test_subtree_root(file, &node) {
         return;
     }
 
     if node.kind() == "call_expression" {
-        if let Some(call) = extract_http_call(file, &node, ctx, has_await) {
+        if let Some(call) = extract_http_call(file, &node, ctx, has_await, const_string_bindings) {
             out.push(call);
             return;
         }
@@ -147,7 +167,7 @@ fn walk_http_calls(
         let child_count = node.child_count();
         for i in 0..child_count {
             if let Some(child) = node.child(i) {
-                walk_http_calls(file, child, out, &new_ctx, false);
+                walk_http_calls(file, child, out, &new_ctx, false, const_string_bindings);
             }
         }
         return;
@@ -157,7 +177,7 @@ fn walk_http_calls(
         let child_count = node.child_count();
         for i in 0..child_count {
             if let Some(child) = node.child(i) {
-                walk_http_calls(file, child, out, ctx, true);
+                walk_http_calls(file, child, out, ctx, true, const_string_bindings);
             }
         }
         return;
@@ -166,7 +186,7 @@ fn walk_http_calls(
     let child_count = node.child_count();
     for i in 0..child_count {
         if let Some(child) = node.child(i) {
-            walk_http_calls(file, child, out, ctx, has_await);
+            walk_http_calls(file, child, out, ctx, has_await, const_string_bindings);
         }
     }
 }
@@ -177,6 +197,7 @@ fn extract_http_call(
     node: &tree_sitter::Node,
     ctx: &HttpCallContext,
     has_await: bool,
+    const_string_bindings: &HashMap<String, String>,
 ) -> Option<HttpCallSite> {
     let func_node = node.child_by_field_name("function")?;
     let callee_expr = file.text_for_node(&func_node);
@@ -190,24 +211,28 @@ fn extract_http_call(
         let location = file.location_for_node(node);
         let byte_range = node.byte_range();
 
-        let (http_method, client_kind) = if value_node.kind() == "call_expression" {
-            extract_http_method_and_client(file, &value_node)
-        } else {
-            let object = file.text_for_node(&value_node);
-            let client = detect_client_kind(&object, &callee_expr)?;
-            (method_name.clone(), client)
-        };
+        let (http_method, client_kind, url_literal, url_expr) =
+            if value_node.kind() == "call_expression" {
+                extract_http_method_client_and_url(file, &value_node, const_string_bindings)
+            } else {
+                let object = file.text_for_node(&value_node);
+                let client = detect_client_kind(&object, &callee_expr)?;
+                let (url_literal, url_expr) =
+                    extract_url_from_first_arg(file, node, const_string_bindings);
+                (method_name.clone(), client, url_literal, url_expr)
+            };
 
         if http_method.is_empty() {
             return None;
         }
 
-        let _args_node = node.child_by_field_name("arguments");
         let (has_timeout, timeout_value) = detect_timeout_in_chain(file, node);
 
         return Some(HttpCallSite {
             client_kind,
             method_name: http_method,
+            url_literal,
+            url_expr,
             call_text,
             has_timeout,
             timeout_value,
@@ -230,9 +255,14 @@ fn extract_http_call(
             let byte_range = node.byte_range();
             let (has_timeout, timeout_value) = detect_timeout(&call_text);
 
+            let (url_literal, url_expr) =
+                extract_url_from_first_arg(file, node, const_string_bindings);
+
             return Some(HttpCallSite {
                 client_kind: HttpClientKind::ReqwestBlocking,
                 method_name,
+                url_literal,
+                url_expr,
                 call_text,
                 has_timeout,
                 timeout_value,
@@ -258,9 +288,14 @@ fn extract_http_call(
                 let byte_range = node.byte_range();
                 let (has_timeout, timeout_value) = detect_timeout(&call_text);
 
+                let (url_literal, url_expr) =
+                    extract_url_from_first_arg(file, node, const_string_bindings);
+
                 return Some(HttpCallSite {
                     client_kind: HttpClientKind::Ureq,
                     method_name,
+                    url_literal,
+                    url_expr,
                     call_text,
                     has_timeout,
                     timeout_value,
@@ -278,13 +313,240 @@ fn extract_http_call(
     None
 }
 
-fn extract_http_method_and_client(
+fn collect_string_const_bindings(
+    file: &ParsedFile,
+    root: tree_sitter::Node,
+) -> HashMap<String, String> {
+    let mut out: HashMap<String, String> = HashMap::new();
+
+    fn walk(file: &ParsedFile, node: tree_sitter::Node, out: &mut HashMap<String, String>) {
+        if node.kind() == "const_item" {
+            let name = node
+                .child_by_field_name("name")
+                .map(|n| file.text_for_node(&n));
+            let value_node = node.child_by_field_name("value");
+            let mut value = value_node.and_then(|n| extract_string_literal_rust(file, &n));
+
+            // Fallback: scan for a direct string literal under the const item.
+            if value.is_none() {
+                value = first_string_literal_in_subtree(file, node);
+            }
+
+            if let (Some(k), Some(v)) = (name, value) {
+                out.insert(k, v);
+            }
+        }
+
+        let child_count = node.child_count();
+        for i in 0..child_count {
+            if let Some(child) = node.child(i) {
+                walk(file, child, out);
+            }
+        }
+    }
+
+    walk(file, root, &mut out);
+    out
+}
+
+fn extract_url_from_first_arg(
+    file: &ParsedFile,
+    call: &tree_sitter::Node,
+    const_string_bindings: &HashMap<String, String>,
+) -> (Option<String>, Option<HttpUrlExpr>) {
+    let args = match call.child_by_field_name("arguments") {
+        Some(a) => a,
+        None => return (None, None),
+    };
+    let first = match args.named_child(0) {
+        Some(a) => a,
+        None => return (None, None),
+    };
+    extract_url_from_expr(file, &first, const_string_bindings)
+}
+
+fn extract_url_from_expr(
+    file: &ParsedFile,
+    expr: &tree_sitter::Node,
+    const_string_bindings: &HashMap<String, String>,
+) -> (Option<String>, Option<HttpUrlExpr>) {
+    // Unwrap references and parentheses.
+    if expr.kind() == "reference_expression" {
+        if let Some(v) = expr.child_by_field_name("value") {
+            return extract_url_from_expr(file, &v, const_string_bindings);
+        }
+    }
+    if expr.kind() == "parenthesized_expression" {
+        // First named child should be the inner expression.
+        if let Some(inner) = expr.named_child(0) {
+            return extract_url_from_expr(file, &inner, const_string_bindings);
+        }
+    }
+
+    if let Some(lit) = extract_string_literal_rust(file, expr) {
+        return (Some(lit), None);
+    }
+
+    let env_var = detect_env_var_name_rust_deep(file, *expr, const_string_bindings);
+    let kind = match expr.kind() {
+        "identifier" => HttpUrlExprKind::Identifier,
+        "field_expression" => HttpUrlExprKind::Member,
+        "call_expression" => HttpUrlExprKind::Call,
+        "macro_invocation" => macro_invocation_kind(file, expr),
+        _ => HttpUrlExprKind::Unknown,
+    };
+
+    let text = file.text_for_node(expr).trim().to_string();
+    (
+        None,
+        Some(HttpUrlExpr {
+            text,
+            kind,
+            env_var,
+        }),
+    )
+}
+
+fn macro_invocation_kind(file: &ParsedFile, node: &tree_sitter::Node) -> HttpUrlExprKind {
+    let name = node
+        .child_by_field_name("macro")
+        .map(|n| file.text_for_node(&n))
+        .unwrap_or_default();
+    match name.as_str() {
+        "format" | "format_args" | "concat" => HttpUrlExprKind::Template,
+        _ => HttpUrlExprKind::Call,
+    }
+}
+
+fn extract_string_literal_rust(file: &ParsedFile, node: &tree_sitter::Node) -> Option<String> {
+    // tree-sitter-rust uses string_literal and raw_string_literal.
+    if node.kind() != "string_literal" && node.kind() != "raw_string_literal" {
+        return None;
+    }
+
+    let raw = file.text_for_node(node);
+    let text = raw.trim();
+    if node.kind() == "string_literal" {
+        return Some(text.trim_matches('"').to_string());
+    }
+
+    // Raw string literals look like: r"...", r#"..."#, r##"..."##, ...
+    let mut s = text;
+    if let Some(rest) = s.strip_prefix('r') {
+        s = rest;
+    }
+    let hash_count = s.chars().take_while(|c| *c == '#').count();
+    s = &s[hash_count..];
+    s = s.strip_prefix('"').unwrap_or(s);
+
+    // Strip trailing hashes then the closing quote.
+    let suffix = "#".repeat(hash_count);
+    if hash_count > 0 {
+        if let Some(rest) = s.strip_suffix(&suffix) {
+            s = rest;
+        }
+    }
+    s = s.strip_suffix('"').unwrap_or(s);
+
+    Some(s.to_string())
+}
+
+fn first_string_literal_in_subtree(file: &ParsedFile, node: tree_sitter::Node) -> Option<String> {
+    if let Some(lit) = extract_string_literal_rust(file, &node) {
+        return Some(lit);
+    }
+    let child_count = node.child_count();
+    for i in 0..child_count {
+        if let Some(child) = node.child(i) {
+            if let Some(lit) = first_string_literal_in_subtree(file, child) {
+                return Some(lit);
+            }
+        }
+    }
+    None
+}
+
+fn detect_env_var_name_rust_deep(
+    file: &ParsedFile,
+    node: tree_sitter::Node,
+    const_string_bindings: &HashMap<String, String>,
+) -> Option<String> {
+    if let Some(v) = detect_env_var_name_rust(file, node, const_string_bindings) {
+        return Some(v);
+    }
+    let child_count = node.child_count();
+    for i in 0..child_count {
+        if let Some(child) = node.child(i) {
+            if let Some(v) = detect_env_var_name_rust_deep(file, child, const_string_bindings) {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+fn detect_env_var_name_rust(
+    file: &ParsedFile,
+    node: tree_sitter::Node,
+    const_string_bindings: &HashMap<String, String>,
+) -> Option<String> {
+    // env!("FOO") / option_env!("FOO")
+    if node.kind() == "macro_invocation" {
+        let name = node
+            .child_by_field_name("macro")
+            .map(|n| file.text_for_node(&n))
+            .unwrap_or_default();
+        if name == "env" || name == "option_env" {
+            return first_string_literal_in_subtree(file, node);
+        }
+    }
+
+    if node.kind() != "call_expression" {
+        return None;
+    }
+
+    let func_node = node.child_by_field_name("function")?;
+    let callee = file.text_for_node(&func_node);
+    let callee_norm: String = callee.chars().filter(|c| !c.is_whitespace()).collect();
+
+    let is_env_var_call = callee_norm.ends_with("env::var")
+        || callee_norm.ends_with("env::var_os")
+        || callee_norm.ends_with("dotenv::var")
+        || callee_norm.ends_with("dotenvy::var")
+        || callee_norm.ends_with("dotenv::var_os")
+        || callee_norm.ends_with("dotenvy::var_os");
+    if !is_env_var_call {
+        return None;
+    }
+
+    let args = node.child_by_field_name("arguments")?;
+    let key_expr = args.named_child(0)?;
+    if let Some(k) = extract_string_literal_rust(file, &key_expr) {
+        return Some(k);
+    }
+    if key_expr.kind() == "identifier" {
+        let k = file.text_for_node(&key_expr);
+        if let Some(v) = const_string_bindings.get(&k) {
+            return Some(v.clone());
+        }
+    }
+
+    None
+}
+
+fn extract_http_method_client_and_url(
     file: &ParsedFile,
     node: &tree_sitter::Node,
-) -> (String, HttpClientKind) {
+    const_string_bindings: &HashMap<String, String>,
+) -> (String, HttpClientKind, Option<String>, Option<HttpUrlExpr>) {
     let func_node = node.child_by_field_name("function");
     if func_node.is_none() {
-        return ("".to_string(), HttpClientKind::Other("unknown".to_string()));
+        return (
+            "".to_string(),
+            HttpClientKind::Other("unknown".to_string()),
+            None,
+            None,
+        );
     }
     let func_node = func_node.unwrap();
 
@@ -292,7 +554,12 @@ fn extract_http_method_and_client(
         let value_node = func_node.child_by_field_name("value");
         let field_node = func_node.child_by_field_name("field");
         if value_node.is_none() || field_node.is_none() {
-            return ("".to_string(), HttpClientKind::Other("unknown".to_string()));
+            return (
+                "".to_string(),
+                HttpClientKind::Other("unknown".to_string()),
+                None,
+                None,
+            );
         }
 
         let inner_method = file.text_for_node(&field_node.unwrap());
@@ -302,16 +569,28 @@ fn extract_http_method_and_client(
         let client_kind = detect_client_kind(&object, &callee_expr);
         if let Some(kind) = client_kind {
             if is_http_method(&inner_method) {
-                return (inner_method, kind);
+                let (url_literal, url_expr) =
+                    extract_url_from_first_arg(file, node, const_string_bindings);
+                return (inner_method, kind, url_literal, url_expr);
             }
             if value_node.unwrap().kind() == "call_expression" {
-                return extract_http_method_and_client(file, &value_node.unwrap());
+                return extract_http_method_client_and_url(
+                    file,
+                    &value_node.unwrap(),
+                    const_string_bindings,
+                );
             }
-            return (inner_method, kind);
+            let (url_literal, url_expr) =
+                extract_url_from_first_arg(file, node, const_string_bindings);
+            return (inner_method, kind, url_literal, url_expr);
         }
 
         if value_node.unwrap().kind() == "call_expression" {
-            return extract_http_method_and_client(file, &value_node.unwrap());
+            return extract_http_method_client_and_url(
+                file,
+                &value_node.unwrap(),
+                const_string_bindings,
+            );
         }
     }
 
@@ -320,7 +599,14 @@ fn extract_http_method_and_client(
 
         if path_text.contains("reqwest::blocking::") {
             let method_name = extract_method_from_blocking_call(&path_text);
-            return (method_name, HttpClientKind::ReqwestBlocking);
+            let (url_literal, url_expr) =
+                extract_url_from_first_arg(file, node, const_string_bindings);
+            return (
+                method_name,
+                HttpClientKind::ReqwestBlocking,
+                url_literal,
+                url_expr,
+            );
         }
 
         if path_text.starts_with("ureq::") {
@@ -329,11 +615,18 @@ fn extract_http_method_and_client(
                 .and_then(|s| s.split('(').next())
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| path_text.to_string());
-            return (method_name, HttpClientKind::Ureq);
+            let (url_literal, url_expr) =
+                extract_url_from_first_arg(file, node, const_string_bindings);
+            return (method_name, HttpClientKind::Ureq, url_literal, url_expr);
         }
     }
 
-    ("".to_string(), HttpClientKind::Other("unknown".to_string()))
+    (
+        "".to_string(),
+        HttpClientKind::Other("unknown".to_string()),
+        None,
+        None,
+    )
 }
 
 /// Detect the HTTP client library from the object expression
@@ -547,6 +840,57 @@ mod tests {
         let calls = parse_and_summarize_http("client.get(\"https://example.com\")");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].method_name, "get");
+        assert_eq!(
+            calls[0].url_literal,
+            Some("https://example.com".to_string())
+        );
+        assert!(calls[0].url_expr.is_none());
+    }
+
+    #[test]
+    fn extracts_env_var_from_std_env_var_literal() {
+        let src = r#"
+ async fn f() {
+     client.get(std::env::var("API_URL").unwrap()).send().await;
+ }
+ "#;
+        let calls = parse_and_summarize_http(src);
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].url_literal.is_none());
+        let expr = calls[0]
+            .url_expr
+            .clone()
+            .expect("url_expr should be present");
+        assert_eq!(expr.env_var, Some("API_URL".to_string()));
+    }
+
+    #[test]
+    fn extracts_env_var_from_env_macro() {
+        let calls = parse_and_summarize_http("client.get(env!(\"API_URL\"))");
+        assert_eq!(calls.len(), 1);
+        let expr = calls[0]
+            .url_expr
+            .clone()
+            .expect("url_expr should be present");
+        assert_eq!(expr.env_var, Some("API_URL".to_string()));
+    }
+
+    #[test]
+    fn extracts_env_var_from_std_env_var_via_const_binding() {
+        let src = r#"
+ const API_URL_KEY: &str = "API_URL";
+
+fn f() {
+    client.get(std::env::var(API_URL_KEY).unwrap());
+}
+ "#;
+        let calls = parse_and_summarize_http(src);
+        assert_eq!(calls.len(), 1);
+        let expr = calls[0]
+            .url_expr
+            .clone()
+            .expect("url_expr should be present");
+        assert_eq!(expr.env_var, Some("API_URL".to_string()));
     }
 
     #[test]

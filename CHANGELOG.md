@@ -4,12 +4,16 @@ All notable changes to `unfault-core` will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
-## [0.1.11] - 2026-01-28
+## [Unreleased]
 
 ### Added
 - Cross-language URL env-var extraction for HTTP calls (Go: `os.Getenv`, Rust: `std::env::var`/`env!`, TypeScript: `process.env`/`import.meta.env`/`Bun.env`/`Deno.env.get`).
 - Go/Rust HTTP URL literal + expression metadata for client callsites.
 - Language support audit document: `docs/language-support-audit.md`.
+
+## [0.1.11] - 2026-01-28
+
+- Extend support on env var detection
 
 ## [0.1.7] - 2026-01-15
 
@@ -58,3 +62,4 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 [0.1.1]: https://github.com/unfault/core/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/unfault/core/releases/tag/v0.1.0
 [0.1.11]: https://github.com/unfault/core/compare/v0.1.7...v0.1.11
+[Unreleased]: https://github.com/unfault/core/compare/v0.1.11...main

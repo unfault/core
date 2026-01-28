@@ -107,9 +107,8 @@ pub struct RustRouteScope {
 pub fn extract_rust_routes(parsed: &ParsedFile) -> RustFrameworkSummary {
     let mut summary = RustFrameworkSummary::default();
 
-    // Detect framework from use statements
-    let source = &parsed.source;
-    summary.framework = detect_framework(source);
+    // Detect framework from AST (prefer over raw text heuristics)
+    summary.framework = detect_framework(parsed);
 
     if summary.framework.is_none() {
         return summary;
@@ -191,27 +190,118 @@ fn extract_rocket_routes_list(text: &str) -> Vec<String> {
 }
 
 /// Detect which Rust HTTP framework is being used based on imports.
-fn detect_framework(source: &str) -> Option<RustFrameworkType> {
-    // Check use statements in order of popularity
-    if source.contains("use axum::") || source.contains("axum::Router") {
+fn detect_framework(parsed: &ParsedFile) -> Option<RustFrameworkType> {
+    let root = parsed.tree.root_node();
+
+    let mut has_axum = false;
+    let mut has_actix = false;
+    let mut has_rocket = false;
+    let mut has_warp = false;
+    let mut has_poem = false;
+    let mut has_tide = false;
+
+    fn mark_from_text(
+        text: &str,
+        has_axum: &mut bool,
+        has_actix: &mut bool,
+        has_rocket: &mut bool,
+        has_warp: &mut bool,
+        has_poem: &mut bool,
+        has_tide: &mut bool,
+    ) {
+        let t: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+        if t.contains("axum::") {
+            *has_axum = true;
+        }
+        if t.contains("actix_web::") {
+            *has_actix = true;
+        }
+        if t.contains("warp::") {
+            *has_warp = true;
+        }
+        if t.contains("poem::") {
+            *has_poem = true;
+        }
+        if t.contains("tide::") {
+            *has_tide = true;
+        }
+
+        // Rocket is trickier because `#[get("/")]` is also common in actix-web.
+        // Only treat it as Rocket if we see Rocket namespacing or launch/build usage.
+        if t.contains("rocket::") || t.contains("#[rocket::") || t.contains("#[launch]") {
+            *has_rocket = true;
+        }
+    }
+
+    fn walk(
+        parsed: &ParsedFile,
+        node: tree_sitter::Node,
+        has_axum: &mut bool,
+        has_actix: &mut bool,
+        has_rocket: &mut bool,
+        has_warp: &mut bool,
+        has_poem: &mut bool,
+        has_tide: &mut bool,
+    ) {
+        if super::is_inline_test_subtree_root(parsed, &node) {
+            return;
+        }
+
+        match node.kind() {
+            "use_declaration" | "scoped_identifier" | "path_expression" | "attribute_item" => {
+                mark_from_text(
+                    &parsed.text_for_node(&node),
+                    has_axum,
+                    has_actix,
+                    has_rocket,
+                    has_warp,
+                    has_poem,
+                    has_tide,
+                );
+            }
+            _ => {}
+        }
+
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i) {
+                walk(
+                    parsed, child, has_axum, has_actix, has_rocket, has_warp, has_poem, has_tide,
+                );
+            }
+        }
+    }
+
+    walk(
+        parsed,
+        root,
+        &mut has_axum,
+        &mut has_actix,
+        &mut has_rocket,
+        &mut has_warp,
+        &mut has_poem,
+        &mut has_tide,
+    );
+
+    // Choose in order of popularity.
+    if has_axum {
         return Some(RustFrameworkType::Axum);
     }
-    if source.contains("use actix_web::") || source.contains("actix_web::") {
+    if has_actix {
         return Some(RustFrameworkType::ActixWeb);
     }
-    if source.contains("use rocket::") || source.contains("#[rocket::") || source.contains("#[get(")
-    {
+    if has_rocket {
         return Some(RustFrameworkType::Rocket);
     }
-    if source.contains("use warp::") || source.contains("warp::Filter") {
+    if has_warp {
         return Some(RustFrameworkType::Warp);
     }
-    if source.contains("use poem::") || source.contains("poem::Route") {
+    if has_poem {
         return Some(RustFrameworkType::Poem);
     }
-    if source.contains("use tide::") {
+    if has_tide {
         return Some(RustFrameworkType::Tide);
     }
+
     None
 }
 
@@ -917,6 +1007,20 @@ fn main() {
     }
 
     #[test]
+    fn detects_axum_framework_without_use_stmt() {
+        let src = r#"
+async fn handler() -> &'static str { "Hello" }
+
+fn main() {
+    let app = axum::Router::new().route("/", axum::routing::get(handler));
+    let _ = app;
+}
+"#;
+        let summary = parse_and_extract(src);
+        assert_eq!(summary.framework, Some(RustFrameworkType::Axum));
+    }
+
+    #[test]
     fn extracts_axum_route() {
         let src = r#"
 use axum::{Router, routing::get};
@@ -957,6 +1061,17 @@ fn main() {
 use actix_web::{web, App, HttpServer};
 
 async fn handler() -> impl Responder { "Hello" }
+"#;
+        let summary = parse_and_extract(src);
+        assert_eq!(summary.framework, Some(RustFrameworkType::ActixWeb));
+    }
+
+    #[test]
+    fn detects_actix_web_framework_without_use_stmt() {
+        let src = r#"
+fn main() {
+    let _app = actix_web::App::new();
+}
 "#;
         let summary = parse_and_extract(src);
         assert_eq!(summary.framework, Some(RustFrameworkType::ActixWeb));
@@ -1094,6 +1209,18 @@ use warp::Filter;
 
 fn main() {
     let routes = warp::path("users").and(warp::get()).and_then(handler);
+}
+"#;
+        let summary = parse_and_extract(src);
+        assert_eq!(summary.framework, Some(RustFrameworkType::Warp));
+    }
+
+    #[test]
+    fn detects_warp_framework_without_use_stmt() {
+        let src = r#"
+fn main() {
+    let routes = warp::path("users").and(warp::get()).and_then(handler);
+    let _ = routes;
 }
 "#;
         let summary = parse_and_extract(src);

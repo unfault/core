@@ -86,6 +86,7 @@ pub fn summarize_http_clients(file: &ParsedFile) -> Vec<HttpCallSite> {
     let const_string_bindings = collect_string_const_bindings(file, root);
     let loop_infos = collect_loop_infos(file, root);
     let retry_client_vars = collect_retry_client_vars(file, root);
+    let http_client_vars = collect_http_client_vars(file, root);
     let mut calls = Vec::new();
     collect_http_calls(
         file,
@@ -95,6 +96,7 @@ pub fn summarize_http_clients(file: &ParsedFile) -> Vec<HttpCallSite> {
         false,
         None,
         &const_string_bindings,
+        &http_client_vars,
     );
 
     // Post-process loop context and best-effort retry detection.
@@ -188,16 +190,38 @@ fn collect_retry_client_vars(
                 if pat.kind() == "identifier" {
                     let name = file.text_for_node(&pat);
                     let v = file.text_for_node(&value);
-                    if v.contains("ClientBuilder::new")
+                    let v_norm: String = v.chars().filter(|c| !c.is_whitespace()).collect();
+
+                    // reqwest-middleware + reqwest-retry patterns
+                    if v_norm.contains("reqwest_middleware::ClientBuilder::new")
+                        || v_norm.contains("ClientBuilder::new")
+                    {
+                        if v_norm.contains("RetryTransientMiddleware")
+                            || v_norm.contains("reqwest_retry::")
+                            || v_norm.contains("policies::")
+                        {
+                            out.insert(
+                                name.clone(),
+                                RetryMechanism::Middleware("reqwest-retry".to_string()),
+                            );
+                        }
+                    }
+
+                    if out.contains_key(&name) {
+                        // already classified
+                    } else if v.contains("ClientBuilder::new")
                         && (v.contains("Retry")
                             || v.contains("reqwest_retry")
                             || v.contains("retry"))
                     {
                         out.insert(
-                            name,
+                            name.clone(),
                             RetryMechanism::Middleware("reqwest-middleware".to_string()),
                         );
-                    } else if v.contains("tower::retry") || v.contains("RetryLayer") {
+                    } else if v_norm.contains("tower::retry")
+                        || v_norm.contains("RetryLayer")
+                        || v_norm.contains("tower_http::retry")
+                    {
                         out.insert(name, RetryMechanism::Middleware("tower".to_string()));
                     }
                 }
@@ -253,6 +277,7 @@ fn collect_http_calls(
     has_await: bool,
     _parent_fn: Option<String>,
     const_string_bindings: &HashMap<String, String>,
+    http_client_vars: &HashMap<String, HttpClientKind>,
 ) {
     let ctx = ctx.unwrap_or_default();
 
@@ -271,16 +296,40 @@ fn collect_http_calls(
         new_ctx.current_function = name;
         new_ctx.in_async_fn = is_async;
 
-        walk_http_calls(file, node, out, &new_ctx, false, const_string_bindings);
+        walk_http_calls(
+            file,
+            node,
+            out,
+            &new_ctx,
+            false,
+            const_string_bindings,
+            http_client_vars,
+        );
         return;
     }
 
     if node.kind() == "await_expression" {
-        walk_http_calls(file, node, out, &ctx, true, const_string_bindings);
+        walk_http_calls(
+            file,
+            node,
+            out,
+            &ctx,
+            true,
+            const_string_bindings,
+            http_client_vars,
+        );
         return;
     }
 
-    walk_http_calls(file, node, out, &ctx, has_await, const_string_bindings);
+    walk_http_calls(
+        file,
+        node,
+        out,
+        &ctx,
+        has_await,
+        const_string_bindings,
+        http_client_vars,
+    );
 }
 
 fn walk_http_calls(
@@ -290,13 +339,21 @@ fn walk_http_calls(
     ctx: &HttpCallContext,
     has_await: bool,
     const_string_bindings: &HashMap<String, String>,
+    http_client_vars: &HashMap<String, HttpClientKind>,
 ) {
     if super::is_inline_test_subtree_root(file, &node) {
         return;
     }
 
     if node.kind() == "call_expression" {
-        if let Some(call) = extract_http_call(file, &node, ctx, has_await, const_string_bindings) {
+        if let Some(call) = extract_http_call(
+            file,
+            &node,
+            ctx,
+            has_await,
+            const_string_bindings,
+            http_client_vars,
+        ) {
             out.push(call);
             return;
         }
@@ -316,7 +373,15 @@ fn walk_http_calls(
         let child_count = node.child_count();
         for i in 0..child_count {
             if let Some(child) = node.child(i) {
-                walk_http_calls(file, child, out, &new_ctx, false, const_string_bindings);
+                walk_http_calls(
+                    file,
+                    child,
+                    out,
+                    &new_ctx,
+                    false,
+                    const_string_bindings,
+                    http_client_vars,
+                );
             }
         }
         return;
@@ -326,7 +391,15 @@ fn walk_http_calls(
         let child_count = node.child_count();
         for i in 0..child_count {
             if let Some(child) = node.child(i) {
-                walk_http_calls(file, child, out, ctx, true, const_string_bindings);
+                walk_http_calls(
+                    file,
+                    child,
+                    out,
+                    ctx,
+                    true,
+                    const_string_bindings,
+                    http_client_vars,
+                );
             }
         }
         return;
@@ -335,7 +408,15 @@ fn walk_http_calls(
     let child_count = node.child_count();
     for i in 0..child_count {
         if let Some(child) = node.child(i) {
-            walk_http_calls(file, child, out, ctx, has_await, const_string_bindings);
+            walk_http_calls(
+                file,
+                child,
+                out,
+                ctx,
+                has_await,
+                const_string_bindings,
+                http_client_vars,
+            );
         }
     }
 }
@@ -347,6 +428,7 @@ fn extract_http_call(
     ctx: &HttpCallContext,
     has_await: bool,
     const_string_bindings: &HashMap<String, String>,
+    http_client_vars: &HashMap<String, HttpClientKind>,
 ) -> Option<HttpCallSite> {
     let func_node = node.child_by_field_name("function")?;
     let callee_expr = file.text_for_node(&func_node);
@@ -362,10 +444,15 @@ fn extract_http_call(
 
         let (http_method, client_kind, url_literal, url_expr) =
             if value_node.kind() == "call_expression" {
-                extract_http_method_client_and_url(file, &value_node, const_string_bindings)
+                extract_http_method_client_and_url(
+                    file,
+                    &value_node,
+                    const_string_bindings,
+                    http_client_vars,
+                )
             } else {
                 let object = file.text_for_node(&value_node);
-                let client = detect_client_kind(&object, &callee_expr)?;
+                let client = detect_client_kind(&object, &callee_expr, http_client_vars)?;
                 let (url_literal, url_expr) =
                     extract_url_from_first_arg(file, node, const_string_bindings);
                 (method_name.clone(), client, url_literal, url_expr)
@@ -693,6 +780,7 @@ fn extract_http_method_client_and_url(
     file: &ParsedFile,
     node: &tree_sitter::Node,
     const_string_bindings: &HashMap<String, String>,
+    http_client_vars: &HashMap<String, HttpClientKind>,
 ) -> (String, HttpClientKind, Option<String>, Option<HttpUrlExpr>) {
     let func_node = node.child_by_field_name("function");
     if func_node.is_none() {
@@ -721,7 +809,7 @@ fn extract_http_method_client_and_url(
         let callee_expr = file.text_for_node(&func_node);
         let object = file.text_for_node(&value_node.unwrap());
 
-        let client_kind = detect_client_kind(&object, &callee_expr);
+        let client_kind = detect_client_kind(&object, &callee_expr, http_client_vars);
         if let Some(kind) = client_kind {
             if is_http_method(&inner_method) {
                 let (url_literal, url_expr) =
@@ -733,6 +821,7 @@ fn extract_http_method_client_and_url(
                     file,
                     &value_node.unwrap(),
                     const_string_bindings,
+                    http_client_vars,
                 );
             }
             let (url_literal, url_expr) =
@@ -745,6 +834,7 @@ fn extract_http_method_client_and_url(
                 file,
                 &value_node.unwrap(),
                 const_string_bindings,
+                http_client_vars,
             );
         }
     }
@@ -784,13 +874,31 @@ fn extract_http_method_client_and_url(
     )
 }
 
-/// Detect the HTTP client library from the object expression
-fn detect_client_kind(object: &str, callee_expr: &str) -> Option<HttpClientKind> {
+/// Detect the HTTP client library from the object expression.
+///
+/// This intentionally prefers known bindings over name-based heuristics to
+/// reduce false positives from non-HTTP receivers like `HashMap::get()`.
+fn detect_client_kind(
+    object: &str,
+    callee_expr: &str,
+    http_client_vars: &HashMap<String, HttpClientKind>,
+) -> Option<HttpClientKind> {
+    if let Some(kind) = http_client_vars.get(object) {
+        return Some(kind.clone());
+    }
+
+    // Field receivers like `self.client` where the struct field is typed as a client.
+    if let Some((_, field)) = object.rsplit_once('.') {
+        let key = format!("__field__:{}", field);
+        if let Some(kind) = http_client_vars.get(&key) {
+            return Some(kind.clone());
+        }
+    }
+
     // Reqwest patterns
     if object == "reqwest"
         || callee_expr.contains("reqwest::Client")
         || callee_expr.contains("reqwest::blocking::Client")
-        || object.contains("client")
     {
         // Check if it's the blocking API
         if callee_expr.contains("blocking::") {
@@ -825,6 +933,80 @@ fn detect_client_kind(object: &str, callee_expr: &str) -> Option<HttpClientKind>
     }
 
     None
+}
+
+fn collect_http_client_vars(
+    file: &ParsedFile,
+    root: tree_sitter::Node,
+) -> HashMap<String, HttpClientKind> {
+    let mut out: HashMap<String, HttpClientKind> = HashMap::new();
+
+    const FIELD_PREFIX: &str = "__field__:";
+
+    fn walk(file: &ParsedFile, node: tree_sitter::Node, out: &mut HashMap<String, HttpClientKind>) {
+        if super::is_inline_test_subtree_root(file, &node) {
+            return;
+        }
+
+        // Struct fields like `client: reqwest::Client`
+        if node.kind() == "field_declaration" {
+            let name = node
+                .child_by_field_name("name")
+                .map(|n| file.text_for_node(&n));
+            let ty = node
+                .child_by_field_name("type")
+                .map(|n| file.text_for_node(&n))
+                .unwrap_or_default();
+            let ty_norm: String = ty.chars().filter(|c| !c.is_whitespace()).collect();
+
+            if let Some(name) = name {
+                if ty_norm.contains("reqwest::blocking::Client") {
+                    out.insert(
+                        format!("{}{}", FIELD_PREFIX, name),
+                        HttpClientKind::ReqwestBlocking,
+                    );
+                } else if ty_norm.contains("reqwest::Client")
+                    || ty_norm.contains("reqwest_middleware::Client")
+                    || ty_norm.contains("reqwest_middleware::ClientWithMiddleware")
+                {
+                    out.insert(format!("{}{}", FIELD_PREFIX, name), HttpClientKind::Reqwest);
+                }
+            }
+        }
+
+        // best-effort: `let client = reqwest::Client::new();`
+        if node.kind() == "let_declaration" {
+            let pat = node.child_by_field_name("pattern");
+            let value = node.child_by_field_name("value");
+            if let (Some(pat), Some(value)) = (pat, value) {
+                if pat.kind() == "identifier" {
+                    let name = file.text_for_node(&pat);
+                    let v = file.text_for_node(&value);
+                    let v_norm: String = v.chars().filter(|c| !c.is_whitespace()).collect();
+
+                    if v_norm.contains("reqwest::blocking::Client::new")
+                        || v_norm.contains("reqwest::blocking::ClientBuilder::new")
+                    {
+                        out.insert(name, HttpClientKind::ReqwestBlocking);
+                    } else if v_norm.contains("reqwest::Client::new")
+                        || v_norm.contains("reqwest::ClientBuilder::new")
+                        || v_norm.contains("reqwest_middleware::ClientBuilder::new")
+                    {
+                        out.insert(name, HttpClientKind::Reqwest);
+                    }
+                }
+            }
+        }
+
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i) {
+                walk(file, child, out);
+            }
+        }
+    }
+
+    walk(file, root, &mut out);
+    out
 }
 
 /// Check if a string is an HTTP method name
@@ -941,9 +1123,19 @@ mod tests {
 
     #[test]
     fn detects_reqwest_client() {
-        let calls = parse_and_summarize_http("client.get(\"https://example.com\")");
+        let calls = parse_and_summarize_http(
+            "let client = reqwest::Client::new(); client.get(\"https://example.com\")",
+        );
         assert_eq!(calls.len(), 1);
         assert!(matches!(calls[0].client_kind, HttpClientKind::Reqwest));
+    }
+
+    #[test]
+    fn does_not_false_positive_on_hashmap_get() {
+        let calls = parse_and_summarize_http(
+            "let client = std::collections::HashMap::<String,String>::new(); client.get(\"k\")",
+        );
+        assert_eq!(calls.len(), 0);
     }
 
     #[test]
@@ -992,7 +1184,9 @@ mod tests {
 
     #[test]
     fn captures_get_method() {
-        let calls = parse_and_summarize_http("client.get(\"https://example.com\")");
+        let calls = parse_and_summarize_http(
+            "let client = reqwest::Client::new(); client.get(\"https://example.com\")",
+        );
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].method_name, "get");
         assert_eq!(
@@ -1006,6 +1200,7 @@ mod tests {
     fn extracts_env_var_from_std_env_var_literal() {
         let src = r#"
  async fn f() {
+     let client = reqwest::Client::new();
      client.get(std::env::var("API_URL").unwrap()).send().await;
  }
  "#;
@@ -1021,7 +1216,9 @@ mod tests {
 
     #[test]
     fn extracts_env_var_from_env_macro() {
-        let calls = parse_and_summarize_http("client.get(env!(\"API_URL\"))");
+        let calls = parse_and_summarize_http(
+            "let client = reqwest::Client::new(); client.get(env!(\"API_URL\"))",
+        );
         assert_eq!(calls.len(), 1);
         let expr = calls[0]
             .url_expr
@@ -1036,6 +1233,7 @@ mod tests {
  const API_URL_KEY: &str = "API_URL";
 
 fn f() {
+    let client = reqwest::Client::new();
     client.get(std::env::var(API_URL_KEY).unwrap());
 }
  "#;
@@ -1050,28 +1248,36 @@ fn f() {
 
     #[test]
     fn captures_post_method() {
-        let calls = parse_and_summarize_http("client.post(\"https://example.com\")");
+        let calls = parse_and_summarize_http(
+            "let client = reqwest::Client::new(); client.post(\"https://example.com\")",
+        );
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].method_name, "post");
     }
 
     #[test]
     fn captures_put_method() {
-        let calls = parse_and_summarize_http("client.put(\"https://example.com\")");
+        let calls = parse_and_summarize_http(
+            "let client = reqwest::Client::new(); client.put(\"https://example.com\")",
+        );
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].method_name, "put");
     }
 
     #[test]
     fn captures_patch_method() {
-        let calls = parse_and_summarize_http("client.patch(\"https://example.com\")");
+        let calls = parse_and_summarize_http(
+            "let client = reqwest::Client::new(); client.patch(\"https://example.com\")",
+        );
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].method_name, "patch");
     }
 
     #[test]
     fn captures_delete_method() {
-        let calls = parse_and_summarize_http("client.delete(\"https://example.com\")");
+        let calls = parse_and_summarize_http(
+            "let client = reqwest::Client::new(); client.delete(\"https://example.com\")",
+        );
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].method_name, "delete");
     }
@@ -1081,7 +1287,8 @@ fn f() {
     #[test]
     fn detects_timeout_with_duration() {
         let calls = parse_and_summarize_http(
-            r#"client.get("https://example.com")
+            r#"let client = reqwest::Client::new();
+                client.get("https://example.com")
                 .timeout(Duration::from_secs(30))"#,
         );
         assert_eq!(calls.len(), 1);
@@ -1092,7 +1299,8 @@ fn f() {
     #[test]
     fn detects_timeout_with_millis() {
         let calls = parse_and_summarize_http(
-            r#"client.get("https://example.com")
+            r#"let client = reqwest::Client::new();
+                client.get("https://example.com")
                 .timeout(Duration::from_millis(5000))"#,
         );
         assert_eq!(calls.len(), 1);
@@ -1102,7 +1310,9 @@ fn f() {
 
     #[test]
     fn detects_missing_timeout() {
-        let calls = parse_and_summarize_http("client.get(\"https://example.com\")");
+        let calls = parse_and_summarize_http(
+            "let client = reqwest::Client::new(); client.get(\"https://example.com\")",
+        );
         assert_eq!(calls.len(), 1);
         assert!(!calls[0].has_timeout);
     }
@@ -1113,6 +1323,7 @@ fn f() {
     fn captures_enclosing_function_name() {
         let src = r#"
 async fn fetch_data() -> Result<String, reqwest::Error> {
+    let client = reqwest::Client::new();
     client.get("https://example.com").send().await?.text().await
 }
 "#;
@@ -1126,6 +1337,7 @@ async fn fetch_data() -> Result<String, reqwest::Error> {
     fn detects_await_on_call() {
         let src = r#"
 async fn fetch_data() -> Result<String, reqwest::Error> {
+    let client = reqwest::Client::new();
     client.get("https://example.com").await?.text().await
 }
 "#;
@@ -1136,7 +1348,9 @@ async fn fetch_data() -> Result<String, reqwest::Error> {
 
     #[test]
     fn module_level_call_has_no_function_name() {
-        let calls = parse_and_summarize_http("let response = client.get(\"https://example.com\");");
+        let calls = parse_and_summarize_http(
+            "let client = reqwest::Client::new(); let response = client.get(\"https://example.com\");",
+        );
         assert_eq!(calls.len(), 1);
         assert!(calls[0].function_name.is_none());
     }
@@ -1147,6 +1361,7 @@ async fn fetch_data() -> Result<String, reqwest::Error> {
     fn collects_multiple_http_calls() {
         let src = r#"
 async fn fetch_all() {
+    let client = reqwest::Client::new();
     let a = client.get("https://example.com/a").await?;
     let b = client.post("https://example.com/b").await?;
     let c = client.delete("https://example.com/c").await?;
@@ -1160,6 +1375,7 @@ async fn fetch_all() {
     fn collects_calls_from_different_functions() {
         let src = r#"
 async fn func_a() {
+    let client = reqwest::Client::new();
     client.get("https://example.com/a").await?;
 }
 
@@ -1195,6 +1411,27 @@ fn func_b() {
     fn ignores_non_http_calls() {
         let calls = parse_and_summarize_http("println!(\"hello\")");
         assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn detects_retry_middleware_on_client_binding() {
+        let src = r#"
+fn f() {
+    let client = reqwest_middleware::ClientBuilder::new(reqwest::Client::new())
+        .with(reqwest_retry::RetryTransientMiddleware::new_with_policy(
+            reqwest_retry::policies::ExponentialBackoff::builder().build_with_max_retries(3),
+        ))
+        .build();
+
+    client.get(\"https://example.com\");
+}
+"#;
+        let calls = parse_and_summarize_http(src);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].retry_mechanism,
+            Some(RetryMechanism::Middleware("reqwest-retry".to_string()))
+        );
     }
 
     #[test]

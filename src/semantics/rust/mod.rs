@@ -16,9 +16,9 @@ pub use model::RustFileSemantics;
 use anyhow::Result;
 
 use crate::parse::ast::ParsedFile;
-use crate::semantics::common::CommonLocation;
 use crate::semantics::common::calls::FunctionCall;
 use crate::semantics::common::db::{DbLibrary, DbOperation, DbOperationType};
+use crate::semantics::common::CommonLocation;
 
 /// Build the semantic model for a single Rust file.
 ///
@@ -2289,6 +2289,7 @@ mod tests {
     fn http_calls_extract_env_var_into_common_http_call() {
         let src = r#"
 async fn f() {
+    let client = reqwest::Client::new();
     client.get(std::env::var("API_URL").unwrap()).send().await;
 }
 "#;

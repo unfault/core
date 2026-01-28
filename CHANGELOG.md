@@ -4,6 +4,10 @@ All notable changes to `unfault-core` will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.1.11] - 2026-01-28
+
+- Extend support on env var detection
+
 ## [0.1.7] - 2026-01-15
 
 - Add missing license file

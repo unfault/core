@@ -4,9 +4,9 @@ All notable changes to `unfault-core` will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
-## [0.1.13]
+## [Unreleased]
 
-### Added
+## [0.1.13] - 2026-01-29
 
 ### Fixed
 

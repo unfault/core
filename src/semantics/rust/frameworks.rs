@@ -1368,14 +1368,17 @@ fn main() {
         assert_eq!(summary.framework, Some(RustFrameworkType::ActixWeb));
         assert_eq!(summary.routes.len(), 2);
 
-        assert!(summary
-            .routes
-            .iter()
-            .any(|r| r.method == "GET" && r.path == "/users" && r.handler_name == "list_users"));
-        assert!(summary
-            .routes
-            .iter()
-            .any(|r| r.method == "POST" && r.path == "/users" && r.handler_name == "create_user"));
+        assert!(
+            summary
+                .routes
+                .iter()
+                .any(|r| r.method == "GET" && r.path == "/users" && r.handler_name == "list_users")
+        );
+        assert!(
+            summary.routes.iter().any(|r| r.method == "POST"
+                && r.path == "/users"
+                && r.handler_name == "create_user")
+        );
     }
 
     #[test]
@@ -1504,14 +1507,18 @@ fn main() {
         assert_eq!(summary.framework, Some(RustFrameworkType::Rocket));
         assert_eq!(summary.routes.len(), 2);
 
-        assert!(summary
-            .routes
-            .iter()
-            .any(|r| r.path == "/api/health" && r.scope_prefix.as_deref() == Some("/api")));
-        assert!(summary
-            .routes
-            .iter()
-            .any(|r| r.path == "/v1/users" && r.scope_prefix.as_deref() == Some("/v1")));
+        assert!(
+            summary
+                .routes
+                .iter()
+                .any(|r| r.path == "/api/health" && r.scope_prefix.as_deref() == Some("/api"))
+        );
+        assert!(
+            summary
+                .routes
+                .iter()
+                .any(|r| r.path == "/v1/users" && r.scope_prefix.as_deref() == Some("/v1"))
+        );
     }
 
     #[test]
@@ -1530,10 +1537,11 @@ fn main() {
         let summary = parse_and_extract(src);
         assert_eq!(summary.framework, Some(RustFrameworkType::Tide));
         assert_eq!(summary.routes.len(), 2);
-        assert!(summary
-            .routes
-            .iter()
-            .any(|r| r.method == "GET" && r.path == "/users/:id" && r.handler_name == "get_user"));
+        assert!(
+            summary.routes.iter().any(|r| r.method == "GET"
+                && r.path == "/users/:id"
+                && r.handler_name == "get_user")
+        );
         assert!(summary.routes.iter().any(|r| r.method == "POST"
             && r.path == "/users/:id"
             && r.handler_name == "update_user"));
@@ -1554,14 +1562,17 @@ fn main() {
         let summary = parse_and_extract(src);
         assert_eq!(summary.framework, Some(RustFrameworkType::Poem));
         assert_eq!(summary.routes.len(), 2);
-        assert!(summary
-            .routes
-            .iter()
-            .any(|r| r.method == "GET" && r.path == "/users" && r.handler_name == "list_users"));
-        assert!(summary
-            .routes
-            .iter()
-            .any(|r| r.method == "POST" && r.path == "/users" && r.handler_name == "create_user"));
+        assert!(
+            summary
+                .routes
+                .iter()
+                .any(|r| r.method == "GET" && r.path == "/users" && r.handler_name == "list_users")
+        );
+        assert!(
+            summary.routes.iter().any(|r| r.method == "POST"
+                && r.path == "/users"
+                && r.handler_name == "create_user")
+        );
     }
 
     #[test]
@@ -1639,10 +1650,12 @@ fn main() {
         assert_eq!(summary.framework, Some(RustFrameworkType::Axum));
         assert_eq!(summary.routes.len(), 3);
 
-        assert!(summary
-            .routes
-            .iter()
-            .any(|r| r.method == "GET" && r.path == "/" && r.handler_name == "index"));
+        assert!(
+            summary
+                .routes
+                .iter()
+                .any(|r| r.method == "GET" && r.path == "/" && r.handler_name == "index")
+        );
         assert!(summary.routes.iter().any(|r| {
             r.method == "GET" && r.path == "/api/recipes" && r.handler_name == "get_recipes"
         }));

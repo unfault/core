@@ -4,11 +4,12 @@ All notable changes to `unfault-core` will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
-## [Unreleased]
+## [0.1.13]
 
 ### Added
 
 ### Fixed
+
 - Rust route extraction: correctly handle chained builder calls (Axum `.route(...)`, Actix `.route(...)`, Rocket `.mount(...)`, Tide `.at(...).get(...).post(...)`, Poem `.at(..., get(...).post(...))`).
 - Rust route handlers: populate HTTP metadata on existing function nodes and add a best-effort synthetic `Calls` edge from the registrar (typically `main`) to the handler for impact analysis.
 

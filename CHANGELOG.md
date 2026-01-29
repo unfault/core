@@ -8,9 +8,9 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [0.1.14] - 2026-01-29
 
-### Changed
+### Fixed
 
-- Bump version
+- Rust HTTP detection: detect chained `reqwest::Client::new().post(url)` patterns for outbound fault injection cards.
 
 ## [0.1.13] - 2026-01-29
 

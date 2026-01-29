@@ -442,21 +442,50 @@ fn extract_http_call(
         let location = file.location_for_node(node);
         let byte_range = node.byte_range();
 
-        let (http_method, client_kind, url_literal, url_expr) =
-            if value_node.kind() == "call_expression" {
+        let (http_method, client_kind, url_literal, url_expr) = if value_node.kind()
+            == "call_expression"
+        {
+            // Check if this is a chained pattern like reqwest::Client::new().post(url)
+            // In this case, method_name is the HTTP method (post), and we need to
+            // detect the client from the inner call expression.
+            let (inner_method, inner_client, inner_url_literal, inner_url_expr) =
                 extract_http_method_client_and_url(
                     file,
                     &value_node,
                     const_string_bindings,
                     http_client_vars,
-                )
-            } else {
-                let object = file.text_for_node(&value_node);
-                let client = detect_client_kind(&object, &callee_expr, http_client_vars)?;
+                );
+
+            // If the outer method is an HTTP method and inner returned a client,
+            // use the outer method with the inner client.
+            if is_http_method(&method_name) && !matches!(inner_client, HttpClientKind::Other(_)) {
                 let (url_literal, url_expr) =
                     extract_url_from_first_arg(file, node, const_string_bindings);
-                (method_name.clone(), client, url_literal, url_expr)
-            };
+                (method_name.clone(), inner_client, url_literal, url_expr)
+            } else if is_http_method(&inner_method) {
+                // Inner call has the HTTP method (e.g., client.get(url).send())
+                (
+                    inner_method,
+                    inner_client,
+                    inner_url_literal,
+                    inner_url_expr,
+                )
+            } else {
+                // Fall back to using whatever we got
+                (
+                    inner_method,
+                    inner_client,
+                    inner_url_literal,
+                    inner_url_expr,
+                )
+            }
+        } else {
+            let object = file.text_for_node(&value_node);
+            let client = detect_client_kind(&object, &callee_expr, http_client_vars)?;
+            let (url_literal, url_expr) =
+                extract_url_from_first_arg(file, node, const_string_bindings);
+            (method_name.clone(), client, url_literal, url_expr)
+        };
 
         if http_method.is_empty() {
             return None;
@@ -854,6 +883,13 @@ fn extract_http_method_client_and_url(
             );
         }
 
+        // Detect reqwest::Client::new() or reqwest::Client::builder() patterns
+        // These return a client, not an HTTP method, so we return empty method
+        // and the caller can use this to detect the client type.
+        if path_text.contains("reqwest::Client::") {
+            return ("".to_string(), HttpClientKind::Reqwest, None, None);
+        }
+
         if path_text.starts_with("ureq::") {
             let method_name = path_text
                 .strip_prefix("ureq::")
@@ -1128,6 +1164,43 @@ mod tests {
         );
         assert_eq!(calls.len(), 1);
         assert!(matches!(calls[0].client_kind, HttpClientKind::Reqwest));
+    }
+
+    #[test]
+    fn detects_reqwest_client_new_chained_post() {
+        // Test the pattern: reqwest::Client::new().post(url)
+        let calls =
+            parse_and_summarize_http(r#"reqwest::Client::new().post("https://example.com")"#);
+        assert_eq!(
+            calls.len(),
+            1,
+            "Should detect chained reqwest::Client::new().post()"
+        );
+        assert!(matches!(calls[0].client_kind, HttpClientKind::Reqwest));
+        assert_eq!(calls[0].method_name, "post");
+    }
+
+    #[test]
+    fn detects_reqwest_client_new_chained_with_format() {
+        // Test the real-world pattern from rustee
+        let src = r#"
+async fn get_recipe() {
+    let remote_host = std::env::var("RECIPE_API_HOST").unwrap_or_else(|_| "http://localhost:8080".to_string());
+    let _ = reqwest::Client::new()
+        .post(format!("{}/api/recipe", remote_host))
+        .json(&serde_json::json!({ "recipe_id": "123" }))
+        .send()
+        .await;
+}
+"#;
+        let calls = parse_and_summarize_http(src);
+        assert_eq!(
+            calls.len(),
+            1,
+            "Should detect reqwest::Client::new().post(format!(...))"
+        );
+        assert!(matches!(calls[0].client_kind, HttpClientKind::Reqwest));
+        assert_eq!(calls[0].method_name, "post");
     }
 
     #[test]

@@ -18,9 +18,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use petgraph::Direction;
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
+use petgraph::Direction;
 use serde::{Deserialize, Serialize};
 
 use crate::parse::ast::FileId;
@@ -2340,40 +2340,114 @@ fn add_rust_framework_nodes(
     _rs: &RustFileSemantics,
     framework: &RustFrameworkSummary,
 ) {
-    // Routes - create function nodes with HTTP metadata
+    // Routes - create function nodes with HTTP metadata.
+    //
+    // Note: Rust frameworks often register handlers by passing them as values
+    // (e.g. `.route("/x", get(handler))`), which does not show up as a direct
+    // `handler()` call in the call graph. For impact analysis, we add a
+    // best-effort synthetic Calls edge from the enclosing function (typically
+    // `main`) to the handler.
+    let mut added_registration_edges: HashSet<(NodeIndex, NodeIndex)> = HashSet::new();
+
+    fn find_enclosing_function_by_line(
+        cg: &CodeGraph,
+        file_id: FileId,
+        line_1_based: u32,
+    ) -> Option<NodeIndex> {
+        let mut best: Option<(NodeIndex, u32)> = None;
+        for idx in cg.graph.node_indices() {
+            let (fid, start, end) = match &cg.graph[idx] {
+                GraphNode::Function {
+                    file_id,
+                    start_line: Some(s),
+                    end_line: Some(e),
+                    ..
+                } => (*file_id, *s, *e),
+                _ => continue,
+            };
+            if fid != file_id {
+                continue;
+            }
+            if line_1_based < start || line_1_based > end {
+                continue;
+            }
+            let span = end.saturating_sub(start);
+            match best {
+                None => best = Some((idx, span)),
+                Some((_, best_span)) if span < best_span => best = Some((idx, span)),
+                _ => {}
+            }
+        }
+        if let Some((idx, _)) = best {
+            return Some(idx);
+        }
+
+        // Fallback: route registrations are commonly in `fn main()`.
+        cg.function_nodes
+            .get(&(file_id, "main".to_string()))
+            .copied()
+    }
+
     for route in &framework.routes {
         let handler_name = route.handler_name.clone();
 
-        // Skip if this function was already added by add_function_nodes
-        if cg
-            .function_nodes
-            .contains_key(&(file_id, handler_name.clone()))
-        {
-            // We could update the existing node, but for simplicity we skip
-            continue;
+        let route_line = route.location.range.start_line + 1; // Convert to 1-based
+
+        let func_key = (file_id, handler_name.clone());
+        let func_node = if let Some(&existing) = cg.function_nodes.get(&func_key) {
+            // Update existing function node with HTTP metadata.
+            if let GraphNode::Function {
+                is_handler,
+                http_method,
+                http_path,
+                ..
+            } = &mut cg.graph[existing]
+            {
+                *is_handler = true;
+                if http_method.is_none() {
+                    *http_method = Some(route.method.clone());
+                }
+                if http_path.is_none() {
+                    *http_path = Some(route.path.clone());
+                }
+            }
+            existing
+        } else {
+            let start_line = route.location.range.start_line + 1; // Convert to 1-based
+            let end_line = route.location.range.end_line + 1;
+
+            let func_node = cg.graph.add_node(GraphNode::Function {
+                file_id,
+                name: handler_name.clone(),
+                qualified_name: handler_name.clone(),
+                is_async: route.is_async,
+                is_handler: true,
+                http_method: Some(route.method.clone()),
+                http_path: Some(route.path.clone()),
+                start_line: Some(start_line),
+                end_line: Some(end_line),
+            });
+
+            // File contains function
+            cg.graph
+                .add_edge(file_node, func_node, GraphEdgeKind::Contains);
+
+            // Store for lookup (needed for call resolution)
+            cg.function_nodes.insert((file_id, handler_name), func_node);
+
+            func_node
+        };
+
+        // Best-effort: add a synthetic call edge from the registering function to the handler.
+        if let Some(registrar) = find_enclosing_function_by_line(cg, file_id, route_line) {
+            if registrar != func_node {
+                let key = (registrar, func_node);
+                if added_registration_edges.insert(key) {
+                    cg.graph
+                        .add_edge(registrar, func_node, GraphEdgeKind::Calls);
+                }
+            }
         }
-
-        let start_line = route.location.range.start_line + 1; // Convert to 1-based
-        let end_line = route.location.range.end_line + 1;
-
-        let func_node = cg.graph.add_node(GraphNode::Function {
-            file_id,
-            name: handler_name.clone(),
-            qualified_name: handler_name.clone(),
-            is_async: route.is_async,
-            is_handler: true,
-            http_method: Some(route.method.clone()),
-            http_path: Some(route.path.clone()),
-            start_line: Some(start_line),
-            end_line: Some(end_line),
-        });
-
-        // File contains function
-        cg.graph
-            .add_edge(file_node, func_node, GraphEdgeKind::Contains);
-
-        // Store for lookup (needed for call resolution)
-        cg.function_nodes.insert((file_id, handler_name), func_node);
     }
 }
 
@@ -2382,8 +2456,10 @@ mod tests {
     use super::*;
     use crate::parse::ast::FileId;
     use crate::parse::python::parse_python_file;
-    use crate::semantics::SourceSemantics;
+    use crate::parse::rust::parse_rust_file;
     use crate::semantics::python::model::PyFileSemantics;
+    use crate::semantics::rust::build_rust_semantics;
+    use crate::semantics::SourceSemantics;
     use crate::types::context::{Language, SourceFile};
 
     /// Helper to parse Python source and build semantics with framework analysis
@@ -2415,6 +2491,18 @@ mod tests {
         (file_id, Arc::new(SourceSemantics::Python(sem)))
     }
 
+    fn parse_rust_and_build_semantics(path: &str, source: &str) -> (FileId, Arc<SourceSemantics>) {
+        let sf = SourceFile {
+            path: path.to_string(),
+            language: Language::Rust,
+            content: source.to_string(),
+        };
+        let file_id = FileId(1);
+        let parsed = parse_rust_file(file_id, &sf).expect("parsing should succeed");
+        let sem = build_rust_semantics(&parsed).expect("semantics should succeed");
+        (file_id, Arc::new(SourceSemantics::Rust(sem)))
+    }
+
     // ==================== CodeGraph Tests ====================
 
     #[test]
@@ -2436,6 +2524,82 @@ mod tests {
     fn code_graph_default_impl() {
         let cg = CodeGraph::default();
         assert_eq!(cg.graph.node_count(), 0);
+    }
+
+    #[test]
+    fn code_graph_updates_rust_handler_nodes_with_http_metadata() {
+        let src = r#"
+use axum::{routing::get, Router};
+
+async fn index() -> &'static str { "ok" }
+
+fn main() {
+    let _app = Router::new().route("/", get(index));
+}
+"#;
+        let (_file_id, sem) = parse_rust_and_build_semantics("src/main.rs", src);
+        let entries = vec![(FileId(1), sem)];
+
+        let graph = build_code_graph(&entries);
+
+        let mut found = false;
+        for idx in graph.graph.node_indices() {
+            if let GraphNode::Function {
+                name,
+                http_method,
+                http_path,
+                ..
+            } = &graph.graph[idx]
+            {
+                if name == "index"
+                    && http_method.as_deref() == Some("GET")
+                    && http_path.as_deref() == Some("/")
+                {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        assert!(found);
+    }
+
+    #[test]
+    fn code_graph_adds_calls_edge_from_registrar_to_rust_handler() {
+        let src = r#"
+use axum::{routing::get, Router};
+
+async fn handler() -> &'static str { "ok" }
+
+fn main() {
+    let _app = Router::new()
+        .route("/", get(handler));
+}
+"#;
+        let (_file_id, sem) = parse_rust_and_build_semantics("src/main.rs", src);
+        let entries = vec![(FileId(1), sem)];
+
+        let graph = build_code_graph(&entries);
+
+        let mut main_idx: Option<NodeIndex> = None;
+        let mut handler_idx: Option<NodeIndex> = None;
+        for idx in graph.graph.node_indices() {
+            if let GraphNode::Function { name, .. } = &graph.graph[idx] {
+                if name == "main" {
+                    main_idx = Some(idx);
+                }
+                if name == "handler" {
+                    handler_idx = Some(idx);
+                }
+            }
+        }
+        let main_idx = main_idx.expect("expected main function node");
+        let handler_idx = handler_idx.expect("expected handler function node");
+
+        let has_edge = graph
+            .graph
+            .edges(main_idx)
+            .any(|e| e.target() == handler_idx && *e.weight() == GraphEdgeKind::Calls);
+        assert!(has_edge);
     }
 
     // ==================== GraphNode Tests ====================
@@ -2689,14 +2853,12 @@ async def fetch_user(user_id):
         assert!(stats.function_count >= 2);
 
         // Functions should be in lookup
-        assert!(
-            cg.function_nodes
-                .contains_key(&(file_id, "process_data".to_string()))
-        );
-        assert!(
-            cg.function_nodes
-                .contains_key(&(file_id, "fetch_user".to_string()))
-        );
+        assert!(cg
+            .function_nodes
+            .contains_key(&(file_id, "process_data".to_string())));
+        assert!(cg
+            .function_nodes
+            .contains_key(&(file_id, "fetch_user".to_string())));
     }
 
     #[test]
@@ -3432,14 +3594,12 @@ def bar():
         // Verify lookups are restored
         assert!(cg.file_nodes.contains_key(&file_id));
         assert!(cg.path_to_file.contains_key("test.py"));
-        assert!(
-            cg.function_nodes
-                .contains_key(&(file_id, "my_func".to_string()))
-        );
-        assert!(
-            cg.class_nodes
-                .contains_key(&(file_id, "MyClass".to_string()))
-        );
+        assert!(cg
+            .function_nodes
+            .contains_key(&(file_id, "my_func".to_string())));
+        assert!(cg
+            .class_nodes
+            .contains_key(&(file_id, "MyClass".to_string())));
         assert!(cg.external_modules.contains_key("requests"));
     }
 
@@ -3543,14 +3703,12 @@ def main():
         let cg = build_code_graph(&sem_entries);
 
         // Both functions should exist
-        assert!(
-            cg.function_nodes
-                .contains_key(&(helper_id, "helper_func".to_string()))
-        );
-        assert!(
-            cg.function_nodes
-                .contains_key(&(main_id, "main".to_string()))
-        );
+        assert!(cg
+            .function_nodes
+            .contains_key(&(helper_id, "helper_func".to_string())));
+        assert!(cg
+            .function_nodes
+            .contains_key(&(main_id, "main".to_string())));
 
         // Check that there's an import edge from main.py to helpers.py
         let stats = cg.stats();
@@ -3822,14 +3980,12 @@ def main():
         let cg = build_code_graph(&sem_entries);
 
         // Verify both functions exist
-        assert!(
-            cg.function_nodes
-                .contains_key(&(utils_id, "add".to_string()))
-        );
-        assert!(
-            cg.function_nodes
-                .contains_key(&(app_id, "main".to_string()))
-        );
+        assert!(cg
+            .function_nodes
+            .contains_key(&(utils_id, "add".to_string())));
+        assert!(cg
+            .function_nodes
+            .contains_key(&(app_id, "main".to_string())));
 
         // Key assertion: There should be a Calls edge from main() to add()
         let stats = cg.stats();
@@ -3902,14 +4058,12 @@ def process(db):
         let cg = build_code_graph(&sem_entries);
 
         // Verify both functions exist
-        assert!(
-            cg.function_nodes
-                .contains_key(&(file_id, "add".to_string()))
-        );
-        assert!(
-            cg.function_nodes
-                .contains_key(&(file_id, "process".to_string()))
-        );
+        assert!(cg
+            .function_nodes
+            .contains_key(&(file_id, "add".to_string())));
+        assert!(cg
+            .function_nodes
+            .contains_key(&(file_id, "process".to_string())));
 
         // Get the function nodes
         let add_func_idx = cg

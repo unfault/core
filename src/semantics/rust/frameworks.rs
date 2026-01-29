@@ -150,13 +150,45 @@ fn collect_rocket_mounts(
 
     fn walk(parsed: &ParsedFile, node: tree_sitter::Node, out: &mut HashMap<String, String>) {
         if node.kind() == "call_expression" {
-            let text = parsed.text_for_node(&node);
-            if text.contains(".mount(") && text.contains("routes![") {
-                if let Some(prefix) = extract_string_arg(&text, ".mount(") {
-                    for name in extract_rocket_routes_list(&text) {
-                        out.insert(name, prefix.clone());
-                    }
-                }
+            // IMPORTANT: `parsed.text_for_node(&node)` may include the *entire* method-call chain
+            // (e.g. `rocket::build().mount(...).mount(...)`). Avoid string-searching.
+            let Some(func) = node.child_by_field_name("function") else {
+                return;
+            };
+            if func.kind() != "field_expression" {
+                return;
+            }
+            let Some(field) = func.child_by_field_name("field") else {
+                return;
+            };
+            if parsed.text_for_node(&field) != "mount" {
+                return;
+            }
+
+            let Some(args) = node.child_by_field_name("arguments") else {
+                return;
+            };
+            if args.named_child_count() < 2 {
+                return;
+            }
+
+            let Some(prefix_arg) = args.named_child(0) else {
+                return;
+            };
+            let Some(routes_arg) = args.named_child(1) else {
+                return;
+            };
+
+            let prefix = match extract_string_literal(&parsed.text_for_node(&prefix_arg)) {
+                Some(p) => p,
+                None => return,
+            };
+            let routes_text = parsed.text_for_node(&routes_arg);
+            if !routes_text.contains("routes![") {
+                return;
+            }
+            for name in extract_rocket_routes_list(&routes_text) {
+                out.insert(name, prefix.clone());
             }
         }
 
@@ -393,19 +425,22 @@ fn extract_axum_route(parsed: &ParsedFile, node: &tree_sitter::Node) -> Option<R
         return None;
     }
 
-    let text = parsed.text_for_node(node);
+    // Extract arguments directly from the AST.
+    //
+    // IMPORTANT: `parsed.text_for_node(node)` may include the *entire* method-call chain
+    // (e.g. `Router::new().route(...).route(...).with_state(...)`).
+    // String-searching that text will repeatedly match the first `.route(`.
+    let args = node.child_by_field_name("arguments")?;
+    let path_arg = args.named_child(0)?;
+    let mut path = extract_string_literal(&parsed.text_for_node(&path_arg))?;
 
-    // Extract path
-    let mut path = extract_string_arg(&text, ".route(")?;
+    let method_handler_arg = args.named_child(1)?;
+    let (method, handler) = extract_axum_method_handler_from_node(parsed, &method_handler_arg)?;
 
     // If this .route call is nested under `.nest("/prefix", ...)`, apply the prefix.
     if let Some(prefix) = find_enclosing_nest_prefix(parsed, node) {
         path = join_paths(&prefix, &path);
     }
-
-    // Extract method and handler
-    // Methods are get, post, put, delete, patch, head, options, trace
-    let (method, handler) = extract_axum_method_handler(&text)?;
 
     Some(RustFrameworkRoute {
         method: method.to_uppercase(),
@@ -419,26 +454,86 @@ fn extract_axum_route(parsed: &ParsedFile, node: &tree_sitter::Node) -> Option<R
     })
 }
 
-/// Extract Axum method and handler from route definition.
-fn extract_axum_method_handler(text: &str) -> Option<(String, String)> {
+/// Extract Axum method and handler from the second argument of `.route(...)`.
+///
+/// Supports patterns like `get(handler)` and `axum::routing::get(handler)`.
+fn extract_axum_method_handler_from_node(
+    parsed: &ParsedFile,
+    node: &tree_sitter::Node,
+) -> Option<(String, String)> {
     let methods = [
         "get", "post", "put", "delete", "patch", "head", "options", "trace",
     ];
 
-    for method in methods {
-        let pattern = format!("{}(", method);
-        if let Some(pos) = text.find(&pattern) {
-            // Find the handler name inside the method call
-            let after = &text[pos + pattern.len()..];
-            if let Some(end) = after.find(')') {
-                let handler = after[..end].trim().to_string();
-                // Clean up handler name (remove any additional method chaining)
-                let handler = handler.split('.').next().unwrap_or(&handler).to_string();
-                return Some((method.to_string(), handler));
-            }
+    if node.kind() != "call_expression" {
+        return None;
+    }
+
+    let call_func = node.child_by_field_name("function")?;
+    let call_func_text = parsed.text_for_node(&call_func);
+    let method = extract_last_ident(&call_func_text)?;
+    if !methods.contains(&method.as_str()) {
+        return None;
+    }
+
+    let args = node.child_by_field_name("arguments")?;
+    let handler_arg = args.named_child(0)?;
+    let handler_text = parsed.text_for_node(&handler_arg);
+    let handler = extract_last_ident(&handler_text)?;
+    Some((method, handler))
+}
+
+/// Extract the inner string content for a Rust string literal.
+///
+/// Supports normal string literals (`"/path"`) and raw string literals (`r"/path"`, `r#"/path"#`).
+fn extract_string_literal(text: &str) -> Option<String> {
+    let s = text.trim();
+    if s.is_empty() {
+        return None;
+    }
+    // Find first quote and last quote.
+    let start = s.find('"')?;
+    let end = s.rfind('"')?;
+    if end <= start {
+        return None;
+    }
+    Some(s[start + 1..end].to_string())
+}
+
+/// Extract the last identifier-like token from a Rust expression string.
+///
+/// Examples:
+/// - `axum::routing::get` -> `get`
+/// - `handlers::list_users` -> `list_users`
+/// - `list_users` -> `list_users`
+fn extract_last_ident(text: &str) -> Option<String> {
+    let s = text.trim();
+    if s.is_empty() {
+        return None;
+    }
+
+    let mut end = None;
+    for (i, ch) in s.char_indices().rev() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            end = Some(i + ch.len_utf8());
+            break;
         }
     }
-    None
+    let end = end?;
+
+    let mut start = 0;
+    for (i, ch) in s[..end].char_indices().rev() {
+        if !(ch.is_ascii_alphanumeric() || ch == '_') {
+            start = i + ch.len_utf8();
+            break;
+        }
+    }
+    let ident = &s[start..end];
+    if ident.is_empty() {
+        None
+    } else {
+        Some(ident.to_string())
+    }
 }
 
 /// Extract Axum layer/middleware from `.layer()` call.
@@ -496,31 +591,64 @@ fn extract_actix_route(
         return None;
     }
 
-    let text = parsed.text_for_node(node);
+    // Extract arguments directly from AST.
+    //
+    // IMPORTANT: `parsed.text_for_node(node)` can include the entire chained expression, so
+    // string-searching it will repeatedly match the first `.route(`.
+    let args = node.child_by_field_name("arguments")?;
+    let arg_count = args.named_child_count();
 
-    if text.contains("web::") {
-        let mut path = extract_string_arg(&text, ".route(")
-            .or_else(|| extract_string_arg(&text, "web::resource("))?;
-        let scope_prefix = extract_string_arg(&text, "web::scope(")
-            .or_else(|| find_enclosing_actix_scope_prefix(parsed, node));
-        if let Some(ref pfx) = scope_prefix {
-            path = join_paths(pfx, &path);
+    // Actix handler expression is either:
+    // - `.route("/path", web::get().to(handler))` (2 args)
+    // - `web::resource("/path").route(web::get().to(handler))` (1 arg)
+    let (path, handler_expr) = if arg_count >= 2 {
+        let path_arg = args.named_child(0)?;
+        let handler_arg = args.named_child(1)?;
+        (
+            extract_string_literal(&parsed.text_for_node(&path_arg))?,
+            handler_arg,
+        )
+    } else if arg_count == 1 {
+        let handler_arg = args.named_child(0)?;
+
+        // For resource routes, get the path from the receiver call (web::resource("/path")).
+        let receiver = func
+            .child_by_field_name("value")
+            .or_else(|| func.child_by_field_name("object"))
+            .or_else(|| func.child_by_field_name("argument"))?;
+        if receiver.kind() != "call_expression" {
+            return None;
         }
-        let (method, handler) = extract_actix_method_handler(&text)?;
+        let recv_args = receiver.child_by_field_name("arguments")?;
+        let recv_path_arg = recv_args.named_child(0)?;
+        let recv_path = extract_string_literal(&parsed.text_for_node(&recv_path_arg))?;
+        (recv_path, handler_arg)
+    } else {
+        return None;
+    };
 
-        return Some(RustFrameworkRoute {
-            method: method.to_uppercase(),
-            path,
-            handler_name: handler,
-            is_async: true,
-            scope_prefix,
-            location: parsed.location_for_node(node),
-            start_byte: node.start_byte(),
-            end_byte: node.end_byte(),
-        });
-    }
+    // Method+handler lives in the handler expression.
+    let handler_text = parsed.text_for_node(&handler_expr);
+    let (method, handler) = extract_actix_method_handler(&handler_text)?;
 
-    None
+    // Apply scope prefix if we find `web::scope("/prefix")` in the receiver/ancestor chain.
+    let scope_prefix = find_enclosing_actix_scope_prefix(parsed, node);
+    let full_path = if let Some(ref pfx) = scope_prefix {
+        join_paths(pfx, &path)
+    } else {
+        path
+    };
+
+    Some(RustFrameworkRoute {
+        method: method.to_uppercase(),
+        path: full_path,
+        handler_name: handler,
+        is_async: true,
+        scope_prefix,
+        location: parsed.location_for_node(node),
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+    })
 }
 
 fn extract_axum_route_service(
@@ -537,8 +665,9 @@ fn extract_axum_route_service(
         return None;
     }
 
-    let text = parsed.text_for_node(node);
-    let mut path = extract_string_arg(&text, ".route_service(")?;
+    let args = node.child_by_field_name("arguments")?;
+    let path_arg = args.named_child(0)?;
+    let mut path = extract_string_literal(&parsed.text_for_node(&path_arg))?;
 
     if let Some(prefix) = find_enclosing_nest_prefix(parsed, node) {
         path = join_paths(&prefix, &path);
@@ -582,8 +711,9 @@ fn extract_axum_nest_service(
         return None;
     }
 
-    let text = parsed.text_for_node(node);
-    let mut prefix = extract_string_arg(&text, ".nest_service(")?;
+    let args = node.child_by_field_name("arguments")?;
+    let prefix_arg = args.named_child(0)?;
+    let mut prefix = extract_string_literal(&parsed.text_for_node(&prefix_arg))?;
 
     if let Some(outer) = find_enclosing_nest_prefix(parsed, node) {
         prefix = join_paths(&outer, &prefix);
@@ -827,20 +957,28 @@ fn extract_warp_handler(text: &str) -> Option<String> {
 
 /// Extract Poem route from Route::at() or similar.
 fn extract_poem_route(parsed: &ParsedFile, node: &tree_sitter::Node) -> Option<RustFrameworkRoute> {
-    let text = parsed.text_for_node(node);
-
     // Poem patterns:
-    // Route::new().at("/users", get(handler))
-    // .at("/users/:id", get(get_user).post(create_user))
+    // - Route::new().at("/users", get(handler))
+    // - .at("/users/:id", get(get_user).post(create_user))
+    //
+    // We build one route per method call (get/post/...) and resolve the path
+    // from the enclosing `.at("/path", ...)` call.
 
-    if !text.contains(".at(") {
+    let func = node.child_by_field_name("function")?;
+    let method = extract_last_ident(&parsed.text_for_node(&func))?;
+    let methods = [
+        "get", "post", "put", "delete", "patch", "head", "options", "trace",
+    ];
+    if !methods.contains(&method.as_str()) {
         return None;
     }
 
-    let path = extract_string_arg(&text, ".at(")?;
+    let args = node.child_by_field_name("arguments")?;
+    let handler_arg = args.named_child(0)?;
+    let handler_text = parsed.text_for_node(&handler_arg);
+    let handler = extract_last_ident(&handler_text).unwrap_or(handler_text);
 
-    // Extract method and handler (similar to Axum)
-    let (method, handler) = extract_axum_method_handler(&text)?;
+    let path = find_enclosing_field_call_path(parsed, node, "at")?;
 
     Some(RustFrameworkRoute {
         method: method.to_uppercase(),
@@ -856,40 +994,97 @@ fn extract_poem_route(parsed: &ParsedFile, node: &tree_sitter::Node) -> Option<R
 
 /// Extract Tide route from app.at().
 fn extract_tide_route(parsed: &ParsedFile, node: &tree_sitter::Node) -> Option<RustFrameworkRoute> {
-    let text = parsed.text_for_node(node);
-
     // Tide patterns:
-    // app.at("/users").get(list_users)
-    // app.at("/users/:id").get(get_user).post(update_user)
+    // - app.at("/users").get(list_users)
+    // - app.at("/users/:id").get(get_user).post(update_user)
+    //
+    // We build one route per method call (get/post/...) and resolve the path
+    // from the enclosing `.at("/path")` call.
 
-    if !text.contains(".at(") {
+    let func = node.child_by_field_name("function")?;
+    let method = extract_last_ident(&parsed.text_for_node(&func))?;
+    let methods = ["get", "post", "put", "delete", "patch"];
+    if !methods.contains(&method.as_str()) {
         return None;
     }
 
-    let path = extract_string_arg(&text, ".at(")?;
+    let args = node.child_by_field_name("arguments")?;
+    let handler_arg = args.named_child(0)?;
+    let handler_text = parsed.text_for_node(&handler_arg);
+    let handler = extract_last_ident(&handler_text).unwrap_or(handler_text);
 
-    // Extract method
-    let methods = ["get", "post", "put", "delete", "patch"];
-    for method in methods {
-        let pattern = format!(".{}(", method);
-        if let Some(pos) = text.find(&pattern) {
-            let after = &text[pos + pattern.len()..];
-            if let Some(end) = after.find(')') {
-                let handler = after[..end].trim().to_string();
-                return Some(RustFrameworkRoute {
-                    method: method.to_uppercase(),
-                    path,
-                    handler_name: handler,
-                    is_async: true,
-                    scope_prefix: None,
-                    location: parsed.location_for_node(node),
-                    start_byte: node.start_byte(),
-                    end_byte: node.end_byte(),
-                });
+    let path = find_enclosing_field_call_path(parsed, node, "at")?;
+
+    Some(RustFrameworkRoute {
+        method: method.to_uppercase(),
+        path,
+        handler_name: handler,
+        is_async: true,
+        scope_prefix: None,
+        location: parsed.location_for_node(node),
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+    })
+}
+
+fn find_enclosing_field_call_path(
+    parsed: &ParsedFile,
+    node: &tree_sitter::Node,
+    field_name: &str,
+) -> Option<String> {
+    // Receiver chain: e.g. `app.at("/x").get(handler)` (at() is the receiver call).
+    let mut cur_call = *node;
+    loop {
+        let Some(func) = cur_call.child_by_field_name("function") else {
+            break;
+        };
+        if func.kind() != "field_expression" {
+            break;
+        }
+        let receiver = func
+            .child_by_field_name("value")
+            .or_else(|| func.child_by_field_name("object"))
+            .or_else(|| func.child_by_field_name("argument"));
+        let Some(receiver) = receiver else {
+            break;
+        };
+        if receiver.kind() != "call_expression" {
+            break;
+        }
+
+        if let Some(recv_func) = receiver.child_by_field_name("function") {
+            if recv_func.kind() == "field_expression" {
+                if let Some(field) = recv_func.child_by_field_name("field") {
+                    if parsed.text_for_node(&field) == field_name {
+                        let args = receiver.child_by_field_name("arguments")?;
+                        let arg0 = args.named_child(0)?;
+                        return extract_string_literal(&parsed.text_for_node(&arg0));
+                    }
+                }
             }
         }
+
+        cur_call = receiver;
     }
 
+    // Ancestor chain: e.g. `.at("/x", get(handler))` (at() is an ancestor call).
+    let mut cur = node.parent();
+    while let Some(n) = cur {
+        if n.kind() == "call_expression" {
+            if let Some(func) = n.child_by_field_name("function") {
+                if func.kind() == "field_expression" {
+                    if let Some(field) = func.child_by_field_name("field") {
+                        if parsed.text_for_node(&field) == field_name {
+                            let args = n.child_by_field_name("arguments")?;
+                            let arg0 = args.named_child(0)?;
+                            return extract_string_literal(&parsed.text_for_node(&arg0));
+                        }
+                    }
+                }
+            }
+        }
+        cur = n.parent();
+    }
     None
 }
 
@@ -909,19 +1104,27 @@ fn extract_string_arg(text: &str, pattern: &str) -> Option<String> {
 }
 
 fn find_enclosing_nest_prefix(parsed: &ParsedFile, node: &tree_sitter::Node) -> Option<String> {
-    // Look for an ancestor call expression that contains `.nest("/prefix",` or `.nest_service("/prefix",`.
+    // Find the nearest ancestor call expression like `.nest("/prefix", ...)` or
+    // `.nest_service("/prefix", ...)`.
+    //
+    // IMPORTANT: avoid parsing `text_for_node` for chained expressions.
     let mut cur = node.parent();
     while let Some(n) = cur {
         if n.kind() == "call_expression" {
-            let text = parsed.text_for_node(&n);
-            if text.contains(".nest(") {
-                if let Some(prefix) = extract_string_arg(&text, ".nest(") {
-                    return Some(prefix);
-                }
-            }
-            if text.contains(".nest_service(") {
-                if let Some(prefix) = extract_string_arg(&text, ".nest_service(") {
-                    return Some(prefix);
+            let Some(func) = n.child_by_field_name("function") else {
+                cur = n.parent();
+                continue;
+            };
+            if func.kind() == "field_expression" {
+                let Some(field) = func.child_by_field_name("field") else {
+                    cur = n.parent();
+                    continue;
+                };
+                let field_name = parsed.text_for_node(&field);
+                if field_name == "nest" || field_name == "nest_service" {
+                    let args = n.child_by_field_name("arguments")?;
+                    let arg0 = args.named_child(0)?;
+                    return extract_string_literal(&parsed.text_for_node(&arg0));
                 }
             }
         }
@@ -934,18 +1137,68 @@ fn find_enclosing_actix_scope_prefix(
     parsed: &ParsedFile,
     node: &tree_sitter::Node,
 ) -> Option<String> {
+    // Find the nearest `web::scope("/prefix")` call in either:
+    // - the receiver chain (e.g. `web::scope("/api").route(...)`), or
+    // - the ancestor chain (e.g. `.service(web::scope("/api").service(...))`).
+
+    fn scope_from_receiver_chain(parsed: &ParsedFile, start: tree_sitter::Node) -> Option<String> {
+        let mut cur_call = start;
+        loop {
+            let Some(func) = cur_call.child_by_field_name("function") else {
+                break;
+            };
+            if func.kind() != "field_expression" {
+                break;
+            }
+            let receiver = func
+                .child_by_field_name("value")
+                .or_else(|| func.child_by_field_name("object"))
+                .or_else(|| func.child_by_field_name("argument"));
+            let Some(receiver) = receiver else {
+                break;
+            };
+            if receiver.kind() != "call_expression" {
+                break;
+            }
+
+            let recv_func = receiver.child_by_field_name("function")?;
+            let recv_func_text = parsed.text_for_node(&recv_func);
+            let recv_ident = extract_last_ident(&recv_func_text);
+            if recv_ident.as_deref() == Some("scope") && recv_func_text.contains("web::scope") {
+                let args = receiver.child_by_field_name("arguments")?;
+                let arg0 = args.named_child(0)?;
+                return extract_string_literal(&parsed.text_for_node(&arg0));
+            }
+
+            cur_call = receiver;
+        }
+        None
+    }
+
+    // Check this call's receiver chain.
+    if let Some(pfx) = scope_from_receiver_chain(parsed, *node) {
+        return Some(pfx);
+    }
+
+    // Walk ancestors; check both the ancestor itself and its receiver chain.
     let mut cur = node.parent();
     while let Some(n) = cur {
         if n.kind() == "call_expression" {
-            let text = parsed.text_for_node(&n);
-            if text.contains("web::scope(") {
-                if let Some(prefix) = extract_string_arg(&text, "web::scope(") {
-                    return Some(prefix);
-                }
+            let func = n.child_by_field_name("function")?;
+            let func_text = parsed.text_for_node(&func);
+            let ident = extract_last_ident(&func_text);
+            if ident.as_deref() == Some("scope") && func_text.contains("web::scope") {
+                let args = n.child_by_field_name("arguments")?;
+                let arg0 = args.named_child(0)?;
+                return extract_string_literal(&parsed.text_for_node(&arg0));
+            }
+            if let Some(pfx) = scope_from_receiver_chain(parsed, n) {
+                return Some(pfx);
             }
         }
         cur = n.parent();
     }
+
     None
 }
 
@@ -1098,6 +1351,34 @@ fn main() {
     }
 
     #[test]
+    fn extracts_actix_chained_routes() {
+        let src = r#"
+use actix_web::{web, App};
+
+async fn list_users() -> String { String::new() }
+async fn create_user() -> String { String::new() }
+
+fn main() {
+    let _app = App::new()
+        .route("/users", web::get().to(list_users))
+        .route("/users", web::post().to(create_user));
+}
+"#;
+        let summary = parse_and_extract(src);
+        assert_eq!(summary.framework, Some(RustFrameworkType::ActixWeb));
+        assert_eq!(summary.routes.len(), 2);
+
+        assert!(summary
+            .routes
+            .iter()
+            .any(|r| r.method == "GET" && r.path == "/users" && r.handler_name == "list_users"));
+        assert!(summary
+            .routes
+            .iter()
+            .any(|r| r.method == "POST" && r.path == "/users" && r.handler_name == "create_user"));
+    }
+
+    #[test]
     fn extracts_actix_scope_prefix_routes_inside_service_resource() {
         let src = r#"
 use actix_web::{web, App};
@@ -1203,6 +1484,87 @@ fn main() {
     }
 
     #[test]
+    fn applies_rocket_mount_prefixes_for_chained_mounts() {
+        let src = r#"
+use rocket::get;
+
+#[get("/health")]
+fn health() -> &'static str { "ok" }
+
+#[get("/users")]
+fn users() -> &'static str { "ok" }
+
+fn main() {
+    rocket::build()
+        .mount("/api", routes![health])
+        .mount("/v1", routes![users]);
+}
+"#;
+        let summary = parse_and_extract(src);
+        assert_eq!(summary.framework, Some(RustFrameworkType::Rocket));
+        assert_eq!(summary.routes.len(), 2);
+
+        assert!(summary
+            .routes
+            .iter()
+            .any(|r| r.path == "/api/health" && r.scope_prefix.as_deref() == Some("/api")));
+        assert!(summary
+            .routes
+            .iter()
+            .any(|r| r.path == "/v1/users" && r.scope_prefix.as_deref() == Some("/v1")));
+    }
+
+    #[test]
+    fn extracts_tide_chained_methods() {
+        let src = r#"
+use tide::Server;
+
+async fn get_user(_: tide::Request<()>) -> tide::Result { Ok("ok".into()) }
+async fn update_user(_: tide::Request<()>) -> tide::Result { Ok("ok".into()) }
+
+fn main() {
+    let mut app: Server<()> = tide::new();
+    app.at("/users/:id").get(get_user).post(update_user);
+}
+"#;
+        let summary = parse_and_extract(src);
+        assert_eq!(summary.framework, Some(RustFrameworkType::Tide));
+        assert_eq!(summary.routes.len(), 2);
+        assert!(summary
+            .routes
+            .iter()
+            .any(|r| r.method == "GET" && r.path == "/users/:id" && r.handler_name == "get_user"));
+        assert!(summary.routes.iter().any(|r| r.method == "POST"
+            && r.path == "/users/:id"
+            && r.handler_name == "update_user"));
+    }
+
+    #[test]
+    fn extracts_poem_methods_under_at() {
+        let src = r#"
+use poem::{get, post, Route};
+
+async fn list_users() -> String { String::new() }
+async fn create_user() -> String { String::new() }
+
+fn main() {
+    let _app = Route::new().at("/users", get(list_users).post(create_user));
+}
+"#;
+        let summary = parse_and_extract(src);
+        assert_eq!(summary.framework, Some(RustFrameworkType::Poem));
+        assert_eq!(summary.routes.len(), 2);
+        assert!(summary
+            .routes
+            .iter()
+            .any(|r| r.method == "GET" && r.path == "/users" && r.handler_name == "list_users"));
+        assert!(summary
+            .routes
+            .iter()
+            .any(|r| r.method == "POST" && r.path == "/users" && r.handler_name == "create_user"));
+    }
+
+    #[test]
     fn detects_warp_framework() {
         let src = r#"
 use warp::Filter;
@@ -1254,5 +1616,38 @@ fn main() {
         let summary = parse_and_extract(src);
         assert!(!summary.middleware.is_empty());
         assert!(summary.middleware[0].name.contains("TraceLayer"));
+    }
+
+    #[test]
+    fn extracts_axum_chained_routes() {
+        let src = r#"
+use axum::{Router, routing::{get, post}};
+
+async fn index() -> &'static str { "ok" }
+async fn get_recipes() -> &'static str { "ok" }
+async fn create_recipe() -> &'static str { "ok" }
+
+fn main() {
+    let _app = Router::new()
+        .route("/", get(index))
+        .route("/api/recipes", get(get_recipes))
+        .route("/api/recipes", post(create_recipe));
+}
+"#;
+        let summary = parse_and_extract(src);
+
+        assert_eq!(summary.framework, Some(RustFrameworkType::Axum));
+        assert_eq!(summary.routes.len(), 3);
+
+        assert!(summary
+            .routes
+            .iter()
+            .any(|r| r.method == "GET" && r.path == "/" && r.handler_name == "index"));
+        assert!(summary.routes.iter().any(|r| {
+            r.method == "GET" && r.path == "/api/recipes" && r.handler_name == "get_recipes"
+        }));
+        assert!(summary.routes.iter().any(|r| {
+            r.method == "POST" && r.path == "/api/recipes" && r.handler_name == "create_recipe"
+        }));
     }
 }

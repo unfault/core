@@ -9,6 +9,8 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 ### Added
 
 ### Fixed
+- Rust route extraction: correctly handle chained builder calls (Axum `.route(...)`, Actix `.route(...)`, Rocket `.mount(...)`, Tide `.at(...).get(...).post(...)`, Poem `.at(..., get(...).post(...))`).
+- Rust route handlers: populate HTTP metadata on existing function nodes and add a best-effort synthetic `Calls` edge from the registrar (typically `main`) to the handler for impact analysis.
 
 ## [0.1.12] - 2026-01-28
 

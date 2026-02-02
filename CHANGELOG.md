@@ -6,6 +6,12 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+## [0.1.16] - 2026-02-02
+
+### Changed
+
+- Formatting and clippy hygiene (no functional changes).
+
 ## [0.1.15] - 2026-01-29
 
 ### Fixed
@@ -100,5 +106,6 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 [0.1.12]: https://github.com/unfault/core/compare/v0.1.11...v0.1.12
 [0.1.13]: https://github.com/unfault/core/compare/v0.1.12...v0.1.13
 [0.1.14]: https://github.com/unfault/core/compare/v0.1.13...v0.1.14
+[0.1.16]: https://github.com/unfault/core/compare/v0.1.15...v0.1.16
 [0.1.15]: https://github.com/unfault/core/compare/v0.1.14...v0.1.15
-[Unreleased]: https://github.com/unfault/core/compare/v0.1.14...main
+[Unreleased]: https://github.com/unfault/core/compare/v0.1.16...main

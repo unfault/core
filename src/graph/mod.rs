@@ -844,6 +844,9 @@ pub fn build_code_graph(sem_entries: &[(FileId, Arc<SourceSemantics>)]) -> CodeG
         add_function_nodes(&mut cg, file_node, *file_id, sem);
     }
 
+    // Propagate UsesLibrary edges from file nodes to function nodes
+    add_function_library_edges(&mut cg, sem_entries);
+
     // Third pass: add framework-specific nodes (after all functions are registered)
     // This is needed because framework nodes (like FastAPI DI edges) may reference
     // functions in other files that must be registered first.
@@ -933,6 +936,10 @@ pub fn build_code_graph(sem_entries: &[(FileId, Arc<SourceSemantics>)]) -> CodeG
 
     // Fourth pass: add cross-file Calls edges using import analysis
     add_cross_file_call_edges(&mut cg, sem_entries);
+
+    // Post-pass: infer UsesLibrary edges from fully-qualified call sites
+    // (e.g., `reqwest::...` without a corresponding `use reqwest;` import).
+    add_external_library_edges_from_calls(&mut cg, sem_entries);
 
     cg
 }
@@ -1937,6 +1944,156 @@ fn add_function_nodes(
     }
 }
 
+/// Propagate UsesLibrary edges from file nodes to function nodes.
+///
+/// This ensures that functions inherit the external library dependencies of their
+/// containing file, enabling analysis tools to detect outbound calls from functions
+/// even when the function doesn't directly use a library but its file does.
+fn add_function_library_edges(cg: &mut CodeGraph, sem_entries: &[(FileId, Arc<SourceSemantics>)]) {
+    for (file_id, _sem) in sem_entries {
+        let Some(&file_idx) = cg.file_nodes.get(file_id) else {
+            continue;
+        };
+
+        // Find all ExternalModule nodes that this file UsesLibrary
+        let external_module_idxs: Vec<petgraph::graph::NodeIndex> = cg
+            .graph
+            .edges(file_idx)
+            .filter(|e| matches!(e.weight(), GraphEdgeKind::UsesLibrary))
+            .filter_map(|e| {
+                if matches!(
+                    cg.graph.node_weight(e.target()),
+                    Some(GraphNode::ExternalModule { .. })
+                ) {
+                    Some(e.target())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if external_module_idxs.is_empty() {
+            continue;
+        }
+
+        // For each function in this file, add UsesLibrary edges to the same ExternalModules
+        for (func_file_id, func_name) in cg.function_nodes.keys().filter(|(fid, _)| fid == file_id)
+        {
+            let Some(&func_idx) = cg
+                .function_nodes
+                .get(&(func_file_id.clone(), func_name.clone()))
+            else {
+                continue;
+            };
+
+            for &ext_idx in &external_module_idxs {
+                // Only add if edge doesn't already exist
+                let edge_exists = cg.graph.edges(func_idx).any(|e| {
+                    e.target() == ext_idx && matches!(e.weight(), GraphEdgeKind::UsesLibrary)
+                });
+
+                if !edge_exists {
+                    cg.graph
+                        .add_edge(func_idx, ext_idx, GraphEdgeKind::UsesLibrary);
+                }
+            }
+        }
+    }
+}
+
+/// Best-effort: infer external library usage from fully-qualified call sites.
+///
+/// In Rust, it's common to call external crates using fully-qualified paths
+/// (e.g., `reqwest::Client::builder()`) without a `use reqwest;` import.
+/// Import-only detection will miss those, which breaks outbound-call workflows.
+///
+/// This pass scans each function's `calls` and adds `UsesLibrary` edges from the
+/// function node to the corresponding `ExternalModule` node when we can infer a
+/// package/module name from `callee_expr`.
+fn add_external_library_edges_from_calls(
+    cg: &mut CodeGraph,
+    sem_entries: &[(FileId, Arc<SourceSemantics>)],
+) {
+    use petgraph::visit::EdgeRef;
+
+    fn package_from_callee_expr(expr: &str) -> Option<&str> {
+        let expr = expr.trim();
+        if expr.is_empty() {
+            return None;
+        }
+
+        // Rust-style paths: reqwest::Client::builder
+        if let Some((first, _rest)) = expr.split_once("::") {
+            let pkg = first.trim();
+            if pkg.is_empty() {
+                return None;
+            }
+            // Ignore obvious local/module qualifiers.
+            if matches!(pkg, "self" | "super" | "crate") {
+                return None;
+            }
+            // Ignore Rust std/core crates to reduce noise.
+            if matches!(pkg, "std" | "core" | "alloc") {
+                return None;
+            }
+            return Some(pkg);
+        }
+
+        // Dot-style paths: requests.get / sqlalchemy.create_engine
+        if let Some((first, _rest)) = expr.split_once('.') {
+            let pkg = first.trim();
+            if pkg.is_empty() {
+                return None;
+            }
+            if matches!(pkg, "self" | "this" | "super") {
+                return None;
+            }
+            return Some(pkg);
+        }
+
+        None
+    }
+
+    for (file_id, sem) in sem_entries {
+        let functions = match sem.as_ref() {
+            SourceSemantics::Python(py) => py.functions(),
+            SourceSemantics::Go(go) => go.functions(),
+            SourceSemantics::Rust(rs) => rs.functions(),
+            SourceSemantics::Typescript(ts) => ts.functions(),
+        };
+
+        for func in functions {
+            let caller_key = (*file_id, func.name.clone());
+            let Some(&caller_node) = cg.function_nodes.get(&caller_key) else {
+                continue;
+            };
+
+            for call in &func.calls {
+                let Some(pkg) = package_from_callee_expr(&call.callee_expr) else {
+                    continue;
+                };
+
+                let category = categorize_module(pkg);
+                // Keep the graph relatively clean: only materialize categories we know.
+                if matches!(category, ModuleCategory::Other) {
+                    continue;
+                }
+
+                let module_idx = cg.get_or_create_external_module(pkg, category);
+
+                // Only add if edge doesn't already exist.
+                let exists = cg.graph.edges(caller_node).any(|e| {
+                    e.target() == module_idx && matches!(e.weight(), GraphEdgeKind::UsesLibrary)
+                });
+                if !exists {
+                    cg.graph
+                        .add_edge(caller_node, module_idx, GraphEdgeKind::UsesLibrary);
+                }
+            }
+        }
+    }
+}
+
 /// Categorize a module based on its name
 fn categorize_module(module_path: &str) -> ModuleCategory {
     let path_lower = module_path.to_lowercase();
@@ -2889,6 +3046,46 @@ import sqlalchemy
             if let GraphNode::ExternalModule { category, .. } = &cg.graph[idx] {
                 assert_eq!(*category, ModuleCategory::HttpClient);
             }
+        }
+    }
+
+    #[test]
+    fn build_code_graph_detects_external_lib_from_fully_qualified_rust_call() {
+        let src = r#"
+async fn fetch() -> Result<(), reqwest::Error> {
+    let _client = reqwest::Client::builder().build()?;
+    Ok(())
+}
+"#;
+
+        let (file_id, sem) = parse_rust_and_build_semantics("main.rs", src);
+        let sem_entries = vec![(file_id, sem)];
+
+        let cg = build_code_graph(&sem_entries);
+
+        // Should have an external module node created from the fully-qualified call.
+        assert!(cg.external_modules.contains_key("reqwest"));
+
+        // Should have a UsesLibrary edge from the function node.
+        let func_idx = *cg
+            .function_nodes
+            .get(&(file_id, "fetch".to_string()))
+            .expect("function node should exist");
+
+        let module_idx = *cg
+            .external_modules
+            .get("reqwest")
+            .expect("external module node should exist");
+
+        let has_edge = cg
+            .graph
+            .edges(func_idx)
+            .any(|e| e.target() == module_idx && matches!(e.weight(), GraphEdgeKind::UsesLibrary));
+        assert!(has_edge, "function should have UsesLibrary edge to reqwest");
+
+        // Category should be HttpClient.
+        if let GraphNode::ExternalModule { category, .. } = &cg.graph[module_idx] {
+            assert_eq!(*category, ModuleCategory::HttpClient);
         }
     }
 

@@ -1059,6 +1059,11 @@ fn build_call_site(
 
     // Detect if method call (has receiver)
     let is_method_call = callee_parts.len() > 1;
+    let method_name = if is_method_call {
+        callee_parts.last().cloned()
+    } else {
+        None
+    };
     let _receiver = if is_method_call {
         Some(first_part.clone())
     } else {
@@ -1097,6 +1102,8 @@ fn build_call_site(
     Some(model::RustCallSite {
         function_call,
         args_repr,
+        method_name,
+        is_method_call,
         in_loop: ctx.in_loop,
         in_async: ctx.in_async_fn,
         in_static_init: ctx.in_static_init,

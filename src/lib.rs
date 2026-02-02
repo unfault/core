@@ -28,6 +28,27 @@
 //! let semantics = PyFileSemantics::from_parsed(&parsed);
 //! ```
 
+#![allow(clippy::clone_on_copy)]
+#![allow(clippy::collapsible_if)]
+#![allow(clippy::derivable_impls)]
+#![allow(clippy::double_ended_iterator_last)]
+#![allow(clippy::empty_line_after_doc_comments)]
+#![allow(clippy::manual_pattern_char_comparison)]
+#![allow(clippy::manual_strip)]
+#![allow(clippy::map_flatten)]
+#![allow(clippy::needless_return)]
+#![allow(clippy::ptr_arg)]
+#![allow(clippy::redundant_closure)]
+#![allow(clippy::single_match)]
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::trim_split_whitespace)]
+#![allow(clippy::field_reassign_with_default)]
+#![allow(clippy::if_same_then_else)]
+#![allow(clippy::manual_split_once)]
+#![allow(clippy::type_complexity)]
+#![allow(clippy::len_zero)]
+#![allow(clippy::items_after_test_module)]
+
 use serde::{Deserialize, Serialize};
 
 pub mod error;

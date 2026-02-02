@@ -576,6 +576,10 @@ pub struct RustCallSite {
     pub function_call: FunctionCall,
     /// Arguments for the call
     pub args_repr: String,
+    /// Method name if this is a method call (e.g., "timeout" in "client.timeout(...)")
+    pub method_name: Option<String>,
+    /// Whether this is a method call (as opposed to a function call)
+    pub is_method_call: bool,
     /// Whether this call is inside a loop
     pub in_loop: bool,
     /// Whether this is in an async context

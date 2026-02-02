@@ -5,6 +5,7 @@
 //! - Function/method nodes
 //! - Class/type nodes
 //! - External module/library nodes
+//! - Remote server nodes (HTTP egress)
 //! - Framework-specific nodes (FastAPI apps, routes, middlewares)
 //!
 //! Edges capture relationships:
@@ -13,17 +14,19 @@
 //! - ImportsFrom: File imports specific items from module
 //! - Calls: Function calls another function
 //! - UsesLibrary: File/function uses external library
+//! - HttpCall: Function makes HTTP call to remote server
 //! - Framework-specific edges (FastAPI routes, middlewares)
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use petgraph::Direction;
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
+use petgraph::Direction;
 use serde::{Deserialize, Serialize};
 
 use crate::parse::ast::FileId;
+use crate::semantics::common::http::HttpCall;
 use crate::semantics::common::CommonSemantics;
 use crate::semantics::go::frameworks::GoFrameworkSummary;
 use crate::semantics::go::model::GoFileSemantics;
@@ -74,6 +77,18 @@ impl Default for ModuleCategory {
     }
 }
 
+/// Classification of a remote server identity.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteServerKind {
+    /// A concrete host (e.g., "api.example.com" or "localhost:8080").
+    Host,
+    /// An environment variable providing the remote base URL/host.
+    EnvVar,
+    /// A dynamic expression used to construct the remote URL.
+    Expr,
+}
+
 /// Nodes in the code graph.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GraphNode {
@@ -115,6 +130,15 @@ pub enum GraphNode {
         name: String,
         /// Category for grouping
         category: ModuleCategory,
+    },
+
+    /// A remote server/service referenced by an outbound HTTP call.
+    ///
+    /// This is best-effort and may be a concrete host, an env var name, or a
+    /// dynamic expression.
+    RemoteServer {
+        kind: RemoteServerKind,
+        id: String,
     },
 
     // === FastAPI-specific nodes (for backward compatibility) ===
@@ -171,6 +195,7 @@ impl GraphNode {
             GraphNode::FastApiRoute { file_id, .. } => Some(*file_id),
             GraphNode::FastApiMiddleware { file_id, .. } => Some(*file_id),
             GraphNode::ExternalModule { .. } => None,
+            GraphNode::RemoteServer { .. } => None,
             GraphNode::Slo { .. } => None,
         }
     }
@@ -182,6 +207,11 @@ impl GraphNode {
             GraphNode::Function { qualified_name, .. } => qualified_name.clone(),
             GraphNode::Class { name, .. } => name.clone(),
             GraphNode::ExternalModule { name, .. } => name.clone(),
+            GraphNode::RemoteServer { kind, id } => match kind {
+                RemoteServerKind::Host => id.clone(),
+                RemoteServerKind::EnvVar => format!("env:{}", id),
+                RemoteServerKind::Expr => format!("expr:{}", id),
+            },
             GraphNode::FastApiApp { var_name, .. } => format!("FastAPI({})", var_name),
             GraphNode::FastApiRoute {
                 http_method, path, ..
@@ -248,6 +278,16 @@ pub enum GraphEdgeKind {
     /// File or Function uses an external library
     UsesLibrary,
 
+    /// Function makes an outbound HTTP call to a remote server.
+    ///
+    /// Direction: function -> remote server
+    HttpCall {
+        method: String,
+        library: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+    },
+
     /// Dependency injection / framework wiring (e.g. FastAPI Depends)
     ///
     /// Direction: consumer -> provider
@@ -293,6 +333,9 @@ pub struct CodeGraph {
     /// Quick lookup: external module name -> node index
     #[serde(skip)]
     pub external_modules: HashMap<String, NodeIndex>,
+    /// Quick lookup: remote server key -> node index
+    #[serde(skip)]
+    pub remote_servers: HashMap<String, NodeIndex>,
     /// Quick lookup: (file_id, function_name) -> node index
     #[serde(skip)]
     pub function_nodes: HashMap<(FileId, String), NodeIndex>,
@@ -313,6 +356,7 @@ impl CodeGraph {
             suffix_to_file: HashMap::new(),
             module_to_file: HashMap::new(),
             external_modules: HashMap::new(),
+            remote_servers: HashMap::new(),
             function_nodes: HashMap::new(),
             class_nodes: HashMap::new(),
             slo_nodes: HashMap::new(),
@@ -333,6 +377,24 @@ impl CodeGraph {
             category,
         });
         self.external_modules.insert(name.to_string(), idx);
+        idx
+    }
+
+    /// Get or create a remote server node.
+    pub fn get_or_create_remote_server(&mut self, kind: RemoteServerKind, id: &str) -> NodeIndex {
+        let key = match kind {
+            RemoteServerKind::Host => format!("host:{}", id),
+            RemoteServerKind::EnvVar => format!("env:{}", id),
+            RemoteServerKind::Expr => format!("expr:{}", id),
+        };
+        if let Some(&idx) = self.remote_servers.get(&key) {
+            return idx;
+        }
+        let idx = self.graph.add_node(GraphNode::RemoteServer {
+            kind,
+            id: id.to_string(),
+        });
+        self.remote_servers.insert(key, idx);
         idx
     }
 
@@ -521,6 +583,7 @@ impl CodeGraph {
         let mut function_count = 0;
         let mut class_count = 0;
         let mut external_module_count = 0;
+        let mut remote_server_count = 0;
 
         for node in self.graph.node_weights() {
             match node {
@@ -528,6 +591,7 @@ impl CodeGraph {
                 GraphNode::Function { .. } => function_count += 1,
                 GraphNode::Class { .. } => class_count += 1,
                 GraphNode::ExternalModule { .. } => external_module_count += 1,
+                GraphNode::RemoteServer { .. } => remote_server_count += 1,
                 _ => {}
             }
         }
@@ -536,6 +600,7 @@ impl CodeGraph {
         let mut contains_edge_count = 0;
         let mut uses_library_edge_count = 0;
         let mut calls_edge_count = 0;
+        let mut http_call_edge_count = 0;
 
         for edge in self.graph.edge_weights() {
             match edge {
@@ -545,6 +610,7 @@ impl CodeGraph {
                 GraphEdgeKind::Contains => contains_edge_count += 1,
                 GraphEdgeKind::UsesLibrary => uses_library_edge_count += 1,
                 GraphEdgeKind::Calls => calls_edge_count += 1,
+                GraphEdgeKind::HttpCall { .. } => http_call_edge_count += 1,
                 _ => {}
             }
         }
@@ -554,10 +620,12 @@ impl CodeGraph {
             function_count,
             class_count,
             external_module_count,
+            remote_server_count,
             import_edge_count,
             contains_edge_count,
             uses_library_edge_count,
             calls_edge_count,
+            http_call_edge_count,
             total_nodes: self.graph.node_count(),
             total_edges: self.graph.edge_count(),
         }
@@ -573,6 +641,7 @@ impl CodeGraph {
         self.suffix_to_file.clear();
         self.module_to_file.clear();
         self.external_modules.clear();
+        self.remote_servers.clear();
         self.function_nodes.clear();
         self.class_nodes.clear();
         self.slo_nodes.clear();
@@ -599,6 +668,14 @@ impl CodeGraph {
                 }
                 GraphNode::ExternalModule { name, .. } => {
                     self.external_modules.insert(name.clone(), node_idx);
+                }
+                GraphNode::RemoteServer { kind, id } => {
+                    let key = match kind {
+                        RemoteServerKind::Host => format!("host:{}", id),
+                        RemoteServerKind::EnvVar => format!("env:{}", id),
+                        RemoteServerKind::Expr => format!("expr:{}", id),
+                    };
+                    self.remote_servers.insert(key, node_idx);
                 }
                 GraphNode::Slo { id, .. } => {
                     self.slo_nodes.insert(id.clone(), node_idx);
@@ -787,11 +864,14 @@ pub struct GraphStats {
     pub function_count: usize,
     pub class_count: usize,
     pub external_module_count: usize,
+    pub remote_server_count: usize,
     pub import_edge_count: usize,
     pub contains_edge_count: usize,
     pub uses_library_edge_count: usize,
     /// Number of function-to-function call edges
     pub calls_edge_count: usize,
+    /// Number of function-to-remote-server HTTP call edges
+    pub http_call_edge_count: usize,
     pub total_nodes: usize,
     pub total_edges: usize,
 }
@@ -941,7 +1021,123 @@ pub fn build_code_graph(sem_entries: &[(FileId, Arc<SourceSemantics>)]) -> CodeG
     // (e.g., `reqwest::...` without a corresponding `use reqwest;` import).
     add_external_library_edges_from_calls(&mut cg, sem_entries);
 
+    // Post-pass: add HTTP egress edges from functions to remote servers.
+    add_http_call_edges(&mut cg, sem_entries);
+
     cg
+}
+
+fn add_http_call_edges(cg: &mut CodeGraph, sem_entries: &[(FileId, Arc<SourceSemantics>)]) {
+    for (file_id, sem) in sem_entries {
+        let http_calls: Vec<HttpCall> = match sem.as_ref() {
+            SourceSemantics::Python(py) => py.http_calls(),
+            SourceSemantics::Go(go) => go.http_calls(),
+            SourceSemantics::Rust(rs) => rs.http_calls(),
+            SourceSemantics::Typescript(ts) => ts.http_calls(),
+        };
+
+        if http_calls.is_empty() {
+            continue;
+        }
+
+        for call in http_calls {
+            let Some(fn_name) = call.enclosing_function.clone() else {
+                continue;
+            };
+
+            let caller_key = (*file_id, fn_name);
+            let Some(&caller_node) = cg.function_nodes.get(&caller_key) else {
+                continue;
+            };
+
+            let (remote_kind, remote_id) = remote_identity_from_http_call(&call);
+            let remote_node = cg.get_or_create_remote_server(remote_kind, &remote_id);
+
+            let method = call.method.as_str().to_string();
+            let library = call.library.as_str().to_string();
+            let url = call.url.clone();
+
+            // Avoid emitting identical duplicate edges.
+            let already = cg
+                .graph
+                .edges_connecting(caller_node, remote_node)
+                .any(|e| match e.weight() {
+                    GraphEdgeKind::HttpCall {
+                        method: m,
+                        library: l,
+                        url: u,
+                    } => m == &method && l == &library && u == &url,
+                    _ => false,
+                });
+            if already {
+                continue;
+            }
+
+            cg.graph.add_edge(
+                caller_node,
+                remote_node,
+                GraphEdgeKind::HttpCall {
+                    method,
+                    library,
+                    url,
+                },
+            );
+        }
+    }
+}
+
+fn remote_identity_from_http_call(call: &HttpCall) -> (RemoteServerKind, String) {
+    if let Some(url) = &call.url {
+        if let Some(host) = extract_host_from_url_literal(url) {
+            return (RemoteServerKind::Host, host);
+        }
+    }
+
+    if let Some(expr) = &call.url_expr {
+        if let Some(env) = expr.env_var.as_deref() {
+            return (RemoteServerKind::EnvVar, env.to_string());
+        }
+        return (
+            RemoteServerKind::Expr,
+            truncate_expr_id(expr.text.trim(), 120),
+        );
+    }
+
+    if let Some(url) = &call.url {
+        return (RemoteServerKind::Expr, truncate_expr_id(url.trim(), 120));
+    }
+
+    (RemoteServerKind::Expr, "unknown".to_string())
+}
+
+fn truncate_expr_id(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        return s.to_string();
+    }
+    let mut out = s[..max_len].to_string();
+    out.push_str("...");
+    out
+}
+
+fn extract_host_from_url_literal(url: &str) -> Option<String> {
+    let u = url.trim();
+    let rest = u
+        .strip_prefix("http://")
+        .or_else(|| u.strip_prefix("https://"))?;
+    let authority = rest
+        .split(&['/', '?', '#'][..])
+        .next()
+        .unwrap_or(rest)
+        .trim();
+    if authority.is_empty() {
+        return None;
+    }
+    // Strip credentials if present.
+    let hostport = authority.rsplit('@').next().unwrap_or(authority).trim();
+    if hostport.is_empty() {
+        return None;
+    }
+    Some(hostport.to_string())
 }
 
 fn join_http_paths(prefix: &str, path: &str) -> String {
@@ -2614,9 +2810,9 @@ mod tests {
     use crate::parse::ast::FileId;
     use crate::parse::python::parse_python_file;
     use crate::parse::rust::parse_rust_file;
-    use crate::semantics::SourceSemantics;
     use crate::semantics::python::model::PyFileSemantics;
     use crate::semantics::rust::build_rust_semantics;
+    use crate::semantics::SourceSemantics;
     use crate::types::context::{Language, SourceFile};
 
     /// Helper to parse Python source and build semantics with framework analysis
@@ -3010,14 +3206,12 @@ async def fetch_user(user_id):
         assert!(stats.function_count >= 2);
 
         // Functions should be in lookup
-        assert!(
-            cg.function_nodes
-                .contains_key(&(file_id, "process_data".to_string()))
-        );
-        assert!(
-            cg.function_nodes
-                .contains_key(&(file_id, "fetch_user".to_string()))
-        );
+        assert!(cg
+            .function_nodes
+            .contains_key(&(file_id, "process_data".to_string())));
+        assert!(cg
+            .function_nodes
+            .contains_key(&(file_id, "fetch_user".to_string())));
     }
 
     #[test]
@@ -3793,14 +3987,12 @@ def bar():
         // Verify lookups are restored
         assert!(cg.file_nodes.contains_key(&file_id));
         assert!(cg.path_to_file.contains_key("test.py"));
-        assert!(
-            cg.function_nodes
-                .contains_key(&(file_id, "my_func".to_string()))
-        );
-        assert!(
-            cg.class_nodes
-                .contains_key(&(file_id, "MyClass".to_string()))
-        );
+        assert!(cg
+            .function_nodes
+            .contains_key(&(file_id, "my_func".to_string())));
+        assert!(cg
+            .class_nodes
+            .contains_key(&(file_id, "MyClass".to_string())));
         assert!(cg.external_modules.contains_key("requests"));
     }
 
@@ -3904,14 +4096,12 @@ def main():
         let cg = build_code_graph(&sem_entries);
 
         // Both functions should exist
-        assert!(
-            cg.function_nodes
-                .contains_key(&(helper_id, "helper_func".to_string()))
-        );
-        assert!(
-            cg.function_nodes
-                .contains_key(&(main_id, "main".to_string()))
-        );
+        assert!(cg
+            .function_nodes
+            .contains_key(&(helper_id, "helper_func".to_string())));
+        assert!(cg
+            .function_nodes
+            .contains_key(&(main_id, "main".to_string())));
 
         // Check that there's an import edge from main.py to helpers.py
         let stats = cg.stats();
@@ -4183,14 +4373,12 @@ def main():
         let cg = build_code_graph(&sem_entries);
 
         // Verify both functions exist
-        assert!(
-            cg.function_nodes
-                .contains_key(&(utils_id, "add".to_string()))
-        );
-        assert!(
-            cg.function_nodes
-                .contains_key(&(app_id, "main".to_string()))
-        );
+        assert!(cg
+            .function_nodes
+            .contains_key(&(utils_id, "add".to_string())));
+        assert!(cg
+            .function_nodes
+            .contains_key(&(app_id, "main".to_string())));
 
         // Key assertion: There should be a Calls edge from main() to add()
         let stats = cg.stats();
@@ -4263,14 +4451,12 @@ def process(db):
         let cg = build_code_graph(&sem_entries);
 
         // Verify both functions exist
-        assert!(
-            cg.function_nodes
-                .contains_key(&(file_id, "add".to_string()))
-        );
-        assert!(
-            cg.function_nodes
-                .contains_key(&(file_id, "process".to_string()))
-        );
+        assert!(cg
+            .function_nodes
+            .contains_key(&(file_id, "add".to_string())));
+        assert!(cg
+            .function_nodes
+            .contains_key(&(file_id, "process".to_string())));
 
         // Get the function nodes
         let add_func_idx = cg

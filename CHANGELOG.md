@@ -6,6 +6,13 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+## [0.1.17] - 2026-02-02
+
+### Added
+
+- CodeGraph: emit remote server nodes and `HttpCall` edges for outbound HTTP callsites.
+- Rust HTTP extraction: propagate env var names through simple `let` bindings (e.g., `let base = env::var("API_URL")...; format!("{}/...", base)`).
+
 ## [0.1.16] - 2026-02-02
 
 ### Changed
@@ -108,4 +115,5 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 [0.1.14]: https://github.com/unfault/core/compare/v0.1.13...v0.1.14
 [0.1.16]: https://github.com/unfault/core/compare/v0.1.15...v0.1.16
 [0.1.15]: https://github.com/unfault/core/compare/v0.1.14...v0.1.15
-[Unreleased]: https://github.com/unfault/core/compare/v0.1.16...main
+[0.1.17]: https://github.com/unfault/core/compare/v0.1.16...v0.1.17
+[Unreleased]: https://github.com/unfault/core/compare/v0.1.17...main

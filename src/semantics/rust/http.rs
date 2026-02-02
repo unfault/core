@@ -84,6 +84,7 @@ pub struct HttpCallSite {
 pub fn summarize_http_clients(file: &ParsedFile) -> Vec<HttpCallSite> {
     let root = file.tree.root_node();
     let const_string_bindings = collect_string_const_bindings(file, root);
+    let env_var_bindings = collect_env_var_bindings(file, root, &const_string_bindings);
     let loop_infos = collect_loop_infos(file, root);
     let retry_client_vars = collect_retry_client_vars(file, root);
     let http_client_vars = collect_http_client_vars(file, root);
@@ -96,6 +97,7 @@ pub fn summarize_http_clients(file: &ParsedFile) -> Vec<HttpCallSite> {
         false,
         None,
         &const_string_bindings,
+        &env_var_bindings,
         &http_client_vars,
     );
 
@@ -277,6 +279,7 @@ fn collect_http_calls(
     has_await: bool,
     _parent_fn: Option<String>,
     const_string_bindings: &HashMap<String, String>,
+    env_var_bindings: &HashMap<String, String>,
     http_client_vars: &HashMap<String, HttpClientKind>,
 ) {
     let ctx = ctx.unwrap_or_default();
@@ -303,6 +306,7 @@ fn collect_http_calls(
             &new_ctx,
             false,
             const_string_bindings,
+            env_var_bindings,
             http_client_vars,
         );
         return;
@@ -316,6 +320,7 @@ fn collect_http_calls(
             &ctx,
             true,
             const_string_bindings,
+            env_var_bindings,
             http_client_vars,
         );
         return;
@@ -328,6 +333,7 @@ fn collect_http_calls(
         &ctx,
         has_await,
         const_string_bindings,
+        env_var_bindings,
         http_client_vars,
     );
 }
@@ -339,6 +345,7 @@ fn walk_http_calls(
     ctx: &HttpCallContext,
     has_await: bool,
     const_string_bindings: &HashMap<String, String>,
+    env_var_bindings: &HashMap<String, String>,
     http_client_vars: &HashMap<String, HttpClientKind>,
 ) {
     if super::is_inline_test_subtree_root(file, &node) {
@@ -352,6 +359,7 @@ fn walk_http_calls(
             ctx,
             has_await,
             const_string_bindings,
+            env_var_bindings,
             http_client_vars,
         ) {
             out.push(call);
@@ -380,6 +388,7 @@ fn walk_http_calls(
                     &new_ctx,
                     false,
                     const_string_bindings,
+                    env_var_bindings,
                     http_client_vars,
                 );
             }
@@ -398,6 +407,7 @@ fn walk_http_calls(
                     ctx,
                     true,
                     const_string_bindings,
+                    env_var_bindings,
                     http_client_vars,
                 );
             }
@@ -415,6 +425,7 @@ fn walk_http_calls(
                 ctx,
                 has_await,
                 const_string_bindings,
+                env_var_bindings,
                 http_client_vars,
             );
         }
@@ -428,6 +439,7 @@ fn extract_http_call(
     ctx: &HttpCallContext,
     has_await: bool,
     const_string_bindings: &HashMap<String, String>,
+    env_var_bindings: &HashMap<String, String>,
     http_client_vars: &HashMap<String, HttpClientKind>,
 ) -> Option<HttpCallSite> {
     let func_node = node.child_by_field_name("function")?;
@@ -453,6 +465,7 @@ fn extract_http_call(
                     file,
                     &value_node,
                     const_string_bindings,
+                    env_var_bindings,
                     http_client_vars,
                 );
 
@@ -460,7 +473,7 @@ fn extract_http_call(
             // use the outer method with the inner client.
             if is_http_method(&method_name) && !matches!(inner_client, HttpClientKind::Other(_)) {
                 let (url_literal, url_expr) =
-                    extract_url_from_first_arg(file, node, const_string_bindings);
+                    extract_url_from_first_arg(file, node, const_string_bindings, env_var_bindings);
                 (method_name.clone(), inner_client, url_literal, url_expr)
             } else if is_http_method(&inner_method) {
                 // Inner call has the HTTP method (e.g., client.get(url).send())
@@ -483,7 +496,7 @@ fn extract_http_call(
             let object = file.text_for_node(&value_node);
             let client = detect_client_kind(&object, &callee_expr, http_client_vars)?;
             let (url_literal, url_expr) =
-                extract_url_from_first_arg(file, node, const_string_bindings);
+                extract_url_from_first_arg(file, node, const_string_bindings, env_var_bindings);
             (method_name.clone(), client, url_literal, url_expr)
         };
 
@@ -523,7 +536,7 @@ fn extract_http_call(
             let (has_timeout, timeout_value) = detect_timeout(&call_text);
 
             let (url_literal, url_expr) =
-                extract_url_from_first_arg(file, node, const_string_bindings);
+                extract_url_from_first_arg(file, node, const_string_bindings, env_var_bindings);
 
             return Some(HttpCallSite {
                 client_kind: HttpClientKind::ReqwestBlocking,
@@ -558,7 +571,7 @@ fn extract_http_call(
                 let (has_timeout, timeout_value) = detect_timeout(&call_text);
 
                 let (url_literal, url_expr) =
-                    extract_url_from_first_arg(file, node, const_string_bindings);
+                    extract_url_from_first_arg(file, node, const_string_bindings, env_var_bindings);
 
                 return Some(HttpCallSite {
                     client_kind: HttpClientKind::Ureq,
@@ -620,10 +633,79 @@ fn collect_string_const_bindings(
     out
 }
 
+fn collect_env_var_bindings(
+    file: &ParsedFile,
+    root: tree_sitter::Node,
+    const_string_bindings: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut out: HashMap<String, String> = HashMap::new();
+
+    fn walk(
+        file: &ParsedFile,
+        node: tree_sitter::Node,
+        const_string_bindings: &HashMap<String, String>,
+        out: &mut HashMap<String, String>,
+    ) {
+        if super::is_inline_test_subtree_root(file, &node) {
+            return;
+        }
+
+        // Best-effort: `let base = std::env::var("FOO")...;`
+        if node.kind() == "let_declaration" {
+            let pat = node.child_by_field_name("pattern");
+            let value = node.child_by_field_name("value");
+            if let (Some(pat), Some(value)) = (pat, value) {
+                if pat.kind() == "identifier" {
+                    let name = file.text_for_node(&pat);
+                    if let Some(env) =
+                        detect_env_var_name_rust_deep(file, value, const_string_bindings)
+                    {
+                        out.insert(name, env);
+                    }
+                }
+            }
+        }
+
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i) {
+                walk(file, child, const_string_bindings, out);
+            }
+        }
+    }
+
+    walk(file, root, const_string_bindings, &mut out);
+    out
+}
+
+fn detect_env_var_from_identifiers_deep(
+    file: &ParsedFile,
+    node: tree_sitter::Node,
+    env_var_bindings: &HashMap<String, String>,
+) -> Option<String> {
+    if env_var_bindings.is_empty() {
+        return None;
+    }
+    if node.kind() == "identifier" {
+        let name = file.text_for_node(&node);
+        if let Some(v) = env_var_bindings.get(&name) {
+            return Some(v.clone());
+        }
+    }
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i) {
+            if let Some(v) = detect_env_var_from_identifiers_deep(file, child, env_var_bindings) {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
 fn extract_url_from_first_arg(
     file: &ParsedFile,
     call: &tree_sitter::Node,
     const_string_bindings: &HashMap<String, String>,
+    env_var_bindings: &HashMap<String, String>,
 ) -> (Option<String>, Option<HttpUrlExpr>) {
     let args = match call.child_by_field_name("arguments") {
         Some(a) => a,
@@ -633,24 +715,25 @@ fn extract_url_from_first_arg(
         Some(a) => a,
         None => return (None, None),
     };
-    extract_url_from_expr(file, &first, const_string_bindings)
+    extract_url_from_expr(file, &first, const_string_bindings, env_var_bindings)
 }
 
 fn extract_url_from_expr(
     file: &ParsedFile,
     expr: &tree_sitter::Node,
     const_string_bindings: &HashMap<String, String>,
+    env_var_bindings: &HashMap<String, String>,
 ) -> (Option<String>, Option<HttpUrlExpr>) {
     // Unwrap references and parentheses.
     if expr.kind() == "reference_expression" {
         if let Some(v) = expr.child_by_field_name("value") {
-            return extract_url_from_expr(file, &v, const_string_bindings);
+            return extract_url_from_expr(file, &v, const_string_bindings, env_var_bindings);
         }
     }
     if expr.kind() == "parenthesized_expression" {
         // First named child should be the inner expression.
         if let Some(inner) = expr.named_child(0) {
-            return extract_url_from_expr(file, &inner, const_string_bindings);
+            return extract_url_from_expr(file, &inner, const_string_bindings, env_var_bindings);
         }
     }
 
@@ -658,7 +741,10 @@ fn extract_url_from_expr(
         return (Some(lit), None);
     }
 
-    let env_var = detect_env_var_name_rust_deep(file, *expr, const_string_bindings);
+    let mut env_var = detect_env_var_name_rust_deep(file, *expr, const_string_bindings);
+    if env_var.is_none() {
+        env_var = detect_env_var_from_identifiers_deep(file, *expr, env_var_bindings);
+    }
     let kind = match expr.kind() {
         "identifier" => HttpUrlExprKind::Identifier,
         "field_expression" => HttpUrlExprKind::Member,
@@ -809,6 +895,7 @@ fn extract_http_method_client_and_url(
     file: &ParsedFile,
     node: &tree_sitter::Node,
     const_string_bindings: &HashMap<String, String>,
+    env_var_bindings: &HashMap<String, String>,
     http_client_vars: &HashMap<String, HttpClientKind>,
 ) -> (String, HttpClientKind, Option<String>, Option<HttpUrlExpr>) {
     let func_node = node.child_by_field_name("function");
@@ -842,7 +929,7 @@ fn extract_http_method_client_and_url(
         if let Some(kind) = client_kind {
             if is_http_method(&inner_method) {
                 let (url_literal, url_expr) =
-                    extract_url_from_first_arg(file, node, const_string_bindings);
+                    extract_url_from_first_arg(file, node, const_string_bindings, env_var_bindings);
                 return (inner_method, kind, url_literal, url_expr);
             }
             if value_node.unwrap().kind() == "call_expression" {
@@ -850,11 +937,12 @@ fn extract_http_method_client_and_url(
                     file,
                     &value_node.unwrap(),
                     const_string_bindings,
+                    env_var_bindings,
                     http_client_vars,
                 );
             }
             let (url_literal, url_expr) =
-                extract_url_from_first_arg(file, node, const_string_bindings);
+                extract_url_from_first_arg(file, node, const_string_bindings, env_var_bindings);
             return (inner_method, kind, url_literal, url_expr);
         }
 
@@ -863,6 +951,7 @@ fn extract_http_method_client_and_url(
                 file,
                 &value_node.unwrap(),
                 const_string_bindings,
+                env_var_bindings,
                 http_client_vars,
             );
         }
@@ -874,7 +963,7 @@ fn extract_http_method_client_and_url(
         if path_text.contains("reqwest::blocking::") {
             let method_name = extract_method_from_blocking_call(&path_text);
             let (url_literal, url_expr) =
-                extract_url_from_first_arg(file, node, const_string_bindings);
+                extract_url_from_first_arg(file, node, const_string_bindings, env_var_bindings);
             return (
                 method_name,
                 HttpClientKind::ReqwestBlocking,
@@ -897,7 +986,7 @@ fn extract_http_method_client_and_url(
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| path_text.to_string());
             let (url_literal, url_expr) =
-                extract_url_from_first_arg(file, node, const_string_bindings);
+                extract_url_from_first_arg(file, node, const_string_bindings, env_var_bindings);
             return (method_name, HttpClientKind::Ureq, url_literal, url_expr);
         }
     }
@@ -1298,6 +1387,26 @@ async fn get_recipe() {
             .clone()
             .expect("url_expr should be present");
         assert_eq!(expr.env_var, Some("API_URL".to_string()));
+    }
+
+    #[test]
+    fn extracts_env_var_from_let_binding_used_in_format_macro() {
+        // Real-world: base URL is read once, then used in a format! call.
+        let src = r#"
+async fn f() {
+    let pantry_url = std::env::var("PANTRY_API_URL")
+        .unwrap_or_else(|_| "http://localhost:8081".to_string());
+    let client = reqwest::Client::new();
+    client.get(&format!("{}/pantry", pantry_url)).send().await;
+}
+"#;
+        let calls = parse_and_summarize_http(src);
+        assert_eq!(calls.len(), 1);
+        let expr = calls[0]
+            .url_expr
+            .clone()
+            .expect("url_expr should be present");
+        assert_eq!(expr.env_var, Some("PANTRY_API_URL".to_string()));
     }
 
     #[test]

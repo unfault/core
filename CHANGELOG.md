@@ -6,6 +6,12 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+## [0.1.19] - 2026-02-03
+
+### Fixed
+
+- Python HTTP extraction: fold simple base URL f-string bindings built from `os.getenv(..., default)` so remote hosts/ports can be derived for cross-workspace resolution.
+
 ## [0.1.18] - 2026-02-03
 
 ### Added
@@ -131,4 +137,5 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 [0.1.15]: https://github.com/unfault/core/compare/v0.1.14...v0.1.15
 [0.1.17]: https://github.com/unfault/core/compare/v0.1.16...v0.1.17
 [0.1.18]: https://github.com/unfault/core/compare/v0.1.17...v0.1.18
-[Unreleased]: https://github.com/unfault/core/compare/v0.1.18...main
+[0.1.19]: https://github.com/unfault/core/compare/v0.1.18...v0.1.19
+[Unreleased]: https://github.com/unfault/core/compare/v0.1.19...main

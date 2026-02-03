@@ -181,6 +181,8 @@ fn collect_http_calls(file: &ParsedFile, root: Node, out: &mut Vec<HttpCallSite>
         has_session_retry: bool,
         http_client_vars: &mut HashMap<String, HttpClientBinding>,
         env_var_bindings: &mut HashMap<String, String>,
+        env_default_bindings: &mut HashMap<String, String>,
+        derived_url_bindings: &mut HashMap<String, String>,
     ) {
         // Detect decorated function definitions (for retry decorator detection)
         // In tree-sitter Python, decorated functions are:
@@ -210,7 +212,7 @@ fn collect_http_calls(file: &ParsedFile, root: Node, out: &mut Vec<HttpCallSite>
         // - `session = requests.Session()`
         // - `async with httpx.AsyncClient() as client:` / `with requests.Session() as s:`
         if let Some((var_name, binding)) =
-            extract_http_client_assignment(file, node, env_var_bindings)
+            extract_http_client_assignment(file, node, env_var_bindings, derived_url_bindings)
         {
             http_client_vars.insert(var_name, binding);
         }
@@ -219,8 +221,19 @@ fn collect_http_calls(file: &ParsedFile, root: Node, out: &mut Vec<HttpCallSite>
         //   KITCHEN_URL = os.getenv("KITCHEN_URL")
         // This enables resolving f-strings like f"{KITCHEN_URL}/orders".
         if enclosing_fn_name.is_none() {
-            if let Some((var_name, env_name)) = extract_env_var_assignment(file, node) {
-                env_var_bindings.insert(var_name, env_name);
+            if let Some((var_name, env_name, default_val)) =
+                extract_env_var_assignment_with_default(file, node)
+            {
+                env_var_bindings.insert(var_name.clone(), env_name);
+                if let Some(d) = default_val {
+                    env_default_bindings.insert(var_name, d);
+                }
+            }
+
+            if let Some((var_name, base_url)) =
+                extract_base_url_assignment(file, node, env_default_bindings)
+            {
+                derived_url_bindings.insert(var_name, base_url);
             }
         }
 
@@ -236,6 +249,7 @@ fn collect_http_calls(file: &ParsedFile, root: Node, out: &mut Vec<HttpCallSite>
                 is_thread_offloaded,
                 http_client_vars,
                 env_var_bindings,
+                derived_url_bindings,
             ) {
                 // Set retry source based on context
                 if enclosing_fn_retry.is_some() {
@@ -259,6 +273,8 @@ fn collect_http_calls(file: &ParsedFile, root: Node, out: &mut Vec<HttpCallSite>
                 has_session_retry,
                 http_client_vars,
                 env_var_bindings,
+                env_default_bindings,
+                derived_url_bindings,
             );
             child = c.next_sibling();
         }
@@ -280,6 +296,8 @@ fn collect_http_calls(file: &ParsedFile, root: Node, out: &mut Vec<HttpCallSite>
     let mut enclosing_fn_retry: Option<RetrySource> = None;
     let mut http_client_vars: HashMap<String, HttpClientBinding> = HashMap::new();
     let mut env_var_bindings: HashMap<String, String> = HashMap::new();
+    let mut env_default_bindings: HashMap<String, String> = HashMap::new();
+    let mut derived_url_bindings: HashMap<String, String> = HashMap::new();
     walk(
         file,
         root,
@@ -290,6 +308,8 @@ fn collect_http_calls(file: &ParsedFile, root: Node, out: &mut Vec<HttpCallSite>
         has_session_retry,
         &mut http_client_vars,
         &mut env_var_bindings,
+        &mut env_default_bindings,
+        &mut derived_url_bindings,
     );
 }
 
@@ -356,6 +376,7 @@ fn extract_http_client_assignment(
     file: &ParsedFile,
     node: Node,
     env_var_bindings: &std::collections::HashMap<String, String>,
+    derived_url_bindings: &std::collections::HashMap<String, String>,
 ) -> Option<(String, HttpClientBinding)> {
     // Pattern 1: Assignment like `client = httpx.Client()`
     if node.kind() == "assignment" {
@@ -373,7 +394,8 @@ fn extract_http_client_assignment(
             return None;
         }
 
-        let binding = detect_http_client_constructor(file, right, env_var_bindings)?;
+        let binding =
+            detect_http_client_constructor(file, right, env_var_bindings, derived_url_bindings)?;
         return Some((var_name, binding));
     }
 
@@ -381,7 +403,9 @@ fn extract_http_client_assignment(
     // or `async with httpx.AsyncClient() as client:`
     // Tree-sitter structure varies - we look for with_item children
     if node.kind() == "with_statement" {
-        if let Some(result) = extract_with_statement_binding(file, node, env_var_bindings) {
+        if let Some(result) =
+            extract_with_statement_binding(file, node, env_var_bindings, derived_url_bindings)
+        {
             return Some(result);
         }
     }
@@ -389,7 +413,10 @@ fn extract_http_client_assignment(
     None
 }
 
-fn extract_env_var_assignment(file: &ParsedFile, node: Node) -> Option<(String, String)> {
+fn extract_env_var_assignment_with_default(
+    file: &ParsedFile,
+    node: Node,
+) -> Option<(String, String, Option<String>)> {
     if node.kind() != "assignment" {
         return None;
     }
@@ -403,7 +430,140 @@ fn extract_env_var_assignment(file: &ParsedFile, node: Node) -> Option<(String, 
 
     let var_name = file.text_for_node(&left);
     let env_name = detect_env_var_name(file, right)?;
-    Some((var_name, env_name))
+    let default_val = detect_env_var_default_value(file, right);
+    Some((var_name, env_name, default_val))
+}
+
+fn detect_env_var_default_value(file: &ParsedFile, expr: Node) -> Option<String> {
+    if expr.kind() != "call" {
+        return None;
+    }
+    let func = expr.child_by_field_name("function")?;
+    let func_text = file.text_for_node(&func);
+
+    // Only handle os.getenv("NAME", "DEFAULT")
+    if func_text != "os.getenv" {
+        return None;
+    }
+    let args = expr.child_by_field_name("arguments")?;
+    let default_arg = args.named_child(1)?;
+    if default_arg.kind() != "string" {
+        return None;
+    }
+    unquote_python_string_literal(file.text_for_node(&default_arg).trim())
+}
+
+fn extract_base_url_assignment(
+    file: &ParsedFile,
+    node: Node,
+    env_default_bindings: &std::collections::HashMap<String, String>,
+) -> Option<(String, String)> {
+    if node.kind() != "assignment" {
+        return None;
+    }
+
+    let left = node.child_by_field_name("left")?;
+    let right = node.child_by_field_name("right")?;
+    if left.kind() != "identifier" {
+        return None;
+    }
+    if right.kind() != "string" {
+        return None;
+    }
+
+    let var_name = file.text_for_node(&left);
+    let raw = file.text_for_node(&right);
+    let trimmed = raw.trim();
+    if !looks_like_f_string(trimmed) {
+        return None;
+    }
+
+    let (scheme, host_ident, port_ident) = parse_host_port_base_f_string(trimmed)?;
+    let host_default = env_default_bindings.get(&host_ident)?.to_string();
+    let port_default = env_default_bindings.get(&port_ident)?.to_string();
+
+    let base_url = format!("{}://{}:{}", scheme, host_default, port_default);
+    Some((var_name, base_url))
+}
+
+fn parse_host_port_base_f_string(s: &str) -> Option<(String, String, String)> {
+    // Handle common single-quoted / double-quoted f-strings: f"..." or f'...'
+    let bytes = s.as_bytes();
+    if bytes.len() < 4 {
+        return None;
+    }
+    if bytes[0] != b'f' {
+        return None;
+    }
+    let quote = bytes[1];
+    if quote != b'"' && quote != b'\'' {
+        return None;
+    }
+    if bytes[bytes.len() - 1] != quote {
+        return None;
+    }
+    let content = &s[2..s.len() - 1];
+    let scheme = if content.starts_with("http://") {
+        "http".to_string()
+    } else if content.starts_with("https://") {
+        "https".to_string()
+    } else {
+        return None;
+    };
+
+    // Expect: scheme://{HOST}:{PORT} (best-effort)
+    let rest = content.split_once("://")?.1;
+    let (host_part, port_part) = rest.split_once(':')?;
+
+    let host_ident = host_part
+        .trim()
+        .strip_prefix('{')?
+        .strip_suffix('}')?
+        .trim();
+    let port_ident = port_part
+        .trim()
+        .strip_prefix('{')?
+        .strip_suffix('}')?
+        .trim();
+
+    if host_ident.is_empty() || port_ident.is_empty() {
+        return None;
+    }
+
+    Some((scheme, host_ident.to_string(), port_ident.to_string()))
+}
+
+fn extract_single_placeholder_f_string(s: &str) -> Option<(String, String)> {
+    // Handle common f-strings: f"{BASE}/path" or f'{BASE}/path'
+    let bytes = s.as_bytes();
+    if bytes.len() < 5 {
+        return None;
+    }
+    if bytes[0] != b'f' {
+        return None;
+    }
+    let quote = bytes[1];
+    if quote != b'"' && quote != b'\'' {
+        return None;
+    }
+    if bytes[bytes.len() - 1] != quote {
+        return None;
+    }
+    let content = &s[2..s.len() - 1];
+    if !content.starts_with('{') {
+        return None;
+    }
+    let end = content.find('}')?;
+    let ident = content[1..end].trim();
+    if ident.is_empty() {
+        return None;
+    }
+    // Only support a single placeholder (no additional '{')
+    if content[end + 1..].contains('{') {
+        return None;
+    }
+    let suffix = content[end + 1..].to_string();
+    Some((ident.to_string(), suffix))
 }
 
 /// Extract HTTP client binding from a with statement.
@@ -412,12 +572,14 @@ fn extract_with_statement_binding(
     file: &ParsedFile,
     with_node: Node,
     env_var_bindings: &std::collections::HashMap<String, String>,
+    derived_url_bindings: &std::collections::HashMap<String, String>,
 ) -> Option<(String, HttpClientBinding)> {
     // Walk through all descendants looking for with_item nodes
     fn find_with_item_binding(
         file: &ParsedFile,
         node: Node,
         env_var_bindings: &std::collections::HashMap<String, String>,
+        derived_url_bindings: &std::collections::HashMap<String, String>,
     ) -> Option<(String, HttpClientBinding)> {
         if node.kind() == "with_item" {
             // The with_item structure is:
@@ -457,8 +619,12 @@ fn extract_with_statement_binding(
             }
 
             if let (Some(call), Some(name)) = (call_node, var_name) {
-                if let Some(binding) = detect_http_client_constructor(file, call, env_var_bindings)
-                {
+                if let Some(binding) = detect_http_client_constructor(
+                    file,
+                    call,
+                    env_var_bindings,
+                    derived_url_bindings,
+                ) {
                     return Some((name, binding));
                 }
             }
@@ -467,7 +633,9 @@ fn extract_with_statement_binding(
         // Recurse into children
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            if let Some(result) = find_with_item_binding(file, child, env_var_bindings) {
+            if let Some(result) =
+                find_with_item_binding(file, child, env_var_bindings, derived_url_bindings)
+            {
                 return Some(result);
             }
         }
@@ -475,7 +643,7 @@ fn extract_with_statement_binding(
         None
     }
 
-    find_with_item_binding(file, with_node, env_var_bindings)
+    find_with_item_binding(file, with_node, env_var_bindings, derived_url_bindings)
 }
 
 /// Check if a call node is constructing an HTTP client.
@@ -485,6 +653,7 @@ fn detect_http_client_constructor(
     file: &ParsedFile,
     call_node: Node,
     env_var_bindings: &std::collections::HashMap<String, String>,
+    derived_url_bindings: &std::collections::HashMap<String, String>,
 ) -> Option<HttpClientBinding> {
     let func = call_node.child_by_field_name("function")?;
 
@@ -505,8 +674,13 @@ fn detect_http_client_constructor(
         _ => return None,
     };
 
-    let (base_url, default_timeout) =
-        extract_client_defaults(file, call_node, &kind, env_var_bindings);
+    let (base_url, default_timeout) = extract_client_defaults(
+        file,
+        call_node,
+        &kind,
+        env_var_bindings,
+        derived_url_bindings,
+    );
 
     Some(HttpClientBinding {
         kind,
@@ -520,6 +694,7 @@ fn extract_client_defaults(
     call_node: Node,
     kind: &HttpClientKind,
     env_var_bindings: &std::collections::HashMap<String, String>,
+    derived_url_bindings: &std::collections::HashMap<String, String>,
 ) -> (Option<String>, Option<f64>) {
     let args = match call_node.child_by_field_name("arguments") {
         Some(a) => a,
@@ -546,7 +721,8 @@ fn extract_client_defaults(
         }
         if name == "base_url" {
             if matches!(kind, HttpClientKind::Httpx | HttpClientKind::Aiohttp) {
-                let (lit, _expr) = extract_url_from_expr(file, v, env_var_bindings);
+                let (lit, _expr) =
+                    extract_url_from_expr(file, v, env_var_bindings, derived_url_bindings);
                 base_url = lit;
             }
         }
@@ -563,6 +739,7 @@ fn extract_http_call(
     is_thread_offloaded: bool,
     http_client_vars: &std::collections::HashMap<String, HttpClientBinding>,
     env_var_bindings: &std::collections::HashMap<String, String>,
+    derived_url_bindings: &std::collections::HashMap<String, String>,
 ) -> Option<HttpCallSite> {
     let func = call_node.child_by_field_name("function")?;
 
@@ -603,8 +780,13 @@ fn extract_http_call(
         None => (default_timeout, default_timeout.is_some()),
     };
 
-    let (url_literal_raw, url_expr_raw) =
-        extract_url_from_call_args(file, call_node, method_name.as_str(), env_var_bindings);
+    let (url_literal_raw, url_expr_raw) = extract_url_from_call_args(
+        file,
+        call_node,
+        method_name.as_str(),
+        env_var_bindings,
+        derived_url_bindings,
+    );
     let (url_literal, url_expr) =
         apply_base_url(base_url.as_deref(), url_literal_raw, url_expr_raw);
 
@@ -634,6 +816,7 @@ fn extract_url_from_call_args(
     call_node: Node,
     method_name: &str,
     env_var_bindings: &std::collections::HashMap<String, String>,
+    derived_url_bindings: &std::collections::HashMap<String, String>,
 ) -> (Option<String>, Option<HttpUrlExpr>) {
     let args = match call_node.child_by_field_name("arguments") {
         Some(a) => a,
@@ -663,7 +846,7 @@ fn extract_url_from_call_args(
         None => return (None, None),
     };
 
-    extract_url_from_expr(file, arg, env_var_bindings)
+    extract_url_from_expr(file, arg, env_var_bindings, derived_url_bindings)
 }
 
 /// Extract `timeout=` keyword argument.
@@ -777,6 +960,7 @@ fn extract_url_from_expr(
     file: &ParsedFile,
     expr: Node,
     env_var_bindings: &std::collections::HashMap<String, String>,
+    derived_url_bindings: &std::collections::HashMap<String, String>,
 ) -> (Option<String>, Option<HttpUrlExpr>) {
     let text = file.text_for_node(&expr);
     let trimmed = text.trim();
@@ -786,6 +970,26 @@ fn extract_url_from_expr(
         // Treat f-strings as templates (non-literal)
         if looks_like_f_string(trimmed) {
             let env_var = detect_env_var_in_f_string(file, expr, env_var_bindings);
+
+            // Best-effort: resolve trivial base-url templates.
+            // Example:
+            //   KITCHEN_URL = f"http://{KITCHEN_HOST}:{KITCHEN_PORT}"
+            //   client.post(f"{KITCHEN_URL}/orders")
+            // When KITCHEN_HOST/KITCHEN_PORT have defaults, we can fold the call URL
+            // into a literal using those defaults.
+            if env_var.is_none() {
+                if let Some((base_ident, suffix)) = extract_single_placeholder_f_string(trimmed) {
+                    if let Some(base) = derived_url_bindings.get(&base_ident) {
+                        let joined = if suffix.is_empty() {
+                            base.to_string()
+                        } else {
+                            format!("{}{}", base.trim_end_matches('/'), suffix)
+                        };
+                        return (Some(joined), None);
+                    }
+                }
+            }
+
             return (
                 None,
                 Some(HttpUrlExpr {
@@ -1107,8 +1311,8 @@ requests.get(url)
     #[test]
     fn extracts_env_var_from_f_string_identifier_binding() {
         let src = r#"
-import os
-KITCHEN_URL = os.getenv('KITCHEN_URL')
+ import os
+ KITCHEN_URL = os.getenv('KITCHEN_URL')
 
 async def create_order():
     async with httpx.AsyncClient() as client:
@@ -1124,6 +1328,30 @@ async def create_order():
             .expect("url_expr should be present");
         assert_eq!(expr.kind, HttpUrlExprKind::Template);
         assert_eq!(expr.env_var, Some("KITCHEN_URL".to_string()));
+    }
+
+    #[test]
+    fn resolves_base_url_f_string_with_env_defaults() {
+        let src = r#"
+import os
+import httpx
+
+KITCHEN_HOST = os.getenv("KITCHEN_HOST", "localhost")
+KITCHEN_PORT = os.getenv("KITCHEN_PORT", "8081")
+KITCHEN_URL = f"http://{KITCHEN_HOST}:{KITCHEN_PORT}"
+
+async def create_order():
+    async with httpx.AsyncClient() as client:
+        await client.post(f"{KITCHEN_URL}/orders")
+"#;
+
+        let calls = parse_and_summarize_http(src);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].url_literal.as_deref(),
+            Some("http://localhost:8081/orders")
+        );
+        assert!(calls[0].url_expr.is_none());
     }
 
     #[test]

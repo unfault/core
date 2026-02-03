@@ -6,6 +6,20 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+## [0.1.18] - 2026-02-03
+
+### Added
+
+- Cross-workspace HTTP tracing support:
+  - Add `workspace_id` and `listening_ports` fields to `IntermediateRepresentation`.
+  - Add `IntermediateRepresentation::with_workspace()` constructor.
+  - Add `detected_ports()` method to `SourceSemantics` for port extraction.
+- Listening port detection from env var defaults across all languages:
+  - Python: `os.getenv("PORT", "8080")`, `os.environ.get("PORT", "8080")`
+  - Rust: `env::var("PORT").unwrap_or("8081")`
+  - Go: `os.Getenv` with PORT-like variable names
+  - TypeScript: `process.env.PORT` patterns
+
 ## [0.1.17] - 2026-02-02
 
 ### Added
@@ -116,4 +130,5 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 [0.1.16]: https://github.com/unfault/core/compare/v0.1.15...v0.1.16
 [0.1.15]: https://github.com/unfault/core/compare/v0.1.14...v0.1.15
 [0.1.17]: https://github.com/unfault/core/compare/v0.1.16...v0.1.17
-[Unreleased]: https://github.com/unfault/core/compare/v0.1.17...main
+[0.1.18]: https://github.com/unfault/core/compare/v0.1.17...v0.1.18
+[Unreleased]: https://github.com/unfault/core/compare/v0.1.18...main

@@ -17,6 +17,25 @@ pub mod route_patterns;
 use crate::parse::ast::{AstLocation, FileId};
 use crate::types::context::Language;
 
+/// An environment variable binding detected in source code.
+///
+/// Used for cross-workspace port detection - when we see patterns like
+/// `port = os.getenv("PORT", "8080")` or `env::var("PORT").unwrap_or("8081")`,
+/// we extract the env var name and default value.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EnvVarBinding {
+    /// Variable name being assigned (e.g., "port", "KITCHEN_PORT")
+    pub target: String,
+    /// Environment variable name (e.g., "WAITER_PORT", "PORT")
+    pub env_var_name: String,
+    /// Default value if provided (e.g., "8080")
+    pub default_value: Option<String>,
+    /// Whether this looks like a port binding (env var name contains "PORT" and default is numeric)
+    pub is_port: bool,
+    /// The numeric port value if this is a port binding
+    pub port_value: Option<u16>,
+}
+
 pub use self::annotations::{Annotation, AnnotationType, FunctionAnnotations};
 pub use self::error_context::{ErrorContext, ErrorContextType, ErrorSummary};
 pub use self::route_patterns::{RouteFramework, RoutePattern};
@@ -65,6 +84,20 @@ pub trait CommonSemantics: Send + Sync {
 
     /// Get error handling contexts (try/catch, error propagation)
     fn error_contexts(&self) -> Vec<error_context::ErrorContext>;
+
+    /// Get environment variable bindings detected in this file
+    fn env_var_bindings(&self) -> Vec<EnvVarBinding>;
+
+    /// Get detected listening ports from env var defaults.
+    ///
+    /// Returns ports extracted from patterns like `os.getenv("PORT", "8080")`
+    /// where the env var name contains "PORT" and the default is numeric.
+    fn detected_ports(&self) -> Vec<u16> {
+        self.env_var_bindings()
+            .into_iter()
+            .filter_map(|b| b.port_value)
+            .collect()
+    }
 
     /// Check if a specific import exists by module path
     fn has_import(&self, module: &str) -> bool {

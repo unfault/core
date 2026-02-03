@@ -243,7 +243,7 @@ mod tests {
     #[test]
     fn error_context_with_function() {
         let ctx = ErrorContext::new(ErrorContextType::SpecificCatch(vec![
-            "IOException".to_string(),
+            "IOException".to_string()
         ]))
         .with_error_variable("e")
         .with_enclosing_function("readFile");

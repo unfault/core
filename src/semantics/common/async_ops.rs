@@ -408,20 +408,14 @@ mod tests {
 
     #[test]
     fn async_runtime_timeout_function() {
-        assert!(
-            AsyncRuntime::Asyncio
-                .timeout_function()
-                .contains("asyncio.timeout")
-        );
-        assert!(
-            AsyncRuntime::Tokio
-                .timeout_function()
-                .contains("tokio::time::timeout")
-        );
-        assert!(
-            AsyncRuntime::Goroutine
-                .timeout_function()
-                .contains("context.WithTimeout")
-        );
+        assert!(AsyncRuntime::Asyncio
+            .timeout_function()
+            .contains("asyncio.timeout"));
+        assert!(AsyncRuntime::Tokio
+            .timeout_function()
+            .contains("tokio::time::timeout"));
+        assert!(AsyncRuntime::Goroutine
+            .timeout_function()
+            .contains("context.WithTimeout"));
     }
 }

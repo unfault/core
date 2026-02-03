@@ -582,8 +582,8 @@ impl FrameworkDetector {
 mod tests {
     use super::*;
     use crate::parse::ast::FileId;
-    use crate::semantics::common::CommonLocation;
     use crate::semantics::common::imports::{ImportBuilder, ImportStyle};
+    use crate::semantics::common::CommonLocation;
 
     fn make_location() -> CommonLocation {
         CommonLocation {

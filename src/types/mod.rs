@@ -8,9 +8,9 @@ pub mod session_result;
 pub mod workspace;
 
 pub use dependency::{
-    BlockType, DependencyProtocol, DependencySource, RuntimeDependency, is_dynamic_uri,
+    is_dynamic_uri, BlockType, DependencyProtocol, DependencySource, RuntimeDependency,
 };
-pub use patch::{FilePatch, PatchHunk, PatchRange, apply_file_patch, make_unified_diff};
+pub use patch::{apply_file_patch, make_unified_diff, FilePatch, PatchHunk, PatchRange};
 
 pub use workspace::{AdvertisedProfile, MetaFile, MetaFileKind, WorkspaceDescriptor};
 

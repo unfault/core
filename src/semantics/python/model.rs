@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::parse::ast::{AstLocation, FileId, ParsedFile};
-use crate::semantics::common::CommonLocation;
 use crate::semantics::common::calls::FunctionCall;
+use crate::semantics::common::CommonLocation;
 use crate::semantics::python::http::HttpCallSite;
 use crate::semantics::python::orm::OrmQueryCall;
 use crate::types::context::Language;
@@ -84,6 +84,13 @@ pub struct PyFileSemantics {
 
     /// Detected decorators (logging, retry, etc.)
     pub decorators: Vec<Decorator>,
+
+    /// Environment variable bindings with defaults (for cross-workspace port detection).
+    ///
+    /// Captures patterns like `port = os.getenv("PORT", "8080")` or
+    /// `host = os.environ.get("HOST", "localhost")`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env_var_bindings: Vec<crate::semantics::common::EnvVarBinding>,
 }
 
 /// Information about a decorator found in the code.
@@ -242,6 +249,7 @@ impl PyFileSemantics {
             module_docstring_end_line: find_module_docstring_end_line(parsed),
             async_operations: Vec::new(),
             decorators: Vec::new(),
+            env_var_bindings: Vec::new(),
         };
 
         if parsed.language == Language::Python {
@@ -953,6 +961,9 @@ fn collect_semantics(parsed: &ParsedFile, sem: &mut PyFileSemantics) {
 
     // Second pass: collect bare except clauses with function context
     collect_bare_excepts(parsed, sem);
+
+    // Third pass: extract env var bindings from assignments and calls
+    extract_env_var_bindings(sem);
 }
 
 /// Walk nodes while tracking loop/comprehension context.
@@ -1849,6 +1860,85 @@ fn extract_decorator_name_and_params(decorator_text: &str) -> (String, Vec<Strin
     (name, params)
 }
 
+/// Extract environment variable bindings from assignments and calls.
+///
+/// Looks for patterns like:
+/// - `port = os.getenv("PORT", "8080")`
+/// - `host = os.environ.get("HOST", "localhost")`
+/// - `KITCHEN_PORT = os.getenv("KITCHEN_PORT", "8081")`
+///
+/// When the env var name contains "PORT" and the default is a numeric string,
+/// marks it as a port binding and extracts the port value.
+fn extract_env_var_bindings(sem: &mut PyFileSemantics) {
+    use crate::semantics::common::EnvVarBinding;
+
+    // Look at each call and find os.getenv / os.environ.get patterns
+    for call in &sem.calls {
+        let callee = &call.function_call.callee_expr;
+
+        // Check for os.getenv("VAR", "default") or os.environ.get("VAR", "default")
+        let is_getenv = callee == "os.getenv";
+        let is_environ_get = callee == "os.environ.get";
+
+        if !is_getenv && !is_environ_get {
+            continue;
+        }
+
+        // Need at least 2 arguments: env var name and default value
+        if call.args.len() < 2 {
+            continue;
+        }
+
+        // Extract env var name (first arg)
+        let env_var_name = call.args[0]
+            .value_repr
+            .trim_matches('"')
+            .trim_matches('\'')
+            .to_string();
+
+        // Extract default value (second arg)
+        let default_raw = call.args[1]
+            .value_repr
+            .trim_matches('"')
+            .trim_matches('\'')
+            .to_string();
+
+        // Check if this looks like a port binding
+        let is_port = env_var_name.to_uppercase().contains("PORT");
+        let port_value = if is_port {
+            default_raw.parse::<u16>().ok()
+        } else {
+            None
+        };
+
+        // Try to find the assignment target for this call
+        // Look for assignments where the value_repr contains this call
+        let target = sem
+            .assignments
+            .iter()
+            .find(|a| {
+                a.value_repr
+                    .contains(&format!("os.getenv(\"{}\"", env_var_name))
+                    || a.value_repr
+                        .contains(&format!("os.getenv('{}'", env_var_name))
+                    || a.value_repr
+                        .contains(&format!("os.environ.get(\"{}\"", env_var_name))
+                    || a.value_repr
+                        .contains(&format!("os.environ.get('{}'", env_var_name))
+            })
+            .map(|a| a.target.clone())
+            .unwrap_or_else(|| env_var_name.clone());
+
+        sem.env_var_bindings.push(EnvVarBinding {
+            target,
+            env_var_name,
+            default_value: Some(default_raw),
+            is_port,
+            port_value,
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2084,21 +2174,19 @@ async def async_func():
     #[test]
     fn collects_simple_function_call() {
         let sem = parse_and_build_semantics("print('hello')");
-        assert!(
-            sem.calls
-                .iter()
-                .any(|c| c.function_call.callee_expr == "print")
-        );
+        assert!(sem
+            .calls
+            .iter()
+            .any(|c| c.function_call.callee_expr == "print"));
     }
 
     #[test]
     fn collects_method_call() {
         let sem = parse_and_build_semantics("app.add_middleware(CORSMiddleware)");
-        assert!(
-            sem.calls
-                .iter()
-                .any(|c| c.function_call.callee_expr == "app.add_middleware")
-        );
+        assert!(sem
+            .calls
+            .iter()
+            .any(|c| c.function_call.callee_expr == "app.add_middleware"));
     }
 
     #[test]
@@ -2119,16 +2207,14 @@ result = outer(inner(x))
 "#;
         let sem = parse_and_build_semantics(src);
         // Should collect both outer and inner calls
-        assert!(
-            sem.calls
-                .iter()
-                .any(|c| c.function_call.callee_expr == "outer")
-        );
-        assert!(
-            sem.calls
-                .iter()
-                .any(|c| c.function_call.callee_expr == "inner")
-        );
+        assert!(sem
+            .calls
+            .iter()
+            .any(|c| c.function_call.callee_expr == "outer"));
+        assert!(sem
+            .calls
+            .iter()
+            .any(|c| c.function_call.callee_expr == "inner"));
     }
 
     #[test]
@@ -2250,16 +2336,14 @@ def helper():
         assert!(sem.functions.iter().any(|f| f.name == "helper"));
 
         // Should have calls
-        assert!(
-            sem.calls
-                .iter()
-                .any(|c| c.function_call.callee_expr == "FastAPI")
-        );
-        assert!(
-            sem.calls
-                .iter()
-                .any(|c| c.function_call.callee_expr == "app.add_middleware")
-        );
+        assert!(sem
+            .calls
+            .iter()
+            .any(|c| c.function_call.callee_expr == "FastAPI"));
+        assert!(sem
+            .calls
+            .iter()
+            .any(|c| c.function_call.callee_expr == "app.add_middleware"));
     }
 
     #[test]
@@ -2913,5 +2997,67 @@ import SQLAlchemy
         // Note: The actual import statement would fail in Python,
         // but our detection should be case-insensitive
         assert!(sem.has_orm_imports());
+    }
+
+    #[test]
+    fn extracts_env_var_port_binding() {
+        let src = r#"
+import os
+port = int(os.getenv("WAITER_PORT", "8080"))
+"#;
+        let sem = parse_and_build_semantics(src);
+
+        assert_eq!(sem.env_var_bindings.len(), 1);
+        let binding = &sem.env_var_bindings[0];
+        assert_eq!(binding.env_var_name, "WAITER_PORT");
+        assert_eq!(binding.default_value, Some("8080".to_string()));
+        assert!(binding.is_port);
+        assert_eq!(binding.port_value, Some(8080));
+    }
+
+    #[test]
+    fn extracts_multiple_env_var_bindings() {
+        let src = r#"
+import os
+host = os.getenv("KITCHEN_HOST", "localhost")
+port = os.getenv("KITCHEN_PORT", "8081")
+"#;
+        let sem = parse_and_build_semantics(src);
+
+        assert_eq!(sem.env_var_bindings.len(), 2);
+
+        let host_binding = sem
+            .env_var_bindings
+            .iter()
+            .find(|b| b.env_var_name == "KITCHEN_HOST")
+            .expect("should have KITCHEN_HOST binding");
+        assert_eq!(host_binding.default_value, Some("localhost".to_string()));
+        assert!(!host_binding.is_port);
+        assert_eq!(host_binding.port_value, None);
+
+        let port_binding = sem
+            .env_var_bindings
+            .iter()
+            .find(|b| b.env_var_name == "KITCHEN_PORT")
+            .expect("should have KITCHEN_PORT binding");
+        assert_eq!(port_binding.default_value, Some("8081".to_string()));
+        assert!(port_binding.is_port);
+        assert_eq!(port_binding.port_value, Some(8081));
+    }
+
+    #[test]
+    fn extracts_env_var_with_environ_get() {
+        let src = r#"
+import os
+port = os.environ.get("PORT", "3000")
+"#;
+        let sem = parse_and_build_semantics(src);
+
+        assert_eq!(sem.env_var_bindings.len(), 1);
+        let binding = &sem.env_var_bindings[0];
+        assert_eq!(binding.env_var_name, "PORT");
+        assert_eq!(binding.default_value, Some("3000".to_string()));
+        assert!(binding.is_port);
+        assert_eq!(binding.port_value, Some(3000));
     }
 }

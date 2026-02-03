@@ -81,6 +81,12 @@ pub struct RustFileSemantics {
 
     /// HTTP client calls (reqwest, ureq, hyper, etc.)
     pub http_calls: Vec<HttpCall>,
+
+    /// Environment variable bindings with defaults (for cross-workspace port detection).
+    ///
+    /// Captures patterns like `env::var("PORT").unwrap_or("8080".to_string())`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env_var_bindings: Vec<crate::semantics::common::EnvVarBinding>,
 }
 
 /// Use statement (import).
@@ -673,6 +679,7 @@ impl RustFileSemantics {
             rust_framework: None,
             db_operations: Vec::new(),
             http_calls: Vec::new(),
+            env_var_bindings: Vec::new(),
         }
     }
 }

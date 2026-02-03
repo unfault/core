@@ -20,14 +20,14 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use petgraph::Direction;
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
+use petgraph::Direction;
 use serde::{Deserialize, Serialize};
 
 use crate::parse::ast::FileId;
-use crate::semantics::common::CommonSemantics;
 use crate::semantics::common::http::HttpCall;
+use crate::semantics::common::CommonSemantics;
 use crate::semantics::go::frameworks::GoFrameworkSummary;
 use crate::semantics::go::model::GoFileSemantics;
 use crate::semantics::python::django::{DjangoFileSummary, ViewType};
@@ -2810,9 +2810,9 @@ mod tests {
     use crate::parse::ast::FileId;
     use crate::parse::python::parse_python_file;
     use crate::parse::rust::parse_rust_file;
-    use crate::semantics::SourceSemantics;
     use crate::semantics::python::model::PyFileSemantics;
     use crate::semantics::rust::build_rust_semantics;
+    use crate::semantics::SourceSemantics;
     use crate::types::context::{Language, SourceFile};
 
     /// Helper to parse Python source and build semantics with framework analysis
@@ -2854,6 +2854,51 @@ mod tests {
         let parsed = parse_rust_file(file_id, &sf).expect("parsing should succeed");
         let sem = build_rust_semantics(&parsed).expect("semantics should succeed");
         (file_id, Arc::new(SourceSemantics::Rust(sem)))
+    }
+
+    #[test]
+    fn emits_http_call_edges_for_python_httpx() {
+        let (fid, sem) = parse_and_build_semantics(
+            "app.py",
+            r#"
+import httpx
+
+async def fetch():
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        await client.get("http://example.com/health")
+"#,
+        );
+
+        let cg = build_code_graph(&[(fid, sem)]);
+
+        // Find the RemoteServer node.
+        let mut remote_idx: Option<NodeIndex> = None;
+        for idx in cg.graph.node_indices() {
+            if let GraphNode::RemoteServer { kind, id } = &cg.graph[idx] {
+                if *kind == RemoteServerKind::Host && id == "example.com" {
+                    remote_idx = Some(idx);
+                    break;
+                }
+            }
+        }
+        let remote_idx = remote_idx.expect("expected RemoteServer(host:example.com)");
+
+        // Find the function node for `fetch`.
+        let func_idx = cg
+            .function_nodes
+            .get(&(fid, "fetch".to_string()))
+            .copied()
+            .expect("expected Function(fetch) node");
+
+        // Ensure we emitted an HttpCall edge from fetch -> remote.
+        let has_edge = cg
+            .graph
+            .edges_connecting(func_idx, remote_idx)
+            .any(|e| matches!(e.weight(), GraphEdgeKind::HttpCall { method, library, .. } if method == "GET" && library == "httpx"));
+        assert!(
+            has_edge,
+            "expected HttpCall(GET,httpx) edge from fetch to example.com"
+        );
     }
 
     // ==================== CodeGraph Tests ====================
@@ -3206,14 +3251,12 @@ async def fetch_user(user_id):
         assert!(stats.function_count >= 2);
 
         // Functions should be in lookup
-        assert!(
-            cg.function_nodes
-                .contains_key(&(file_id, "process_data".to_string()))
-        );
-        assert!(
-            cg.function_nodes
-                .contains_key(&(file_id, "fetch_user".to_string()))
-        );
+        assert!(cg
+            .function_nodes
+            .contains_key(&(file_id, "process_data".to_string())));
+        assert!(cg
+            .function_nodes
+            .contains_key(&(file_id, "fetch_user".to_string())));
     }
 
     #[test]
@@ -3989,14 +4032,12 @@ def bar():
         // Verify lookups are restored
         assert!(cg.file_nodes.contains_key(&file_id));
         assert!(cg.path_to_file.contains_key("test.py"));
-        assert!(
-            cg.function_nodes
-                .contains_key(&(file_id, "my_func".to_string()))
-        );
-        assert!(
-            cg.class_nodes
-                .contains_key(&(file_id, "MyClass".to_string()))
-        );
+        assert!(cg
+            .function_nodes
+            .contains_key(&(file_id, "my_func".to_string())));
+        assert!(cg
+            .class_nodes
+            .contains_key(&(file_id, "MyClass".to_string())));
         assert!(cg.external_modules.contains_key("requests"));
     }
 
@@ -4100,14 +4141,12 @@ def main():
         let cg = build_code_graph(&sem_entries);
 
         // Both functions should exist
-        assert!(
-            cg.function_nodes
-                .contains_key(&(helper_id, "helper_func".to_string()))
-        );
-        assert!(
-            cg.function_nodes
-                .contains_key(&(main_id, "main".to_string()))
-        );
+        assert!(cg
+            .function_nodes
+            .contains_key(&(helper_id, "helper_func".to_string())));
+        assert!(cg
+            .function_nodes
+            .contains_key(&(main_id, "main".to_string())));
 
         // Check that there's an import edge from main.py to helpers.py
         let stats = cg.stats();
@@ -4379,14 +4418,12 @@ def main():
         let cg = build_code_graph(&sem_entries);
 
         // Verify both functions exist
-        assert!(
-            cg.function_nodes
-                .contains_key(&(utils_id, "add".to_string()))
-        );
-        assert!(
-            cg.function_nodes
-                .contains_key(&(app_id, "main".to_string()))
-        );
+        assert!(cg
+            .function_nodes
+            .contains_key(&(utils_id, "add".to_string())));
+        assert!(cg
+            .function_nodes
+            .contains_key(&(app_id, "main".to_string())));
 
         // Key assertion: There should be a Calls edge from main() to add()
         let stats = cg.stats();
@@ -4459,14 +4496,12 @@ def process(db):
         let cg = build_code_graph(&sem_entries);
 
         // Verify both functions exist
-        assert!(
-            cg.function_nodes
-                .contains_key(&(file_id, "add".to_string()))
-        );
-        assert!(
-            cg.function_nodes
-                .contains_key(&(file_id, "process".to_string()))
-        );
+        assert!(cg
+            .function_nodes
+            .contains_key(&(file_id, "add".to_string())));
+        assert!(cg
+            .function_nodes
+            .contains_key(&(file_id, "process".to_string())));
 
         // Get the function nodes
         let add_func_idx = cg

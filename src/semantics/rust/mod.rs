@@ -16,9 +16,9 @@ pub use model::RustFileSemantics;
 use anyhow::Result;
 
 use crate::parse::ast::ParsedFile;
-use crate::semantics::common::CommonLocation;
 use crate::semantics::common::calls::FunctionCall;
 use crate::semantics::common::db::{DbLibrary, DbOperation, DbOperationType};
+use crate::semantics::common::CommonLocation;
 
 /// Build the semantic model for a single Rust file.
 ///
@@ -31,6 +31,7 @@ pub fn build_rust_semantics(parsed: &ParsedFile) -> Result<RustFileSemantics> {
     analyze_unsafe_patterns(parsed, &mut sem);
     analyze_frameworks(parsed, &mut sem);
     analyze_http_calls(parsed, &mut sem);
+    extract_env_var_bindings(parsed, &mut sem);
     Ok(sem)
 }
 
@@ -2228,6 +2229,154 @@ fn detect_unsafe_operations(text: &str) -> Vec<model::UnsafeOp> {
     ops
 }
 
+/// Extract environment variable bindings from Rust code.
+///
+/// Looks for patterns like:
+/// - `env::var("PORT").unwrap_or("8080".to_string())`
+/// - `env::var("PORT").unwrap_or_else(|_| "8080".to_string())`
+/// - `std::env::var("PORT").unwrap_or_default()`
+///
+/// When the env var name contains "PORT" and the default is a numeric string,
+/// marks it as a port binding and extracts the port value.
+fn extract_env_var_bindings(parsed: &ParsedFile, sem: &mut RustFileSemantics) {
+    let root = parsed.tree.root_node();
+    let mut bindings = Vec::new();
+
+    // Walk the AST looking for env::var calls with unwrap_or/unwrap_or_else
+    walk_for_env_var_bindings(parsed, root, &mut bindings);
+
+    // Deduplicate by env_var_name (nested method chains produce multiple matches)
+    let mut seen = std::collections::HashSet::new();
+    bindings.retain(|b| seen.insert(b.env_var_name.clone()));
+
+    sem.env_var_bindings = bindings;
+}
+
+/// Recursively walk AST looking for env var bindings.
+fn walk_for_env_var_bindings(
+    parsed: &ParsedFile,
+    node: tree_sitter::Node,
+    bindings: &mut Vec<crate::semantics::common::EnvVarBinding>,
+) {
+    // Look for method call expressions that might be env::var().unwrap_or()
+    if node.kind() == "call_expression" || node.kind() == "method_call_expression" {
+        if let Some(binding) = try_extract_env_var_binding(parsed, node) {
+            bindings.push(binding);
+        }
+    }
+
+    // Recurse into children
+    for child in node.children(&mut node.walk()) {
+        walk_for_env_var_bindings(parsed, child, bindings);
+    }
+}
+
+/// Try to extract an env var binding from a potential env::var().unwrap_or() pattern.
+fn try_extract_env_var_binding(
+    parsed: &ParsedFile,
+    node: tree_sitter::Node,
+) -> Option<crate::semantics::common::EnvVarBinding> {
+    let text = parsed.text_for_node(&node);
+
+    // Must contain env::var or std::env::var
+    if !text.contains("env::var") {
+        return None;
+    }
+
+    // Must have unwrap_or or unwrap_or_else with a default
+    let has_unwrap_or = text.contains("unwrap_or(") || text.contains("unwrap_or_else(");
+    if !has_unwrap_or {
+        return None;
+    }
+
+    // Extract the env var name from env::var("NAME")
+    let env_var_name = extract_env_var_name_from_text(&text)?;
+
+    // Extract the default value from unwrap_or("default") or unwrap_or_else(|_| "default")
+    let default_value = extract_default_value_from_text(&text);
+
+    // Check if this looks like a port binding
+    let is_port = env_var_name.to_uppercase().contains("PORT");
+    let port_value = if is_port {
+        default_value
+            .as_ref()
+            .and_then(|d| d.trim_matches('"').parse::<u16>().ok())
+    } else {
+        None
+    };
+
+    // Try to find the assignment target (the variable being assigned to)
+    let target = find_assignment_target(parsed, node).unwrap_or_else(|| env_var_name.clone());
+
+    Some(crate::semantics::common::EnvVarBinding {
+        target,
+        env_var_name,
+        default_value,
+        is_port,
+        port_value,
+    })
+}
+
+/// Extract the env var name from text containing env::var("NAME")
+fn extract_env_var_name_from_text(text: &str) -> Option<String> {
+    // Look for env::var("...") or env::var_os("...")
+    let patterns = ["env::var(\"", "env::var_os(\""];
+
+    for pattern in patterns {
+        if let Some(start) = text.find(pattern) {
+            let after_quote = start + pattern.len();
+            if let Some(end_quote) = text[after_quote..].find('"') {
+                return Some(text[after_quote..after_quote + end_quote].to_string());
+            }
+        }
+    }
+
+    None
+}
+
+/// Extract the default value from unwrap_or("default") or unwrap_or_else(|_| "default".to_string())
+fn extract_default_value_from_text(text: &str) -> Option<String> {
+    // Look for unwrap_or("...") pattern
+    if let Some(idx) = text.find("unwrap_or(\"") {
+        let after = idx + "unwrap_or(\"".len();
+        if let Some(end) = text[after..].find('"') {
+            return Some(text[after..after + end].to_string());
+        }
+    }
+
+    // Look for unwrap_or_else(|_| "...".to_string()) pattern
+    if let Some(idx) = text.find("unwrap_or_else(") {
+        let after = idx + "unwrap_or_else(".len();
+        // Find the string literal inside
+        if let Some(quote_start) = text[after..].find('"') {
+            let str_start = after + quote_start + 1;
+            if let Some(quote_end) = text[str_start..].find('"') {
+                return Some(text[str_start..str_start + quote_end].to_string());
+            }
+        }
+    }
+
+    None
+}
+
+/// Find the assignment target for an expression (let binding).
+fn find_assignment_target(parsed: &ParsedFile, node: tree_sitter::Node) -> Option<String> {
+    // Walk up to find a let_declaration
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "let_declaration" {
+            // Find the pattern (identifier)
+            if let Some(pattern) = parent.child_by_field_name("pattern") {
+                if pattern.kind() == "identifier" {
+                    return Some(parsed.text_for_node(&pattern));
+                }
+            }
+        }
+        current = parent;
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2526,5 +2675,126 @@ async fn fetch() -> Result<String, reqwest::Error> {
         // Verify via CommonSemantics trait
         let http_calls = sem.http_calls();
         assert_eq!(http_calls.len(), 1);
+    }
+
+    // =============================================================================
+    // Environment Variable Binding Tests
+    // =============================================================================
+
+    #[test]
+    fn extracts_env_var_port_binding_unwrap_or() {
+        let src = r#"
+use std::env;
+
+fn main() {
+    let port = env::var("KITCHEN_PORT").unwrap_or("8081".to_string());
+}
+"#;
+        let sem = parse_and_build_semantics(src);
+        assert_eq!(sem.env_var_bindings.len(), 1);
+
+        let binding = &sem.env_var_bindings[0];
+        assert_eq!(binding.env_var_name, "KITCHEN_PORT");
+        assert_eq!(binding.default_value, Some("8081".to_string()));
+        assert!(binding.is_port);
+        assert_eq!(binding.port_value, Some(8081));
+        assert_eq!(binding.target, "port");
+    }
+
+    #[test]
+    fn extracts_env_var_port_binding_unwrap_or_else() {
+        let src = r#"
+use std::env;
+
+fn main() {
+    let port: u16 = env::var("WAITER_PORT")
+        .unwrap_or_else(|_| "8080".to_string())
+        .parse()
+        .expect("PORT must be a number");
+}
+"#;
+        let sem = parse_and_build_semantics(src);
+        assert_eq!(sem.env_var_bindings.len(), 1);
+
+        let binding = &sem.env_var_bindings[0];
+        assert_eq!(binding.env_var_name, "WAITER_PORT");
+        assert_eq!(binding.default_value, Some("8080".to_string()));
+        assert!(binding.is_port);
+        assert_eq!(binding.port_value, Some(8080));
+    }
+
+    #[test]
+    fn extracts_non_port_env_var_binding() {
+        let src = r#"
+use std::env;
+
+fn main() {
+    let api_url = env::var("API_URL").unwrap_or("http://localhost".to_string());
+}
+"#;
+        let sem = parse_and_build_semantics(src);
+        assert_eq!(sem.env_var_bindings.len(), 1);
+
+        let binding = &sem.env_var_bindings[0];
+        assert_eq!(binding.env_var_name, "API_URL");
+        assert_eq!(binding.default_value, Some("http://localhost".to_string()));
+        assert!(!binding.is_port);
+        assert_eq!(binding.port_value, None);
+    }
+
+    #[test]
+    fn detected_ports_via_common_semantics() {
+        use crate::semantics::common::CommonSemantics;
+
+        let src = r#"
+use std::env;
+
+fn main() {
+    let port = env::var("PORT").unwrap_or("3000".to_string());
+    let api_url = env::var("API_URL").unwrap_or("http://localhost".to_string());
+}
+"#;
+        let sem = parse_and_build_semantics(src);
+
+        // detected_ports() should only return ports
+        let ports = sem.detected_ports();
+        assert_eq!(ports.len(), 1);
+        assert_eq!(ports[0], 3000);
+    }
+
+    #[test]
+    fn extracts_multiple_port_bindings() {
+        let src = r#"
+use std::env;
+
+fn main() {
+    let http_port = env::var("HTTP_PORT").unwrap_or("8080".to_string());
+    let grpc_port = env::var("GRPC_PORT").unwrap_or("9090".to_string());
+}
+"#;
+        let sem = parse_and_build_semantics(src);
+        assert_eq!(sem.env_var_bindings.len(), 2);
+
+        let ports: Vec<u16> = sem
+            .env_var_bindings
+            .iter()
+            .filter_map(|b| b.port_value)
+            .collect();
+        assert!(ports.contains(&8080));
+        assert!(ports.contains(&9090));
+    }
+
+    #[test]
+    fn no_env_var_bindings_without_default() {
+        let src = r#"
+use std::env;
+
+fn main() {
+    let port = env::var("PORT").expect("PORT must be set");
+}
+"#;
+        let sem = parse_and_build_semantics(src);
+        // No binding extracted since there's no unwrap_or/unwrap_or_else
+        assert!(sem.env_var_bindings.is_empty());
     }
 }

@@ -473,7 +473,11 @@ fn first_identifier_before_text(stmt_text: &str) -> Option<String> {
         .split_whitespace()
         .last()?
         .to_string();
-    if name.is_empty() { None } else { Some(name) }
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
 }
 
 fn is_context_timeout_call(file: &ParsedFile, call: Node) -> bool {

@@ -2,10 +2,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::parse::ast::{AstLocation, FileId, ParsedFile};
 use crate::semantics::common::db::{DbLibrary, DbOperation, DbOperationType};
-use crate::semantics::common::{CommonLocation, calls::FunctionCall};
+use crate::semantics::common::{calls::FunctionCall, CommonLocation};
 use crate::types::context::Language;
 
-use super::frameworks::{GoFrameworkSummary, extract_go_routes};
+use super::frameworks::{extract_go_routes, GoFrameworkSummary};
 use super::http::HttpCallSite;
 
 /// Information about an unchecked error in Go code.
@@ -2061,21 +2061,18 @@ func main() {
 "#;
         let sem = parse_and_build_semantics(src);
         assert_eq!(sem.channel_ops.len(), 3);
-        assert!(
-            sem.channel_ops
-                .iter()
-                .any(|op| matches!(op.kind, ChannelOpKind::Send))
-        );
-        assert!(
-            sem.channel_ops
-                .iter()
-                .any(|op| matches!(op.kind, ChannelOpKind::Receive))
-        );
-        assert!(
-            sem.channel_ops
-                .iter()
-                .any(|op| matches!(op.kind, ChannelOpKind::Close))
-        );
+        assert!(sem
+            .channel_ops
+            .iter()
+            .any(|op| matches!(op.kind, ChannelOpKind::Send)));
+        assert!(sem
+            .channel_ops
+            .iter()
+            .any(|op| matches!(op.kind, ChannelOpKind::Receive)));
+        assert!(sem
+            .channel_ops
+            .iter()
+            .any(|op| matches!(op.kind, ChannelOpKind::Close)));
     }
 
     #[test]

@@ -235,11 +235,9 @@ async def main():
             summary.task_spawns[0].operation_type,
             AsyncOperationType::TaskSpawn
         );
-        assert!(
-            summary.task_spawns[0]
-                .operation_text
-                .contains("asyncio.create_task")
-        );
+        assert!(summary.task_spawns[0]
+            .operation_text
+            .contains("asyncio.create_task"));
     }
 
     #[test]

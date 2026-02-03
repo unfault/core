@@ -17,8 +17,8 @@ use typescript::model::TsFileSemantics;
 
 // Re-export common types for convenience
 pub use common::{
-    CommonSemantics, async_ops::AsyncOperation, db::DbOperation, functions::FunctionDef,
-    http::HttpCall, imports::Import,
+    async_ops::AsyncOperation, db::DbOperation, functions::FunctionDef, http::HttpCall,
+    imports::Import, CommonSemantics,
 };
 
 /// Language-agnostic wrapper for per-file semantics.
@@ -93,6 +93,21 @@ impl SourceSemantics {
         match self {
             SourceSemantics::Typescript(sem) => Some(sem),
             _ => None,
+        }
+    }
+
+    /// Get detected listening ports from env var defaults.
+    ///
+    /// Returns ports extracted from patterns like `os.getenv("PORT", "8080")`
+    /// or `env::var("PORT").unwrap_or("8081")` where the env var name contains
+    /// "PORT" and the default is numeric.
+    pub fn detected_ports(&self) -> Vec<u16> {
+        use common::CommonSemantics;
+        match self {
+            SourceSemantics::Python(sem) => sem.detected_ports(),
+            SourceSemantics::Go(sem) => sem.detected_ports(),
+            SourceSemantics::Rust(sem) => sem.detected_ports(),
+            SourceSemantics::Typescript(sem) => sem.detected_ports(),
         }
     }
 }

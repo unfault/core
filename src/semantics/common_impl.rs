@@ -7,7 +7,6 @@ use crate::parse::ast::FileId;
 use crate::types::context::Language;
 
 use super::common::{
-    CommonLocation, CommonSemantics,
     annotations::{Annotation, AnnotationType},
     async_ops::{AsyncOperation, AsyncOperationType, AsyncRuntime},
     db::{DbLibrary, DbOperation, DbOperationType},
@@ -18,6 +17,7 @@ use super::common::{
     http::{HttpCall, HttpClientLibrary, HttpMethod, RetryMechanism},
     imports::{Import, ImportSource, ImportStyle, ImportedItem},
     route_patterns::{RouteFramework, RoutePattern},
+    CommonLocation, CommonSemantics, EnvVarBinding,
 };
 
 use super::go::model::{GoCallSite, GoFileSemantics, GoFunction, GoImport, GoMethod};
@@ -422,6 +422,10 @@ impl CommonSemantics for PyFileSemantics {
         }
 
         contexts
+    }
+
+    fn env_var_bindings(&self) -> Vec<EnvVarBinding> {
+        self.env_var_bindings.clone()
     }
 }
 
@@ -1091,6 +1095,11 @@ impl CommonSemantics for GoFileSemantics {
 
         contexts
     }
+
+    fn env_var_bindings(&self) -> Vec<EnvVarBinding> {
+        // TODO: Implement Go env var extraction (os.Getenv patterns)
+        Vec::new()
+    }
 }
 
 /// Convert a Go import to the common Import type
@@ -1567,6 +1576,10 @@ impl CommonSemantics for RustFileSemantics {
         }
 
         contexts
+    }
+
+    fn env_var_bindings(&self) -> Vec<EnvVarBinding> {
+        self.env_var_bindings.clone()
     }
 }
 
@@ -2116,6 +2129,11 @@ impl CommonSemantics for TsFileSemantics {
         }
 
         contexts
+    }
+
+    fn env_var_bindings(&self) -> Vec<EnvVarBinding> {
+        // TODO: Implement TypeScript env var extraction (process.env patterns)
+        Vec::new()
     }
 }
 

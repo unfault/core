@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::parse::ast::{AstLocation, FileId, ParsedFile};
-use crate::semantics::common::CommonLocation;
 use crate::semantics::common::calls::FunctionCall;
 use crate::semantics::common::db::{DbLibrary, DbOperation, DbOperationType};
+use crate::semantics::common::CommonLocation;
 use crate::types::context::Language;
 
 use super::http::HttpCallSite;
@@ -1836,11 +1836,10 @@ class MyClass {
     fn collects_calls() {
         let sem = parse_and_build_semantics("fetch('https://api.example.com');");
         assert!(!sem.calls.is_empty());
-        assert!(
-            sem.calls
-                .iter()
-                .any(|c| c.function_call.callee_expr == "fetch")
-        );
+        assert!(sem
+            .calls
+            .iter()
+            .any(|c| c.function_call.callee_expr == "fetch"));
     }
 
     #[test]

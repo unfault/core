@@ -58,7 +58,7 @@ pub mod semantics;
 pub mod types;
 
 // Re-export commonly used types for convenience
-pub use graph::{CodeGraph, GraphEdgeKind, GraphNode, GraphStats, build_code_graph};
+pub use graph::{build_code_graph, CodeGraph, GraphEdgeKind, GraphNode, GraphStats};
 pub use parse::ast::{FileId, ParsedFile};
 pub use semantics::SourceSemantics;
 pub use types::context::{Language, SourceFile};
@@ -88,6 +88,21 @@ pub use types::context::{Language, SourceFile};
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IntermediateRepresentation {
+    /// Unique identifier for the workspace this IR was built from.
+    ///
+    /// Computed from git remote URL and/or meta files (pyproject.toml, Cargo.toml, etc.).
+    /// Used for cross-workspace tracing to link HTTP calls to their target services.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+
+    /// Port(s) this service listens on, extracted from framework detection.
+    ///
+    /// For example, a FastAPI app with `uvicorn.run(app, port=8081)` would have
+    /// `listening_ports: vec![8081]`. Used for cross-workspace tracing to match
+    /// outbound HTTP calls to target services.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub listening_ports: Vec<u16>,
+
     /// Per-file semantics containing parsed information about each source file.
     ///
     /// Each entry contains language-specific semantic data including:
@@ -111,7 +126,27 @@ pub struct IntermediateRepresentation {
 impl IntermediateRepresentation {
     /// Create a new IntermediateRepresentation from semantics and graph.
     pub fn new(semantics: Vec<SourceSemantics>, graph: CodeGraph) -> Self {
-        Self { semantics, graph }
+        Self {
+            workspace_id: None,
+            listening_ports: Vec::new(),
+            semantics,
+            graph,
+        }
+    }
+
+    /// Create a new IntermediateRepresentation with workspace metadata.
+    pub fn with_workspace(
+        workspace_id: Option<String>,
+        listening_ports: Vec<u16>,
+        semantics: Vec<SourceSemantics>,
+        graph: CodeGraph,
+    ) -> Self {
+        Self {
+            workspace_id,
+            listening_ports,
+            semantics,
+            graph,
+        }
     }
 
     /// Get the number of files in this IR.

@@ -1207,11 +1207,9 @@ app.add_middleware(
         let summary = summary.unwrap();
         assert_eq!(summary.middlewares.len(), 1);
         assert_eq!(summary.middlewares[0].app_var_name, "app");
-        assert!(
-            summary.middlewares[0]
-                .middleware_type
-                .contains("CORSMiddleware")
-        );
+        assert!(summary.middlewares[0]
+            .middleware_type
+            .contains("CORSMiddleware"));
     }
 
     #[test]
@@ -1508,11 +1506,9 @@ async def root():
         assert_eq!(summary.apps[0].var_name, "app");
 
         assert_eq!(summary.middlewares.len(), 1);
-        assert!(
-            summary.middlewares[0]
-                .middleware_type
-                .contains("CORSMiddleware")
-        );
+        assert!(summary.middlewares[0]
+            .middleware_type
+            .contains("CORSMiddleware"));
 
         assert_eq!(summary.routers.len(), 2);
     }
@@ -1899,11 +1895,9 @@ async def http_handler(request: Request, exc):
         let summary = summary.unwrap();
 
         assert_eq!(summary.exception_handlers.len(), 1);
-        assert!(
-            summary.exception_handlers[0]
-                .exception_type
-                .contains("HTTPException")
-        );
+        assert!(summary.exception_handlers[0]
+            .exception_type
+            .contains("HTTPException"));
     }
 
     #[test]

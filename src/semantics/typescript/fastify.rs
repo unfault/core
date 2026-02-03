@@ -675,12 +675,10 @@ const app = fastify();
 app.use(helmet());
 "#;
         let summary = parse_and_summarize(src).unwrap();
-        assert!(
-            summary
-                .middlewares
-                .iter()
-                .any(|m| m.middleware_name == "helmet")
-        );
+        assert!(summary
+            .middlewares
+            .iter()
+            .any(|m| m.middleware_name == "helmet"));
     }
 
     #[test]
@@ -694,12 +692,10 @@ const app = fastify();
 app.register(fastifyCookie, { secret: 'my-secret' });
 "#;
         let summary = parse_and_summarize(src).unwrap();
-        assert!(
-            summary
-                .middlewares
-                .iter()
-                .any(|m| m.middleware_name.contains("cookie"))
-        );
+        assert!(summary
+            .middlewares
+            .iter()
+            .any(|m| m.middleware_name.contains("cookie")));
     }
 
     #[test]
@@ -713,11 +709,9 @@ const app = fastify();
 app.register(fastifyRateLimit, { max: 100 });
 "#;
         let summary = parse_and_summarize(src).unwrap();
-        assert!(
-            summary
-                .middlewares
-                .iter()
-                .any(|m| m.middleware_name.contains("rate-limit"))
-        );
+        assert!(summary
+            .middlewares
+            .iter()
+            .any(|m| m.middleware_name.contains("rate-limit")));
     }
 }
